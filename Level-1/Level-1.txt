@@ -1,0 +1,217 @@
+Awesome—let’s kick off with **Step 1: Arrays + Options Basics**.
+I’ll give you: (1) deep theory, (2) a concrete problem, (3) fully-worked Python, (4) a real-life scenario, and (5) articles to read.
+
+---
+
+# Step 1 — Arrays + Options Basics
+
+## Theory (crash-course, practical)
+
+**Why arrays first?**
+Most quant tasks ultimately boil down to transforming sequences of numbers: prices, returns, payoffs, P&L. An **array** is the simplest container for those sequences. In Python, arrays are usually handled with **NumPy** (fast, contiguous memory, vectorized math) or **pandas** (tables with time indexes over NumPy arrays).
+
+### 1) Arrays & indexing essentials
+
+* **Shape & dtype:** A 1-D price series is `shape (n,)`; a 2-D panel (e.g., multiple tickers by time) is `shape (n, m)`. Choosing `float64` avoids precision surprises when you divide or take logs.
+* **Indexing:**
+
+  * `a[i]` grabs the i-th element; `a[i:j]` slices a half-open range `[i, j)`.
+  * Negative indices count from the end (`a[-1]` is last price).
+* **Broadcasting:** Numpy aligns shapes to apply vectorized ops without loops. Example: `(prices[1:] / prices[:-1]) - 1` computes all daily simple returns at once.
+* **Copy vs view:** Slicing returns **views** (no data copy) unless you explicitly copy; know this to avoid accidental mutation.
+* **Performance:** Vectorized array math is O(n) but runs in C under the hood; avoid Python `for` loops when possible.
+
+### 2) Returns: simple vs log
+
+Given closing prices ( P_t ):
+
+* **Simple return**: ( r_t = \frac{P_t}{P_{t-1}} - 1 ).
+
+  * Intuitive, additive over wealth: ( P_t = P_{t-1}(1 + r_t) ).
+* **Log return**: ( \ell_t = \ln!\left(\frac{P_t}{P_{t-1}}\right) ).
+
+  * Time-additive: ( \ln!\frac{P_T}{P_0} = \sum_t \ell_t ).
+  * For small moves, ( \ell_t \approx r_t ).
+* **Adjusted Close:** Use **adjusted** prices to handle splits & dividends; otherwise you’ll fabricate jumps that aren’t “real” returns.
+
+Common analytics from returns arrays:
+
+* **Volatility (stdev)**, **cumulative return** ( \prod_t (1+r_t) - 1 ) or ( \exp(\sum \ell_t)-1 ), **drawdown**, **Sharpe** (later steps).
+* **Vectorized pipelines:** Missing values → align index → compute returns → summarize → plot.
+
+### 3) European options: calls & puts (payoff vs profit)
+
+* **Contract:** A *European call* gives the right (not obligation) to **buy** the underlying at strike ( K ) at **expiry** ( T ). A *European put* gives the right to **sell** at ( K ) at ( T ).
+* **Payoff** at expiry from the option’s perspective (ignoring premium):
+
+  * Call: ( \text{payoff}_C(S_T) = \max(S_T - K, 0) )
+  * Put: ( \text{payoff}_P(S_T) = \max(K - S_T, 0) )
+* **Premium vs payoff:** You pay a premium ( c ) (call) or ( p ) (put) **today**. **Profit** at expiry = payoff − premium (ignoring carry/fees).
+
+  * Call **break-even**: ( S_T = K + c )
+  * Put **break-even**: ( S_T = K - p )
+* **Moneyness at time t:**
+
+  * **ITM** (in-the-money): call ( S_t > K ), put ( S_t < K )
+  * **ATM**: ( S_t \approx K )
+  * **OTM**: call ( S_t < K ), put ( S_t > K )
+* **Time vs intrinsic value:**
+
+  * Intrinsic (=) immediate exercise value.
+  * Time value (=) option price − intrinsic (captures uncertainty left until expiry).
+* **Why arrays again?** To build **payoff diagrams**, we evaluate an array of possible expiry prices ( S_T ) and compute the vector of payoffs/profits for each ( S_T ). That array view lets you reason about strategies (covered calls, collars, straddles) geometrically.
+
+### 4) Data pipeline for Step 1
+
+1. Pull **Adjusted Close** for a ticker (e.g., AAPL) over a date range.
+2. Convert to a NumPy array; compute **simple** and **log** daily returns.
+3. Choose a strike ( K ) (ATM/±5% for OTM/ITM examples).
+4. Build a vector of hypothetical expiry prices ( S_T ) around today’s price; compute arrays of call/put **payoff** and **profit** (with assumed premiums).
+5. Plot: (a) returns histogram or series; (b) call & put payoff curves.
+
+---
+
+## Problem (you’ll solve it end-to-end)
+
+> **Given a ticker, date range, and one strike K,**
+>
+> 1. Pull Adjusted Close, compute **simple** and **log** daily returns.
+> 2. Create payoff and profit arrays for a **European call** and **put** at strike (K) for a grid of expiry prices around the latest spot (±40%).
+> 3. Plot the **daily returns** series and the **payoff/profit diagrams** for both options.
+> 4. Save a CSV with date, price, simple return, log return.
+
+**Inputs to try:** `ticker="AAPL"`, last 1 year, `K = round(spot, 0)` (nearest dollar), `call_premium=5.0`, `put_premium=5.0` (placeholders).
+
+---
+
+## Python (ready to run locally)
+
+> This script uses `yfinance`, `numpy`, `pandas`, and `matplotlib`. Install if needed:
+> `pip install yfinance pandas numpy matplotlib`
+
+```python
+# step1_arrays_options_basics.py
+import numpy as np
+import pandas as pd
+import yfinance as yf
+import matplotlib.pyplot as plt
+
+# --------- CONFIG ---------
+ticker = "AAPL"
+period = "1y"     # or use start/end dates: start="2024-01-01", end="2025-01-01"
+interval = "1d"
+call_premium = 5.0  # assumed, for profit curve only
+put_premium  = 5.0  # assumed, for profit curve only
+# --------------------------
+
+# 1) Download adjusted prices
+data = yf.download(ticker, period=period, interval=interval, auto_adjust=True, progress=False)
+if data.empty:
+    raise SystemExit("No data returned—check ticker/period/internet.")
+
+prices = data["Close"].dropna().rename("AdjClose")
+
+# 2) Compute returns
+simple_ret = prices.pct_change().dropna().rename("simple_return")
+log_ret = np.log(prices / prices.shift(1)).dropna().rename("log_return")
+
+# 3) Save to CSV
+out = pd.concat([prices, simple_ret, log_ret], axis=1)
+out.to_csv(f"{ticker}_step1_returns.csv", index=True)
+
+# 4) Plot returns over time (simple) and histogram (log)
+plt.figure(figsize=(10,4))
+simple_ret.plot()
+plt.title(f"{ticker} Daily Simple Return")
+plt.xlabel("Date"); plt.ylabel("Return")
+plt.tight_layout()
+plt.show()
+
+plt.figure(figsize=(6,4))
+log_ret.plot(kind="hist", bins=50)
+plt.title(f"{ticker} Daily Log Return Histogram")
+plt.xlabel("Log Return")
+plt.tight_layout()
+plt.show()
+
+# 5) Build payoff/profit arrays for a European call & put
+S0 = prices.iloc[-1]
+K = round(float(S0))  # nearest integer strike for demo
+
+S_T = np.linspace(0.6*S0, 1.4*S0, 200)  # expiry price grid
+call_payoff = np.maximum(S_T - K, 0.0)
+put_payoff  = np.maximum(K - S_T, 0.0)
+
+call_profit = call_payoff - call_premium
+put_profit  = put_payoff  - put_premium
+
+# 6) Plot payoff & profit diagrams
+plt.figure(figsize=(8,4))
+plt.plot(S_T, call_payoff, label="Call Payoff")
+plt.axvline(K, linestyle="--"); plt.axhline(0, linestyle="--")
+plt.title(f"European Call Payoff (K={K})")
+plt.xlabel("Underlying Price at Expiry S_T"); plt.ylabel("Payoff")
+plt.legend(); plt.tight_layout(); plt.show()
+
+plt.figure(figsize=(8,4))
+plt.plot(S_T, call_profit, label="Call Profit (premium={})".format(call_premium))
+plt.axvline(K, linestyle="--"); plt.axhline(0, linestyle="--")
+plt.title(f"European Call Profit (K={K})")
+plt.xlabel("Underlying Price at Expiry S_T"); plt.ylabel("Profit")
+plt.legend(); plt.tight_layout(); plt.show()
+
+plt.figure(figsize=(8,4))
+plt.plot(S_T, put_payoff, label="Put Payoff")
+plt.axvline(K, linestyle="--"); plt.axhline(0, linestyle="--")
+plt.title(f"European Put Payoff (K={K})")
+plt.xlabel("Underlying Price at Expiry S_T"); plt.ylabel("Payoff")
+plt.legend(); plt.tight_layout(); plt.show()
+
+plt.figure(figsize=(8,4))
+plt.plot(S_T, put_profit, label="Put Profit (premium={})".format(put_premium))
+plt.axvline(K, linestyle="--"); plt.axhline(0, linestyle="--")
+plt.title(f"European Put Profit (K={K})")
+plt.xlabel("Underlying Price at Expiry S_T"); plt.ylabel("Profit")
+plt.legend(); plt.tight_layout(); plt.show()
+
+print(f"Saved returns to {ticker}_step1_returns.csv")
+print(f"Spot S0={S0:.2f}, Strike K={K}, Call breakeven ≈ {K+call_premium:.2f}, Put breakeven ≈ {K-put_premium:.2f}")
+```
+
+**What to look for:**
+
+* The simple and log return series should be near-zero mean with volatility “clusters” (quiet vs wild periods).
+* Call payoff is **zero** until (S_T > K); profit line shifts down by the premium.
+* Put payoff is **zero** until (S_T < K); profit line shifts down by the premium.
+
+**Optional mini-challenges:**
+
+* Replace assumed premiums with actual option prices from `yf.Ticker(ticker).option_chain(expiry)` (choose the strike nearest `K`).
+* Add a **straddle** (buy call + buy put at same (K)) payoff array.
+* Compute **cumulative return** and **max drawdown** from your returns CSV.
+
+---
+
+## Real-life scenario (how this is used)
+
+You manage a concentrated position in a tech stock and fear a near-term earnings miss. You evaluate **protective puts**:
+
+1. Pull the last year of adjusted prices to quantify typical daily swing (volatility).
+2. Choose a strike ( K ) near current spot and inspect the **put profit curve**: you visualize how much you’d lose if the stock drops 10–20%, and how the put caps that loss beyond ( K - p ).
+3. Compare premiums for different strikes/expiries (OTM vs ATM) by shifting the payoff arrays, and pick the hedge that balances cost vs protection.
+   This exact workflow—returns arrays + payoff arrays—is how risk and trading desks sanity-check hedges and communicate them with simple diagrams before running heavier models.
+
+---
+
+## Articles & docs to read (starter set)
+
+* *Options Basics* — Investopedia (calls, puts, moneyness, intrinsic/time value).
+* *Option Payoff Diagrams Explained* — Corporate Finance Institute (CFI).
+* *Introduction to Options* — QuantStart (worked examples).
+* *Black–Scholes Primer* — CFI / Investopedia (to prep for Step 7).
+* *yfinance Documentation* — Official docs / GitHub README (download adjusted close, option chains).
+* *NumPy Quickstart* — Official NumPy docs (arrays, broadcasting).
+* *pandas Time Series* — Official pandas docs (indexing by dates, `pct_change`, `rolling`).
+
+---
+
