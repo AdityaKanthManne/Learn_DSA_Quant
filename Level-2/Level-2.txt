@@ -1,0 +1,208 @@
+Perfect—let’s dive into **Step 2: Strings + Option Moneyness**.
+Like before, I’ll give you: **(1) deep theory**, **(2) a concrete problem**, **(3) full Python code**, **(4) real-life scenario**, and **(5) further readings**. This will be long and detailed (using maximum depth).
+
+---
+
+# Step 2 — Strings + Option Moneyness
+
+## Theory (comprehensive, max detail)
+
+### 1) Strings and parsing in programming
+
+Strings are the building blocks of **text data**. In financial data, especially option tickers, text encodes structured info: underlying symbol, expiry date, option type (call/put), strike. To extract meaning, you must parse strings.
+
+Core **string concepts in Python**:
+
+* **Indexing:** `"AAPL"[0] == 'A'`
+* **Slicing:** `"AAPL"[0:2] == 'AA'`
+* **Methods:** `.split()`, `.strip()`, `.upper()`, `.lower()`, `.replace()`
+* **Regex (regular expressions):** patterns to match structured text (e.g., dates, numbers, suffixes). Example: `re.match(r"(\d{6})([CP])(\d+)", "240621C00125000")`
+
+Financial strings are often *dense and compact*, so regex is the natural weapon.
+
+---
+
+### 2) Anatomy of an option ticker
+
+#### a) OCC standard format (used by US options exchanges):
+
+* Example: `AAPL240621C00125000`
+* Components:
+
+  * `AAPL` → Underlying symbol
+  * `240621` → Expiry date (YYMMDD)
+  * `C` → Call (C) or Put (P)
+  * `00125000` → Strike price (implied decimal, 125.00)
+
+#### b) Yahoo Finance format (shorter):
+
+* Example: `AAPL240621C125`
+* Components:
+
+  * `AAPL` → Underlying
+  * `240621` → Expiry (YYMMDD)
+  * `C` → Call / `P` → Put
+  * `125` → Strike price (no decimals if whole number)
+
+Other data vendors (Bloomberg, Refinitiv, Interactive Brokers) use slightly different encodings, but the logic is similar.
+
+---
+
+### 3) Option moneyness
+
+**Moneyness** describes the relationship between the spot price (S) and strike price (K). It determines whether exercising an option is profitable today.
+
+* **In the Money (ITM):**
+
+  * Call: ( S > K )
+  * Put: ( S < K )
+* **At the Money (ATM):**
+
+  * ( S \approx K ) (within a narrow band, usually nearest strike to spot)
+* **Out of the Money (OTM):**
+
+  * Call: ( S < K )
+  * Put: ( S > K )
+
+**Why it matters:**
+
+* ITM options have intrinsic value.
+* OTM options are pure time-value bets (cheaper, more leveraged).
+* Traders scan the chain to see distribution of open interest across strikes/moneyness.
+
+---
+
+### 4) Parsing → Classification → Integration
+
+Workflow in code:
+
+1. Parse ticker strings into components (underlying, expiry, type, strike).
+2. Get **spot price** from Yahoo Finance.
+3. Compare strike vs spot → classify ITM/ATM/OTM.
+4. Store results in a **DataFrame** for analysis, filtering, or trading logic.
+
+---
+
+### 5) Real-world edge cases
+
+* Some underlyings have suffixes (e.g., `BRK.B`, `TSLA1!`).
+* Weekly vs monthly expiries → always 6-digit expiry code.
+* Fractional strikes (tickers like `00097500` → strike = 97.5).
+* Data vendor differences: OCC adds more padding than Yahoo.
+
+---
+
+## Problem (your assignment)
+
+> **Given a ticker string from Yahoo Finance (like `AAPL240621C125`)**:
+>
+> 1. Parse it into underlying, expiry (date), option type, strike.
+> 2. Pull the current spot price for the underlying.
+> 3. Classify the option as ITM/ATM/OTM.
+> 4. Print all fields in a neat table.
+> 5. Extend it to parse **multiple tickers** from an option chain and classify each.
+
+---
+
+## Python Code (ready to run)
+
+> Requires: `re`, `datetime`, `yfinance`, `pandas`
+
+```python
+# step2_strings_moneyness.py
+import re
+from datetime import datetime
+import yfinance as yf
+import pandas as pd
+
+def parse_option_ticker(ticker_str):
+    """
+    Parse Yahoo-style option ticker: e.g., 'AAPL240621C125'
+    Returns dict with underlying, expiry_date, type, strike
+    """
+    # Regex: symbol letters, 6 digits, C/P, strike digits (may include decimals)
+    m = re.match(r"^([A-Z]+)(\d{6})([CP])(\d+(\.\d+)?)$", ticker_str)
+    if not m:
+        raise ValueError(f"Unrecognized ticker format: {ticker_str}")
+
+    underlying = m.group(1)
+    expiry_str = m.group(2)
+    option_type = "Call" if m.group(3) == "C" else "Put"
+    strike = float(m.group(4))
+
+    expiry_date = datetime.strptime(expiry_str, "%y%m%d").date()
+
+    return {
+        "Underlying": underlying,
+        "Expiry": expiry_date,
+        "Type": option_type,
+        "Strike": strike
+    }
+
+def classify_moneyness(spot, strike, opt_type):
+    """Return ITM/ATM/OTM classification given spot vs strike."""
+    # ATM tolerance = 0.5% of spot
+    tol = 0.005 * spot
+    if abs(spot - strike) <= tol:
+        return "ATM"
+    if opt_type == "Call":
+        return "ITM" if spot > strike else "OTM"
+    else:
+        return "ITM" if spot < strike else "OTM"
+
+# Example 1: single ticker
+opt_ticker = "AAPL240621C125"
+parsed = parse_option_ticker(opt_ticker)
+
+spot = yf.Ticker(parsed["Underlying"]).history(period="1d")["Close"].iloc[-1]
+
+moneyness = classify_moneyness(spot, parsed["Strike"], parsed["Type"])
+parsed["Spot"] = round(spot, 2)
+parsed["Moneyness"] = moneyness
+
+print("Single option classification:")
+print(parsed)
+
+# Example 2: multiple tickers
+tickers = ["AAPL240621C125", "AAPL240621P120", "AAPL240621C150"]
+rows = []
+for t in tickers:
+    p = parse_option_ticker(t)
+    spot = yf.Ticker(p["Underlying"]).history(period="1d")["Close"].iloc[-1]
+    p["Spot"] = round(spot, 2)
+    p["Moneyness"] = classify_moneyness(spot, p["Strike"], p["Type"])
+    rows.append(p)
+
+df = pd.DataFrame(rows)
+print("\nMultiple option chain classification:")
+print(df)
+```
+
+---
+
+## Real-life Scenario
+
+You are a junior quant on an **options trading desk**. A trader asks:
+*"What’s the distribution of open interest around spot for next week’s expiry?"*
+
+Steps:
+
+1. Pull the chain for expiry `240621`.
+2. Parse tickers into strikes.
+3. Get spot (e.g., AAPL = $128).
+4. Classify: Calls with strikes 125 and 130 are **ATM/OTM**; puts at 125 are **ATM/ITM**.
+5. Plot histogram of OI by moneyness.
+   This tells the trader where the market is positioning: e.g., **heavy OI in OTM calls** suggests speculative bullish bets.
+
+---
+
+## Articles & Docs
+
+* **CBOE Option Symbols Guide** (official breakdown of option ticker formats)
+* **Investopedia: Moneyness** — clear definitions of ITM, ATM, OTM
+* **QuantInsti: How to Read Option Chains**
+* **Python regex documentation** (`re` module basics)
+* **Yahoo Finance API with yfinance** — how to pull spot prices and chains
+
+---
+
