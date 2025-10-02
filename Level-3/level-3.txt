@@ -1,0 +1,353 @@
+Awesome — rolling into **Step 3: Hashmaps + Tracking Portfolio Weights**.
+You’ll get: **(1) deep theory**, **(2) a concrete problem**, **(3) production-style Python**, **(4) a real-life desk scenario**, and **(5) readings**.
+
+---
+
+# Step 3 — Hashmaps + Tracking Portfolio Weights
+
+## Theory (in-depth, practical)
+
+### 1) Why hashmaps (Python dicts) for portfolios?
+
+A **hashmap** (Python `dict`) gives O(1) average-time access from a **key** (ticker) to a **value** (weight, price, shares, metadata). In a portfolio, nearly everything is a mapping:
+
+* `weights = {"AAPL": 0.20, "MSFT": 0.25, "NVDA": 0.30, "GOOGL": 0.15, "AMZN": 0.10}`
+* `last_price = {"AAPL": 231.42, ...}`
+* `shares = {"AAPL": 86, ...}`
+
+Benefits:
+
+* **Fast lookup** for rebalancing & risk checks.
+* **Clear semantics**: The key *is* the identifier.
+* **Composable**: easy to merge with other dicts (prices, shares, betas).
+
+### 2) Weight vs capital vs shares
+
+Definitions:
+
+* **Target weight** (w_i): fraction of the portfolio allocated to asset (i), (\sum_i w_i = 1).
+* **Capital** (C): total value (e.g., $100,000).
+* **Price** (P_i): latest close or live price.
+* **Shares** (q_i): integer units you actually hold.
+
+Initial allocation (ignoring fractional share brokers):
+[
+q_i = \left\lfloor \frac{w_i \cdot C}{P_i} \right\rfloor
+]
+Residual cash (C - \sum_i q_i P_i) remains as cash.
+
+### 3) Actual weight vs target weight (drift)
+
+Over time, prices move. Current weight:
+[
+\hat{w}_i = \frac{q_i P_i}{\sum_j q_j P_j + \text{cash}}
+]
+**Drift** (d_i = \hat{w}_i - w_i). A rebalance rule might be:
+
+* Rebalance if (|d_i| > \tau) for any (i) (e.g., (\tau = 2%)) or at fixed cadence (monthly/quarterly).
+* Incorporate **transaction costs** (fees, bid-ask, taxes).
+
+### 4) Time series tracking (NAV & returns)
+
+Given price history (P_{i,t}) and shares (q_i):
+[
+\text{NAV}*t = \sum_i q_i P*{i,t} + \text{cash}
+]
+Daily return:
+[
+R_t = \frac{\text{NAV}*t - \text{NAV}*{t-1}}{\text{NAV}_{t-1}}
+]
+Hashmaps store **shares** and **weights**; a `DataFrame` stores price history.
+
+### 5) Dicts ↔ pandas
+
+* Use **dicts** at the edges (inputs/outputs, configs, current positions).
+* Use **pandas** for vectorized math (prices, returns, reporting).
+* Convert safely with aligned indexes/columns to avoid key mismatches.
+
+---
+
+## Problem (your assignment)
+
+> **Build a hashmap-based portfolio tracker that:**
+>
+> 1. Accepts a dict of **target weights** and total **capital**.
+> 2. Pulls price history, computes **last prices**, and converts weights → **integer shares** (with residual cash).
+> 3. Produces a **NAV time series**, **daily returns**, and **current weights**.
+> 4. Detects **drift** vs targets and proposes **rebalance trades** (within a tolerance, including transaction cost in bps).
+> 5. Exports a CSV report (positions, drift, trades) and a NAV CSV.
+
+Try with:
+
+```python
+weights = {"AAPL":0.20, "MSFT":0.20, "NVDA":0.30, "GOOGL":0.15, "AMZN":0.15}
+capital = 100_000
+period = "1y"
+tolerance = 0.02     # 2% drift
+fee_bps = 5          # 5 bps per notional traded
+```
+
+---
+
+## Python (robust, ready to run)
+
+> Requires: `pandas`, `numpy`, `yfinance`, `matplotlib`
+> `pip install yfinance pandas numpy matplotlib`
+
+```python
+# step3_hashmaps_portfolio_tracker.py
+import math
+import numpy as np
+import pandas as pd
+import yfinance as yf
+import matplotlib.pyplot as plt
+from typing import Dict, Tuple
+
+# ---------------- Helpers ---------------- #
+
+def validate_weights(weights: Dict[str, float]) -> Dict[str, float]:
+    if not weights:
+        raise ValueError("weights dict is empty.")
+    if any(w < 0 for w in weights.values()):
+        raise ValueError("All weights must be non-negative.")
+    s = sum(weights.values())
+    if s <= 0:
+        raise ValueError("Sum of weights must be > 0.")
+    # Normalize to sum to 1 (guard against rounding input)
+    return {k: (v / s) for k, v in weights.items()}
+
+def fetch_prices(tickers, period="1y", interval="1d") -> pd.DataFrame:
+    # yfinance returns multiindex columns sometimes; we coerce to a clean Close frame
+    df = yf.download(tickers, period=period, interval=interval, auto_adjust=True, progress=False)
+    if df.empty:
+        raise SystemExit("No data returned—check tickers/period/internet.")
+    # If MultiIndex, pick 'Close' level; else assume it already is Close
+    if isinstance(df.columns, pd.MultiIndex):
+        if ("Close" in df.columns.get_level_values(0)):
+            px = df["Close"].copy()
+        else:
+            # Fallback to any price-like field
+            for lvl0 in ("Adj Close", "Close"):
+                if lvl0 in df.columns.get_level_values(0):
+                    px = df[lvl0].copy()
+                    break
+            else:
+                raise SystemExit(f"Could not find Close/Adj Close in columns: {df.columns}")
+    else:
+        # Single index columns (e.g., ['Open','High','Low','Close','Volume'])
+        if "Close" in df.columns:
+            px = df["Close"].to_frame()
+        elif "Adj Close" in df.columns:
+            px = df["Adj Close"].to_frame()
+        else:
+            raise SystemExit(f"No Close/Adj Close columns found: {list(df.columns)}")
+
+    # If single ticker, ensure 2D with that ticker as column name
+    if isinstance(px, pd.Series):
+        px = px.to_frame(name=tickers if isinstance(tickers, str) else list(weights.keys())[0])
+    px = px.dropna(how="all")
+    return px
+
+def last_prices(price_df: pd.DataFrame) -> Dict[str, float]:
+    last_row = price_df.dropna().iloc[-1]
+    return {sym: float(last_row[sym]) for sym in last_row.index}
+
+def allocate_shares(weights: Dict[str, float], prices: Dict[str, float], capital: float) -> Tuple[Dict[str, int], float]:
+    shares = {}
+    spent = 0.0
+    for sym, w in weights.items():
+        p = prices[sym]
+        dollar = w * capital
+        q = int(dollar // p)  # integer shares
+        shares[sym] = q
+        spent += q * p
+    cash = capital - spent
+    return shares, cash
+
+def portfolio_nav_series(price_df: pd.DataFrame, shares: Dict[str, int], cash: float) -> pd.Series:
+    # Align shares dict to columns; missing cols handled by reindex
+    cols = price_df.columns.tolist()
+    share_vec = pd.Series({c: shares.get(c, 0) for c in cols}, index=cols, dtype=float)
+    nav = (price_df * share_vec).sum(axis=1) + cash
+    nav.name = "NAV"
+    return nav
+
+def current_weights_from_shares(prices: Dict[str, float], shares: Dict[str, int], cash: float) -> Dict[str, float]:
+    equity = sum(shares[s] * prices[s] for s in shares)
+    total = equity + cash
+    if total <= 0:
+        raise ValueError("Total portfolio value must be positive.")
+    return {s: (shares[s] * prices[s]) / total for s in shares}
+
+def drift_and_rebalance_trades(target_w: Dict[str, float],
+                               prices: Dict[str, float],
+                               shares: Dict[str, int],
+                               cash: float,
+                               tolerance: float = 0.02,
+                               fee_bps: float = 5.0):
+    """
+    Returns a trades dict {symbol: delta_shares} to move within tolerance,
+    and a summary of costs. Trade sign: +buy, -sell.
+    """
+    # Compute current weights
+    curr_w = current_weights_from_shares(prices, shares, cash)
+    total_val = sum(shares[s]*prices[s] for s in shares) + cash
+
+    # Desired dollar per asset
+    desired_dollars = {s: target_w[s]*total_val for s in target_w}
+    current_dollars = {s: shares[s]*prices[s] for s in shares}
+
+    drift = {s: (current_dollars[s]/total_val) - target_w[s] for s in target_w}
+    # If all within tolerance, no trades
+    if all(abs(drift[s]) <= tolerance for s in drift):
+        return {}, {"within_tolerance": True, "fees_paid": 0.0, "cash_after": cash, "total_val": total_val, "drift": drift}
+
+    # Compute target shares rounded to integers
+    target_shares = {s: int(desired_dollars[s] // prices[s]) for s in target_w}
+    delta_shares = {s: target_shares[s] - shares[s] for s in target_w}
+
+    # Compute trade cash impact & fees
+    notional = sum(abs(delta_shares[s]) * prices[s] for s in delta_shares)
+    fees = notional * (fee_bps / 10_000.0)
+    cash_after = cash - sum(delta_shares[s]*prices[s] for s in delta_shares) - fees
+
+    # If cash becomes negative (insufficient), scale trades down proportionally (greedy fallback)
+    if cash_after < 0:
+        scale = max(0.0, (cash - fees) / max(1e-9, sum(max(0, d)*prices[s] for s, d in delta_shares.items())))
+        scaled_delta = {}
+        cash_spend = 0.0
+        for s, d in delta_shares.items():
+            if d > 0:
+                d2 = int(math.floor(d * scale))
+            else:
+                d2 = d  # allow full sells
+            scaled_delta[s] = d2
+            cash_spend += d2 * prices[s]
+        notional = sum(abs(scaled_delta[s]) * prices[s] for s in scaled_delta)
+        fees = notional * (fee_bps / 10_000.0)
+        cash_after = cash - cash_spend - fees
+        delta_shares = scaled_delta
+
+    return delta_shares, {
+        "within_tolerance": False,
+        "fees_paid": fees,
+        "cash_after": cash_after,
+        "total_val": sum((shares[s]+delta_shares[s])*prices[s] for s in shares) + cash_after,
+        "drift": drift
+    }
+
+# ---------------- Main demo ---------------- #
+
+if __name__ == "__main__":
+    # --- Inputs ---
+    weights = {"AAPL":0.20, "MSFT":0.20, "NVDA":0.30, "GOOGL":0.15, "AMZN":0.15}
+    capital = 100_000
+    period = "1y"
+    interval = "1d"
+    tolerance = 0.02
+    fee_bps = 5.0
+
+    # 1) Normalize weights
+    weights = validate_weights(weights)
+
+    # 2) Pull prices
+    tickers = list(weights.keys())
+    px = fetch_prices(tickers, period=period, interval=interval)
+
+    # Ensure the columns match our tickers exactly
+    missing = [t for t in tickers if t not in px.columns]
+    if missing:
+        raise SystemExit(f"Price data missing for: {missing}")
+
+    # 3) Last prices & initial allocation
+    lp = last_prices(px)
+    shares, cash = allocate_shares(weights, lp, capital)
+
+    # 4) NAV series & returns
+    nav = portfolio_nav_series(px, shares, cash)
+    ret = nav.pct_change().dropna()
+    nav.to_csv("portfolio_nav.csv")
+    ret.to_csv("portfolio_returns.csv")
+
+    # 5) Current weights and drift
+    curr_w = current_weights_from_shares(lp, shares, cash)
+    # 6) Rebalance proposal
+    trades, summary = drift_and_rebalance_trades(weights, lp, shares, cash, tolerance, fee_bps)
+
+    # 7) Build reports
+    positions = pd.DataFrame({
+        "Shares": pd.Series(shares, dtype=int),
+        "LastPrice": pd.Series(lp),
+        "PositionValue": pd.Series({s: shares[s]*lp[s] for s in shares}),
+        "TargetWeight": pd.Series(weights),
+        "CurrentWeight": pd.Series(curr_w)
+    }).sort_index()
+    positions["Drift"] = positions["CurrentWeight"] - positions["TargetWeight"]
+
+    trade_df = pd.DataFrame({
+        "DeltaShares": pd.Series(trades, dtype=int),
+        "TradeNotional": pd.Series({s: (trades.get(s,0) * lp[s]) for s in weights})
+    }).sort_index()
+
+    positions.to_csv("portfolio_positions.csv")
+    trade_df.to_csv("portfolio_rebalance_trades.csv")
+
+    # 8) Simple plots
+    plt.figure(figsize=(10,4))
+    nav.plot()
+    plt.title("Portfolio NAV")
+    plt.xlabel("Date"); plt.ylabel("Value")
+    plt.tight_layout(); plt.show()
+
+    plt.figure(figsize=(6,4))
+    ret.plot(kind="hist", bins=50)
+    plt.title("Daily Returns Distribution")
+    plt.xlabel("Return")
+    plt.tight_layout(); plt.show()
+
+    # 9) Print summary
+    print("\n=== Positions ===")
+    print(positions.round(4))
+    print("\n=== Rebalance Proposal ===")
+    print(trade_df.round(2))
+    print("\nSummary:", {k: (round(v,4) if isinstance(v, float) else v) for k,v in summary.items()})
+    print(f"\nCSV exports: portfolio_positions.csv, portfolio_rebalance_trades.csv, portfolio_nav.csv, portfolio_returns.csv")
+```
+
+### What this does
+
+* **Dicts** hold weights, prices, and shares for O(1) access per ticker.
+* Converts target weights → **integer shares** with residual **cash**.
+* Computes **NAV** and **daily returns** from historical prices.
+* Detects **drift** and proposes **trades** to bring the book back within tolerance, with **fee_bps** cost.
+* Exports **four CSVs** for auditability.
+
+### Common tweaks
+
+* Use **fractional shares** if your broker supports them (replace `int(...)` with round and allow decimals).
+* Add **cash weight** as an explicit ticker like `"CASH": 0.05` (handled outside price DF).
+* Replace yfinance **Close** with **VWAP** or **mid quotes** for intraday tracking.
+
+---
+
+## Real-life scenario (how this is used)
+
+You’re on a **systematic equities** team rebalancing a 5-stock thematic sleeve daily at the **close**.
+
+* Each morning, the dict of **target weights** comes from an optimizer (risk parity or factor tilt).
+* The tracker ingests **latest prices**, computes **current weights**, and measures **drift** (NVDA rally pushed it 4% overweight).
+* The **trade blotter** proposes selling some NVDA, buying GOOGL/AMZN to restore targets, and includes **fees** (5 bps).
+* You export the files to operations; they stage orders via the broker’s smart router before the close.
+* Post-trade, you roll forward **shares** and **cash** and archive the CSVs for compliance.
+
+---
+
+## Articles / Docs to read next
+
+* **Python dicts & hashing** — Official Python docs (performance & semantics)
+* **Vectorization with pandas** — pandas user guide (DataFrame math, alignment)
+* **Rebalancing rules** — Research posts on tolerance bands vs calendar rebalancing
+* **Transaction cost modeling** — Notes on bps costs, bid-ask, market impact
+* **yfinance** — fetching multi-ticker frames, handling MultiIndex columns
+
+---
