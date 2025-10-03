@@ -1,0 +1,176 @@
+Great — let’s move on to **Step 4: Linked Lists + Time Series Cleaning**.
+Here’s the deep dive with **theory**, **problem**, **code**, **real-life desk use case**, and **further readings**.
+
+---
+
+# Step 4 — Linked Lists + Time Series Cleaning
+
+## Theory (full length, maximum detail)
+
+### 1) Linked lists in data structures
+
+A **linked list** is a sequential collection where each element (node) stores:
+
+* **Data** (payload, e.g., a price on a given date).
+* **Pointer/reference** to the next node (and optionally the previous node if it’s doubly linked).
+
+**Why they matter conceptually:**
+
+* Unlike arrays, linked lists don’t require contiguous memory.
+* Insertion/deletion at arbitrary points is O(1) (given a reference).
+* Traversal is O(n).
+* Good mental model for time series: each record points to the “next day.”
+
+In financial engineering, we rarely hand-code linked lists (because pandas/NumPy cover this), but thinking in linked-list terms is powerful for **streaming data** and **cleaning**: we traverse records sequentially, check relationships, and drop/adjust anomalies.
+
+---
+
+### 2) Time series cleaning problems
+
+Real-world market data is messy:
+
+* **Missing dates:** e.g., holidays, weekends, or bad ticks.
+* **Duplicate timestamps:** Same day/second reported twice, with conflicting values.
+* **NaNs:** No trades or bad feed.
+* **Corporate actions:** Splits, dividends, mergers → jumps unless adjusted.
+* **Outliers/spikes:** Erroneous prints (e.g., stock at $0.01 for 1 tick).
+
+**Cleaning pipeline:**
+
+1. **Standardize index** — Ensure DateTimeIndex, sorted, unique.
+2. **Fill missing timestamps** — Generate a complete date range (trading calendar).
+3. **Drop duplicates** — Keep the last or average.
+4. **Forward-fill/back-fill** — If missing values, propagate last valid or drop.
+5. **Adjust for splits/dividends** — Use adjusted closes, not raw closes.
+6. **Resample** — Convert tick data to OHLC bars, or daily → weekly.
+
+---
+
+### 3) Why linked list metaphor helps
+
+Think of a time series as a **chain** of nodes:
+
+* Each node has `date` and `price`.
+* Cleaning = walking the chain:
+
+  * If `node.date == next_node.date`, drop duplicates.
+  * If `gap > 1 day` (and not weekend/holiday), insert synthetic node with NaN, then decide how to fill.
+  * If `price <= 0`, mark as invalid.
+* This traversal logic is identical to linked-list pointer walking.
+
+---
+
+### 4) Cleaning methods in pandas
+
+* `df = df[~df.index.duplicated(keep="last")]` → remove duplicates.
+* `df = df.asfreq("B")` → reindex to business days.
+* `df.ffill()` → forward-fill NaNs.
+* `df.bfill()` → backward-fill NaNs.
+* `df.interpolate()` → smooth missing values.
+* `df.resample("W").last()` → weekly last price.
+
+---
+
+## Problem (assignment)
+
+> **Build a time series cleaning pipeline that:**
+>
+> 1. Loads a ticker’s adjusted close prices.
+> 2. Ensures no duplicate dates.
+> 3. Fills missing weekdays with NaN, then forward-fills.
+> 4. Flags outliers >5σ from rolling mean.
+> 5. Outputs both the raw and cleaned series to CSV.
+> 6. Plots before/after for visual inspection.
+
+---
+
+## Python Code (production-ready)
+
+```python
+# step4_linkedlist_timeseries_cleaning.py
+import pandas as pd
+import numpy as np
+import yfinance as yf
+import matplotlib.pyplot as plt
+
+def clean_time_series(ticker, period="2y", interval="1d", sigma_thresh=5):
+    # 1) Download
+    df = yf.download(ticker, period=period, interval=interval, auto_adjust=True, progress=False)
+    if df.empty:
+        raise SystemExit("No data returned.")
+
+    # Keep Adjusted Close (or Close if only available)
+    if "Adj Close" in df.columns:
+        s = df["Adj Close"].rename("price")
+    elif "Close" in df.columns:
+        s = df["Close"].rename("price")
+    else:
+        raise SystemExit("No Close/Adj Close found.")
+
+    # 2) Remove duplicates
+    s = s[~s.index.duplicated(keep="last")]
+
+    # 3) Reindex to business days
+    full_range = pd.date_range(start=s.index.min(), end=s.index.max(), freq="B")
+    s = s.reindex(full_range)
+
+    # 4) Fill missing values
+    s_filled = s.ffill()
+
+    # 5) Outlier detection
+    rolling_mean = s_filled.rolling(20, min_periods=5).mean()
+    rolling_std = s_filled.rolling(20, min_periods=5).std()
+    zscore = (s_filled - rolling_mean) / rolling_std
+    outliers = zscore.abs() > sigma_thresh
+
+    # Replace outliers with NaN and ffill again
+    s_clean = s_filled.copy()
+    s_clean[outliers] = np.nan
+    s_clean = s_clean.ffill()
+
+    # 6) Save
+    out_df = pd.DataFrame({"raw": s, "filled": s_filled, "clean": s_clean})
+    out_df.to_csv(f"{ticker}_cleaned_timeseries.csv")
+
+    # 7) Plot
+    plt.figure(figsize=(12,6))
+    plt.plot(out_df.index, out_df["raw"], label="Raw", alpha=0.6)
+    plt.plot(out_df.index, out_df["clean"], label="Cleaned", linewidth=2)
+    plt.title(f"{ticker} Price Series (raw vs cleaned)")
+    plt.legend(); plt.tight_layout(); plt.show()
+
+    return out_df, outliers
+
+if __name__ == "__main__":
+    cleaned, outliers = clean_time_series("AAPL")
+    print(cleaned.head())
+    print(f"Total outliers flagged: {outliers.sum()}")
+```
+
+---
+
+## Real-life scenario
+
+On a **quant research team**, you’re building a factor model using **daily returns** across 2000 equities.
+
+* If you don’t clean, one bad print (e.g., MSFT at $0.01 for one day due to a feed glitch) creates a -99% return → breaks volatility estimates → corrupts correlation matrices → wrecks PCA/factor regressions.
+* Your cleaning pipeline ensures:
+
+  * Missing data is forward-filled properly.
+  * Outliers are flagged and neutralized.
+  * NAV curves, volatility, beta calculations are stable.
+
+Traders then trust your risk model because it’s robust to dirty vendor feeds.
+
+---
+
+## Articles & Docs
+
+* **Investopedia: Adjusted Close** (why adjusted > raw close).
+* **QuantInsti: Cleaning Financial Data** (practical guide).
+* **pandas time series docs** (`asfreq`, `resample`, `rolling`).
+* **Outlier detection in time series** — rolling z-scores vs robust MAD.
+* **Market data errors** — “bad ticks” case studies in high-frequency trading.
+
+---
+
