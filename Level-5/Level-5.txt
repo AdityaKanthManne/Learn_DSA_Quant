@@ -1,0 +1,200 @@
+Alright 🚀 — let’s move into **Step 5: Stacks + Evaluating Option Strategies**.
+I’ll follow the structure we’ve been using: **Theory → Problem + Python Code → Real-World Use Case → Articles/Resources.**
+This will be long (max character usage) so you get full depth.
+
+---
+
+# 📘 Step 5 — Stacks + Evaluating Option Strategies
+
+---
+
+## 🔹 Theory (Detailed)
+
+### 1. Data Structures: Stacks
+
+A **stack** is a linear data structure that follows **LIFO (Last In, First Out)** ordering.
+
+* Think of a stack of plates: the last plate you put on is the first plate you take off.
+* Two primary operations:
+
+  * **push(x):** Add element `x` to the top.
+  * **pop():** Remove and return the element from the top.
+* Other useful operations: `peek()` (see top without removing), `isEmpty()`, and `size()`.
+
+In **algorithmic trading and finance**, stacks are especially useful for evaluating **expressions** — for example, when you build payoff expressions for complex option strategies.
+
+---
+
+### 2. Options Recap
+
+Options are derivative contracts:
+
+* **Call option:** Right (not obligation) to buy the underlying at strike price `K`.
+* **Put option:** Right (not obligation) to sell the underlying at strike price `K`.
+* **Expiration (T):** The last day the contract is valid.
+* **Premium (P):** The cost to buy the option.
+
+**Option strategies** are built by combining multiple calls and puts:
+
+* **Covered Call:** Long underlying + short call.
+* **Protective Put:** Long stock + long put.
+* **Straddle:** Buy call and put at same strike/expiry.
+* **Strangle:** Buy call and put at different strikes.
+* **Spread:** Combination of multiple calls/puts at different strikes (bull/bear spreads).
+
+---
+
+### 3. Using Stacks for Payoff Expressions
+
+Why stacks? Because option strategies can be thought of as **arithmetic expressions** involving multiple instruments.
+
+For example:
+
+* A **covered call payoff** could be written as:
+  `Stock - Call(K)`
+* A **straddle payoff** could be written as:
+  `Call(K) + Put(K)`
+
+If we represent strategies in **Reverse Polish Notation (RPN)** or postfix format, we can evaluate them using a **stack**:
+
+* Push underlying instruments (e.g., stock payoff, call payoff, put payoff).
+* Push operators (+, -, *) for combining.
+* Pop operands and apply operation.
+
+This method is **scalable** to arbitrarily complex strategies.
+
+---
+
+### 4. Payoff Function Basics
+
+For a call option:
+[
+\text{Call Payoff} = \max(S_T - K, 0)
+]
+
+For a put option:
+[
+\text{Put Payoff} = \max(K - S_T, 0)
+]
+
+Where:
+
+* (S_T) = stock price at expiration
+* (K) = strike price
+
+---
+
+## 🔹 Problem Statement
+
+**Build a stack-based payoff evaluator** for option strategies.
+
+Given:
+
+* Underlying stock price at expiration range (vector).
+* Strategy defined in postfix form.
+* Evaluate payoffs using a stack.
+
+Example:
+
+* Covered call = `["Stock", "Call100", "-"]`
+* Straddle = `["Call100", "Put100", "+"]`
+
+---
+
+## 🔹 Python Code
+
+```python
+import numpy as np
+import matplotlib.pyplot as plt
+
+# ----- Helper payoff functions -----
+def stock_payoff(S, S0):
+    return S - S0  # Profit relative to initial stock price
+
+def call_payoff(S, K):
+    return np.maximum(S - K, 0)
+
+def put_payoff(S, K):
+    return np.maximum(K - S, 0)
+
+# ----- Stack-based payoff evaluator -----
+def evaluate_strategy(S_range, tokens, S0=None):
+    """
+    Evaluate an option strategy payoff using stack evaluation.
+    tokens: list of strings in postfix notation, e.g. ["Stock", "Call100", "-"]
+    """
+    stack = []
+
+    for token in tokens:
+        if token.startswith("Call"):
+            K = float(token[4:])
+            stack.append(call_payoff(S_range, K))
+        elif token.startswith("Put"):
+            K = float(token[3:])
+            stack.append(put_payoff(S_range, K))
+        elif token == "Stock":
+            if S0 is None:
+                raise ValueError("Need initial stock price S0 for stock payoff")
+            stack.append(stock_payoff(S_range, S0))
+        elif token == "+":
+            b = stack.pop()
+            a = stack.pop()
+            stack.append(a + b)
+        elif token == "-":
+            b = stack.pop()
+            a = stack.pop()
+            stack.append(a - b)
+        else:
+            raise ValueError(f"Unknown token: {token}")
+
+    return stack.pop()
+
+# ----- Example strategies -----
+S = np.linspace(50, 150, 200)  # price range at expiry
+S0 = 100  # initial stock price
+
+# Covered Call = Stock - Call(100)
+covered_call = evaluate_strategy(S, ["Stock", "Call100", "-"], S0)
+
+# Straddle = Call(100) + Put(100)
+straddle = evaluate_strategy(S, ["Call100", "Put100", "+"], S0)
+
+# ----- Plot results -----
+plt.figure(figsize=(12,6))
+plt.plot(S, covered_call, label="Covered Call")
+plt.plot(S, straddle, label="Straddle")
+plt.axhline(0, color="black", linewidth=0.8)
+plt.xlabel("Stock Price at Expiry (S_T)")
+plt.ylabel("Payoff")
+plt.title("Option Strategy Payoffs using Stack Evaluation")
+plt.legend()
+plt.grid(True)
+plt.show()
+```
+
+---
+
+## 🔹 Real-World Scenario
+
+Investment banks, hedge funds, and retail traders constantly **combine multiple options** to hedge or speculate. A **stack-based expression evaluator** like this is powerful because:
+
+* Traders design strategies as formulas → evaluator computes payoffs automatically.
+* Quant teams can model **exotic strategies** (multi-leg spreads, butterflies, condors) without rewriting payoff formulas every time.
+* Risk managers can test **stress scenarios**: e.g., “What if volatility spikes and the underlying moves ±30%?”
+
+Example:
+
+* A portfolio manager might want to hedge a stock portfolio with protective puts.
+* They define `"Stock Put100 +"` and quickly visualize the payoff profile.
+
+---
+
+## 🔹 Articles & Resources
+
+1. [Investopedia — Options Strategies](https://www.investopedia.com/options-strategies-4689741)
+2. [QuantStart — Options Trading Strategies](https://www.quantstart.com/articles/Option-Strategy-Payoff-Diagrams/)
+3. [CBOE Options Institute](https://www.cboe.com/education/)
+4. [CFI Options Trading Guide](https://corporatefinanceinstitute.com/resources/derivatives/options-trading/)
+5. [LeetCode Stacks](https://leetcode.com/tag/stack/) (practice stack problems, similar to evaluating postfix expressions).
+
+---
