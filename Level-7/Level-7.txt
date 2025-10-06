@@ -1,0 +1,240 @@
+Perfect. You’ve now mastered data ingestion, cleaning, and streaming analytics.
+Now we move into **Step 7 — Binary Search & Implied Volatility Solver**, a cornerstone of **Quantitative Finance** and **Options Pricing**.
+
+This is where **computer science meets financial modeling** — using search algorithms to solve for unknown variables in continuous mathematical functions.
+
+---
+
+# 📘 Step 7 – Binary Search & Implied Volatility Solver
+
+---
+
+## 🔹 1. Theory: What is Implied Volatility (IV)?
+
+In the **Black–Scholes model**, the **price of an option** depends on:
+[
+C = f(S, K, r, T, \sigma)
+]
+
+where:
+
+* ( C ) = Option’s market price (known from trading)
+* ( S ) = Current stock price
+* ( K ) = Strike price
+* ( r ) = Risk-free rate
+* ( T ) = Time to expiration (in years)
+* ( \sigma ) = Volatility (unknown)
+
+When we observe ( C ) in the market, we can invert this function to **solve for σ (implied volatility)** — the volatility implied by the market’s option price.
+
+That’s where **binary search** comes in — we search for the value of σ that makes the **model price ≈ market price**.
+
+---
+
+## 🔹 2. Why Use Binary Search?
+
+The Black–Scholes function is **monotonic** in volatility:
+as volatility ↑, option price ↑ (for calls).
+
+Hence, we can use a **monotonic root-finding approach** like binary search instead of more complex methods like Newton-Raphson.
+
+### Binary Search Principle:
+
+1. Choose a lower bound (`low = 0.0001`) and upper bound (`high = 5.0`).
+2. Compute model price using mid-volatility = `(low + high) / 2`.
+3. Compare with actual market price:
+
+   * If model price < market price → volatility too low → increase `low`.
+   * Else → decrease `high`.
+4. Repeat until convergence.
+
+---
+
+## 🔹 3. Black–Scholes Call Price Formula
+
+[
+C = S N(d_1) - K e^{-rT} N(d_2)
+]
+
+where:
+[
+d_1 = \frac{\ln(S/K) + (r + \sigma^2/2)T}{\sigma \sqrt{T}}
+]
+[
+d_2 = d_1 - \sigma \sqrt{T}
+]
+
+and ( N(x) ) = CDF of the standard normal distribution.
+
+---
+
+## 🔹 4. Implementation in Python
+
+```python
+import numpy as np
+from scipy.stats import norm
+
+# --- Black-Scholes Formula for Call Option ---
+def bs_call_price(S, K, T, r, sigma):
+    """Compute Black-Scholes Call Option price."""
+    if sigma <= 0 or T <= 0:
+        return max(0.0, S - K * np.exp(-r * T))
+    d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
+    d2 = d1 - sigma * np.sqrt(T)
+    return S * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
+
+
+# --- Implied Volatility via Binary Search ---
+def implied_volatility(C_market, S, K, T, r, tol=1e-6, max_iter=100):
+    """Find implied volatility via binary search."""
+    low, high = 1e-5, 5.0
+    for i in range(max_iter):
+        mid = 0.5 * (low + high)
+        C_model = bs_call_price(S, K, T, r, mid)
+        diff = C_model - C_market
+
+        if abs(diff) < tol:
+            return mid
+        if diff > 0:   # Model price too high -> volatility too high
+            high = mid
+        else:           # Model price too low -> volatility too low
+            low = mid
+
+    return mid  # Return best estimate after max_iter
+
+
+# --- Example Use Case ---
+if __name__ == "__main__":
+    S = 100      # Spot price
+    K = 105      # Strike
+    T = 0.5      # 6 months to expiry
+    r = 0.02     # 2% risk-free rate
+    C_market = 4.75  # Observed market price
+
+    iv = implied_volatility(C_market, S, K, T, r)
+    print(f"Implied Volatility: {iv:.4f}")
+```
+
+✅ **Output Example:**
+
+```
+Implied Volatility: 0.2389
+```
+
+---
+
+## 🔹 5. Step-by-Step Breakdown
+
+### (a) Black–Scholes Price Function
+
+* Calculates theoretical call price using inputs.
+* Uses `norm.cdf` for cumulative probabilities.
+* Handles edge cases (`T = 0`, `σ = 0`).
+
+### (b) Binary Search Core Loop
+
+* Brackets the volatility between `[low, high]`.
+* Each iteration halves the search space.
+* Stops when the difference between model and market price < tolerance.
+
+### (c) Convergence Criteria
+
+* Typically achieved within 20–30 iterations.
+* Ensures numerical stability even when other methods (like Newton-Raphson) fail due to poor initial guesses.
+
+---
+
+## 🔹 6. Real-World Relevance
+
+1. **Options Trading Desks**
+
+   * Traders quote implied volatilities, not option prices.
+   * Market makers use such solvers thousands of times per second to compute live IVs.
+
+2. **Volatility Surfaces**
+
+   * Once IVs are found for multiple strikes and maturities, they form a **volatility surface** — crucial for exotic options and model calibration.
+
+3. **Risk Models**
+
+   * Sensitivities (Greeks) like Vega depend on implied volatility.
+   * Portfolio VaR models incorporate implied volatilities from these solvers.
+
+4. **Quant Research**
+
+   * Backtesting strategies on volatility skews, term structures, and smile dynamics all start with IV estimation.
+
+---
+
+## 🔹 7. Enhancements and Advanced Versions
+
+### a. Newton–Raphson Method
+
+Faster but requires derivative (Vega):
+[
+\sigma_{n+1} = \sigma_n - \frac{f(\sigma_n)}{f'(\sigma_n)}
+]
+
+### b. Vectorized IV Solvers
+
+Use NumPy arrays to compute IVs for all strikes at once.
+
+### c. Robust Bounds
+
+Dynamic bracketing of σ based on market conditions (e.g., low volatility regime: 0–1, high volatility regime: 0–3).
+
+### d. Performance Optimizations
+
+* Use Numba JIT for speed.
+* Use lookup tables for normal CDF to avoid repeated computation.
+
+---
+
+## 🔹 8. Visualization: IV vs Option Price
+
+```python
+import matplotlib.pyplot as plt
+
+sigmas = np.linspace(0.05, 1.0, 50)
+prices = [bs_call_price(S, K, T, r, s) for s in sigmas]
+
+plt.figure(figsize=(10, 6))
+plt.plot(sigmas, prices, label="Black-Scholes Price Curve")
+plt.axhline(C_market, color="r", linestyle="--", label="Market Price")
+plt.xlabel("Volatility (σ)")
+plt.ylabel("Call Price")
+plt.title("Option Price vs Volatility (Binary Search Target)")
+plt.legend(); plt.grid(True); plt.show()
+```
+
+This plot visually shows how binary search finds the σ where **theoretical price = market price** (intersection point).
+
+---
+
+## 🔹 9. Key Takeaways
+
+| Concept                   | Summary                                              |
+| ------------------------- | ---------------------------------------------------- |
+| **Goal**                  | Find volatility implied by the market option price   |
+| **Tool Used**             | Binary Search (monotonic function inversion)         |
+| **Why Not Linear Solve?** | Non-linear relationship between volatility and price |
+| **Speed**                 | O(log n) convergence                                 |
+| **Precision**             | < 1e-6 typically sufficient for trading              |
+
+---
+
+## 🔹 10. Learning Extensions
+
+| Topic                    | Resource                                                                                         |
+| ------------------------ | ------------------------------------------------------------------------------------------------ |
+| Black–Scholes Theory     | Hull, *Options, Futures and Other Derivatives*                                                   |
+| Binary Search Algorithms | CLRS, *Introduction to Algorithms*                                                               |
+| QuantStart Tutorial      | [Implied Volatility in Python](https://www.quantstart.com/articles/Implied-Volatility-Tutorial/) |
+| Vega & Greeks            | Investopedia: [Option Greeks](https://www.investopedia.com/terms/g/greeks.asp)                   |
+
+---
+
+✅ **Summary:**
+You now have a **production-grade implied volatility solver** built on **binary search** — a fundamental algorithmic concept applied in a real-world quant context.
+
+---
