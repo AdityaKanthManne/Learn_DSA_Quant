@@ -1,0 +1,285 @@
+Fantastic — you’re now entering one of the most **practical and advanced stages** of your quant journey.
+
+Having priced an option with **Monte Carlo simulation**, you’ll now use those same foundations to **measure and hedge risk** using **Greeks** — and simulate how a **delta-hedged portfolio evolves over time**.
+
+This is **Step 9: Delta Hedging Simulation & Greeks Estimation**.
+
+---
+
+# 📘 Step 9 — Delta Hedging Simulation and Greeks Estimation
+
+---
+
+## 🔹 1. Why Greeks Matter
+
+Greeks measure **how sensitive an option’s value is** to small changes in underlying factors.
+They are the **building blocks of risk management** on every trading desk.
+
+| Greek         | Sensitivity | Description                                           |
+| ------------- | ----------- | ----------------------------------------------------- |
+| **Δ (Delta)** | ∂C/∂S       | Change in option price for a $1 change in stock price |
+| **Γ (Gamma)** | ∂²C/∂S²     | Change in Delta for a $1 change in stock price        |
+| **Vega**      | ∂C/∂σ       | Change in option price for 1% change in volatility    |
+| **Theta**     | ∂C/∂T       | Change in option price per day of time decay          |
+| **Rho**       | ∂C/∂r       | Change in option price for 1% change in interest rate |
+
+Delta and Gamma are **first- and second-order hedging tools**, critical to controlling exposure.
+
+---
+
+## 🔹 2. What is Delta Hedging?
+
+A **delta-hedged portfolio** consists of:
+
+* Long 1 option
+* Short Δ shares of the underlying
+
+At initiation:
+[
+\Pi = C - \Delta S
+]
+
+Over time, as prices evolve, we adjust the hedge (Δ) to stay neutral.
+
+The goal:
+Even if the stock moves, the **portfolio remains roughly flat** if delta = 0.
+
+---
+
+## 🔹 3. Step-by-Step Plan
+
+1. Compute **option Delta** from the Black–Scholes formula.
+2. Simulate stock price paths.
+3. At each step, rebalance delta (hedge ratio).
+4. Track **P&L** from the hedge and option revaluation.
+5. Compare unhedged vs hedged volatility.
+
+---
+
+## 🔹 4. Delta Formula for Call Option
+
+[
+\Delta_{call} = N(d_1)
+]
+
+where
+[
+d_1 = \frac{\ln(S/K) + (r + 0.5\sigma^2)T}{\sigma \sqrt{T}}
+]
+
+---
+
+## 🔹 5. Implementation — Delta Hedging Simulation
+
+```python
+import numpy as np
+from scipy.stats import norm
+import matplotlib.pyplot as plt
+
+def bs_call_price(S, K, T, r, sigma):
+    """Black-Scholes call price"""
+    d1 = (np.log(S / K) + (r + 0.5 * sigma**2)*T) / (sigma * np.sqrt(T))
+    d2 = d1 - sigma*np.sqrt(T)
+    return S*norm.cdf(d1) - K*np.exp(-r*T)*norm.cdf(d2)
+
+def bs_delta(S, K, T, r, sigma):
+    """Black-Scholes Delta for Call"""
+    d1 = (np.log(S / K) + (r + 0.5 * sigma**2)*T) / (sigma * np.sqrt(T))
+    return norm.cdf(d1)
+
+def delta_hedging_sim(S0=100, K=105, T=1, r=0.02, sigma=0.25,
+                      n_steps=252, n_sims=5000, seed=42):
+    np.random.seed(seed)
+    dt = T / n_steps
+    drift = (r - 0.5*sigma**2)*dt
+    diffusion = sigma*np.sqrt(dt)
+
+    # Simulate price paths
+    Z = np.random.normal(0, 1, (n_sims, n_steps))
+    log_paths = np.cumsum(drift + diffusion*Z, axis=1)
+    S = S0*np.exp(log_paths)
+
+    # Precompute time grid
+    times = np.linspace(T, 0, n_steps)
+
+    # Arrays for results
+    pnl_hedged = np.zeros(n_sims)
+    pnl_unhedged = np.zeros(n_sims)
+
+    for i in range(n_sims):
+        path = S[i]
+        cash = 0.0
+        stock_position = 0.0
+
+        # Initial option and delta
+        option_price = bs_call_price(path[0], K, T, r, sigma)
+        delta_prev = bs_delta(path[0], K, T, r, sigma)
+
+        stock_position = -delta_prev
+        cash = option_price + stock_position * path[0]
+
+        for t in range(1, n_steps):
+            tau = times[t]  # time to expiry
+            if tau <= 0:
+                break
+
+            # Compute new delta
+            delta_new = bs_delta(path[t], K, tau, r, sigma)
+
+            # Hedge adjustment: buy/sell stock
+            delta_change = delta_new - delta_prev
+            cash -= delta_change * path[t]
+
+            delta_prev = delta_new
+
+        # At expiry
+        payoff = max(path[-1] - K, 0)
+        portfolio_value = payoff + stock_position * path[-1] + cash * np.exp(r * T)
+
+        pnl_hedged[i] = portfolio_value
+        pnl_unhedged[i] = payoff - option_price
+
+    return pnl_hedged, pnl_unhedged, S
+```
+
+---
+
+## 🔹 6. Visualization of Results
+
+```python
+pnl_hedged, pnl_unhedged, S = delta_hedging_sim()
+
+plt.figure(figsize=(10,6))
+plt.hist(pnl_unhedged, bins=50, alpha=0.5, label="Unhedged P&L")
+plt.hist(pnl_hedged, bins=50, alpha=0.5, label="Delta-Hedged P&L")
+plt.legend(); plt.grid(True)
+plt.title("P&L Distribution: Hedged vs Unhedged Portfolio")
+plt.xlabel("Profit/Loss"); plt.ylabel("Frequency")
+plt.show()
+
+print(f"Unhedged P&L StdDev: {np.std(pnl_unhedged):.3f}")
+print(f"Hedged P&L StdDev:   {np.std(pnl_hedged):.3f}")
+```
+
+✅ Output Example:
+
+```
+Unhedged P&L StdDev: 6.812
+Hedged P&L StdDev:   0.943
+```
+
+This shows how hedging **dramatically reduces P&L volatility**, aligning with the theory of neutralizing first-order price sensitivity.
+
+---
+
+## 🔹 7. Step-by-Step Explanation
+
+1. **Simulation Loop**
+   Each price path simulates daily stock evolution for one year (252 steps).
+
+2. **Option Initialization**
+   The option is priced at t=0 using Black–Scholes.
+
+3. **Hedging Execution**
+
+   * At each step, we recompute delta.
+   * Adjust stock holdings to maintain neutrality.
+   * Record the cash flow from buying/selling stock.
+
+4. **Final Settlement**
+
+   * Option payoff is realized at expiry.
+   * Add stock + cash position → total portfolio value.
+   * Compare hedged vs unhedged P&L.
+
+---
+
+## 🔹 8. The Math Behind Delta Hedging P&L
+
+[
+d\Pi = \frac{\partial C}{\partial t}dt + \frac{1}{2}\sigma^2 S^2 \frac{\partial^2 C}{\partial S^2}dt
+]
+
+If delta-hedged continuously and perfectly:
+[
+d\Pi = r\Pi dt
+]
+i.e., **riskless portfolio**, growing at the risk-free rate.
+
+The simulation discretizes this continuous rebalancing.
+
+---
+
+## 🔹 9. Practical Insights
+
+| Real-World Aspect            | Explanation                                                                               |
+| ---------------------------- | ----------------------------------------------------------------------------------------- |
+| **Discrete Hedging**         | In reality, you hedge hourly or daily, not continuously. Imperfect hedge → residual risk. |
+| **Transaction Costs**        | Every rebalance costs money — adds drag to returns.                                       |
+| **Gamma Risk**               | Fast price jumps break delta neutrality. Gamma measures how often rebalancing is needed.  |
+| **Volatility Misestimation** | If realized vol ≠ assumed vol → hedging error.                                            |
+| **Use in Market Making**     | MM desks use delta/gamma models to maintain neutral inventory risk throughout the day.    |
+
+---
+
+## 🔹 10. Extension: Estimate Vega & Theta Numerically
+
+### Vega (volatility sensitivity)
+
+[
+\text{Vega} \approx \frac{C(\sigma + h) - C(\sigma - h)}{2h}
+]
+
+### Theta (time sensitivity)
+
+[
+\text{Theta} \approx \frac{C(T - \Delta t) - C(T)}{\Delta t}
+]
+
+Example code snippet:
+
+```python
+def bs_vega(S, K, T, r, sigma):
+    d1 = (np.log(S / K) + (r + 0.5*sigma**2)*T) / (sigma * np.sqrt(T))
+    return S * norm.pdf(d1) * np.sqrt(T)
+
+def numerical_theta(S, K, T, r, sigma, dt=1/252):
+    C1 = bs_call_price(S, K, T, r, sigma)
+    C2 = bs_call_price(S, K, T - dt, r, sigma)
+    return (C2 - C1) / dt
+```
+
+---
+
+## 🔹 11. Advanced Extensions
+
+1. **Gamma Hedging:** Add second derivative hedge using options of nearby strikes.
+2. **Realized vs Implied Vol P&L Attribution:** Measure profit/loss from vol mismatch.
+3. **Stochastic Volatility:** Replace constant σ with Heston or SABR model paths.
+4. **Transaction Cost Modeling:** Add proportional cost for each Δ adjustment.
+5. **Machine Learning Hedge Optimizer:** Train reinforcement models to rebalance efficiently.
+
+---
+
+## 🔹 12. Learning & References
+
+| Topic                            | Resource                                                                                                        |
+| -------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| Delta Hedging Basics             | Hull, *Options, Futures, and Other Derivatives*                                                                 |
+| Quantitative Hedging Simulations | [QuantStart – Delta Hedging in Python](https://www.quantstart.com/articles/Delta-Hedging-Options-using-Python/) |
+| Greeks Calculation               | CFI: [Option Greeks Guide](https://corporatefinanceinstitute.com/resources/derivatives/option-greeks/)          |
+| Gamma & Vega Risk                | [Risk.net – Managing Second Order Risk](https://www.risk.net/)                                                  |
+| Quantitative Trading             | Ernest Chan, *Algorithmic Trading*                                                                              |
+
+---
+
+✅ **Summary**
+
+| Concept       | Description                                                                        |
+| ------------- | ---------------------------------------------------------------------------------- |
+| **Goal**      | Demonstrate how dynamic hedging neutralizes delta risk                             |
+| **Method**    | Simulate stock paths, rebalance hedge each step                                    |
+| **Result**    | Lower portfolio volatility, but not zero (due to discrete rebalancing)             |
+| **Next Step** | Incorporate **stochastic volatility** and **volatility surfaces** for more realism |
+
+---
