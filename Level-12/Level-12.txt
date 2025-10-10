@@ -1,0 +1,255 @@
+Heck yes — time to level up to **Step 12: Local Volatility via Dupire**.
+Here we turn your implied-vol surface ( \sigma_{\text{imp}}(K,T) ) into an **instantaneous local volatility surface** ( \sigma_{\text{loc}}(K,T) ) that’s consistent with all vanilla option prices (in theory), and is used to price path-dependent exotics.
+
+I’ll give you: **theory**, a concrete **problem**, a **single runnable Python cell** that builds ( \sigma_{\text{loc}} ) from Yahoo option chains (using your Step 10 flow), a **real desk scenario**, and **readings**.
+
+---
+
+# Step 12 — Local Volatility (Dupire Surface)
+
+## Theory (dense but essential)
+
+* We want a model where the underlying follows:
+  [
+  dS_t = (r - q),S_t,dt + \sigma_{\text{loc}}(S_t,t),S_t,dW_t
+  ]
+* **Dupire’s result**: if you know risk-neutral call prices ( C(K,T) ) for *all* (K,T), the **local variance** is
+  [
+  \sigma_{\text{loc}}^2(K,T) =
+  \frac{\partial_T C(K,T)}{\tfrac{1}{2}K^2,\partial_{KK} C(K,T)} \quad
+  \text{(with rates/divs handled via forwards).}
+  ]
+* In practice we don’t observe ( C(K,T) ) directly for all (K,T). We observe quotes → compute **implied vol** ( \sigma_{\text{imp}}(K,T) ) → rebuild **BS call prices** ( C^{BS}(K,T;\sigma_{\text{imp}}) ) on a grid → take **numerical derivatives** in (K) and (T) → plug into Dupire formula.
+* **Caveats** (big ones): finite differences are noisy; quotes have micro-arbitrage; (\partial_{KK}C) can be small → numerical blow-ups. So we **smooth, clip**, and sometimes **regularize**.
+
+---
+
+## Problem
+
+1. Download several expiries of a ticker’s option chain.
+2. Build ( \sigma_{\text{imp}}(K,T) ) and then compute a grid of **BS call prices** ( C(K,T) ).
+3. Approximate (\partial_T C) and (\partial_{KK} C) with centered finite differences.
+4. Compute ( \sigma_{\text{loc}}(K,T) ) using Dupire, apply safety guards, and visualize 3D + heatmap.
+5. Export the local-vol points to CSV.
+
+---
+
+## One-cell Python (drop into Jupyter / PyCharm and run)
+
+```python
+# Step 12 — Local Volatility via Dupire from an Implied-Vol Surface
+import numpy as np, pandas as pd, matplotlib.pyplot as plt, yfinance as yf
+from datetime import datetime, timezone
+from scipy.stats import norm
+
+# ---------------- Black–Scholes helpers ---------------- #
+def bs_call_price(S, K, T, r, q, sigma):
+    if T <= 0:  # maturity payoff under risk-neutral
+        return max(S*np.exp(-q*T) - K*np.exp(-r*T), 0.0)
+    if sigma <= 0:
+        return max(S*np.exp(-q*T) - K*np.exp(-r*T), 0.0)
+    d1 = (np.log((S*np.exp(-q*T))/(K*np.exp(-r*T))) + 0.5*sigma*sigma*T) / (sigma*np.sqrt(T))
+    d2 = d1 - sigma*np.sqrt(T)
+    return S*np.exp(-q*T)*norm.cdf(d1) - K*np.exp(-r*T)*norm.cdf(d2)
+
+def implied_vol_binary(C_mkt, S, K, T, r=0.02, q=0.0, tol=1e-6, low=1e-6, high=5.0, max_iter=100):
+    # simple robust bracketing IV for calls
+    intrinsic = max(0.0, S*np.exp(-q*T) - K*np.exp(-r*T))
+    if C_mkt < intrinsic - 1e-10:  # stale/bad quote
+        return np.nan
+    if abs(C_mkt - intrinsic) < 1e-12:
+        return 0.0
+    lo, hi = low, high
+    for _ in range(max_iter):
+        mid = 0.5*(lo+hi)
+        price = bs_call_price(S, K, T, r, q, mid)
+        if abs(price - C_mkt) < tol:
+            return mid
+        if price > C_mkt: hi = mid
+        else: lo = mid
+    return mid
+
+# ---------------- Build IV surface from Yahoo ---------------- #
+def pull_iv_surface(ticker="AAPL", max_expiries=6, r=0.02, q=0.0, prefer_calls=True):
+    tk = yf.Ticker(ticker)
+    spot_series = tk.history(period="1d")["Close"]
+    if spot_series.empty:
+        raise SystemExit("No spot data.")
+    S = float(spot_series.iloc[-1])
+    expiries = tk.options
+    if not expiries:
+        raise SystemExit("No listed options.")
+    expiries = expiries[:max_expiries]
+
+    now = datetime.now(timezone.utc)
+    rows = []
+    for exp in expiries:
+        chain = tk.option_chain(exp)
+        calls = chain.calls.copy()
+        puts  = chain.puts.copy()
+        # compute mid
+        for df, side in [(calls, "C"), (puts, "P")]:
+            if not df.empty:
+                df["mid"] = (df["bid"].fillna(0) + df["ask"].fillna(0))/2.0
+                df["side"] = side
+        # pick data
+        base = None
+        if prefer_calls and not calls.empty:
+            base = calls
+        elif not puts.empty:
+            base = puts
+        else:
+            continue
+        base = base.dropna(subset=["mid"])
+        if base.empty:
+            continue
+
+        T = max((pd.to_datetime(exp).tz_localize("UTC") - now).days/365.0, 1e-6)
+        # Compute IV per strike from mid call (or put if chosen)
+        ivs = []
+        for _, row in base.iterrows():
+            K = float(row["strike"])
+            Cmid = float(row["mid"])
+            iv = implied_vol_binary(Cmid, S, K, T, r=r, q=q)
+            ivs.append((K, T, iv))
+        frame = pd.DataFrame(ivs, columns=["strike","T","iv"]).dropna()
+        rows.append(frame)
+
+    if not rows:
+        raise SystemExit("No usable IV points.")
+    iv_table = pd.concat(rows, ignore_index=True).dropna()
+    # clean/sort
+    iv_table = iv_table[(iv_table["iv"]>0) & (iv_table["iv"]<5.0)]
+    iv_table = iv_table.sort_values(["T","strike"]).reset_index(drop=True)
+    return S, iv_table
+
+# ---------------- Dupire: C(K,T) grid & local vol ---------------- #
+def dupire_local_vol_surface(ticker="AAPL", max_expiries=6, r=0.02, q=0.0,
+                             clip_sigma_loc=(0.01, 3.0)):
+    S, iv_table = pull_iv_surface(ticker=ticker, max_expiries=max_expiries, r=r, q=q)
+
+    # pivot to regular grid (T rows, K cols)
+    piv = iv_table.pivot_table(index="T", columns="strike", values="iv")
+    T_vals = piv.index.values
+    K_vals = piv.columns.values
+    sigma_imp = piv.values  # shape (len(T), len(K))
+
+    # compute Black–Scholes call price grid C(K,T) using σ_imp
+    C = np.zeros_like(sigma_imp)
+    for i, T in enumerate(T_vals):
+        for j, K in enumerate(K_vals):
+            C[i, j] = bs_call_price(S, K, T, r, q, sigma_imp[i, j])
+
+    # finite-difference derivatives
+    # Use nonuniform-safe gradients if needed; here grids are uniform (after pivot)
+    # ∂C/∂T (rows); ∂^2 C/∂K^2 (cols twice)
+    # Guard against small grid sizes
+    if len(T_vals) < 3 or len(K_vals) < 3:
+        raise SystemExit("Need at least 3 expiries and 3 strikes for stable second derivatives.")
+
+    # approximate gradients with central differences via numpy.gradient then gradient again
+    # scale by actual step sizes
+    dT = T_vals[1] - T_vals[0]
+    dK = K_vals[1] - K_vals[0]
+
+    dC_dT = np.gradient(C, dT, axis=0)          # ∂C/∂T
+    dC_dK  = np.gradient(C, dK, axis=1)         # ∂C/∂K
+    d2C_dK2 = np.gradient(dC_dK, dK, axis=1)    # ∂²C/∂K²
+
+    # Dupire local variance: sigma_loc^2 = (∂C/∂T) / (0.5 * K^2 * ∂²C/∂K²)
+    K_grid = np.tile(K_vals, (len(T_vals), 1))
+    denom = 0.5 * (K_grid**2) * d2C_dK2
+
+    # numerical guards: avoid divide-by-zero / negative curvatures
+    eps = 1e-10
+    denom_safe = np.where(np.abs(denom) < eps, np.nan, denom)
+    sig2 = dC_dT / denom_safe
+
+    # local vol is sqrt of local variance; clip to sane band to suppress spikes
+    sigma_loc = np.sqrt(np.clip(sig2, clip_sigma_loc[0]**2, clip_sigma_loc[1]**2))
+
+    # mask NaNs where derivatives unreliable (edges)
+    mask = ~np.isfinite(sigma_loc)
+    sigma_loc[mask] = np.nan
+
+    # pack results table
+    rows = []
+    for i, T in enumerate(T_vals):
+        for j, K in enumerate(K_vals):
+            rows.append((T, K, sigma_imp[i,j], C[i,j], dC_dT[i,j], d2C_dK2[i,j], sigma_loc[i,j]))
+    out = pd.DataFrame(rows, columns=["T","strike","iv_imp","call_price","dC_dT","d2C_dK2","sigma_loc"])
+
+    return S, T_vals, K_vals, sigma_imp, sigma_loc, out
+
+# ---------------- Plotting helpers ---------------- #
+def plot_surface(K_vals, T_vals, Z, title, zlabel):
+    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+    Tmesh, Kmesh = np.meshgrid(T_vals, K_vals, indexing="ij")
+    fig = plt.figure(figsize=(11,7))
+    ax = fig.add_subplot(111, projection="3d")
+    ax.plot_surface(Kmesh, Tmesh, Z, linewidth=0, antialiased=True)
+    ax.set_xlabel("Strike (K)")
+    ax.set_ylabel("Time to Expiry (T, yrs)")
+    ax.set_zlabel(zlabel)
+    ax.set_title(title)
+    plt.tight_layout(); plt.show()
+
+def plot_heatmap(K_vals, T_vals, Z, title, cbar="Value"):
+    plt.figure(figsize=(11,5))
+    extent=[K_vals.min(), K_vals.max(), T_vals.min(), T_vals.max()]
+    plt.imshow(Z, aspect="auto", origin="lower", extent=extent)
+    plt.colorbar(label=cbar)
+    plt.xlabel("Strike (K)"); plt.ylabel("T (yrs)"); plt.title(title)
+    plt.tight_layout(); plt.show()
+
+# ---------------- Run demo ---------------- #
+if __name__ == "__main__":
+    ticker = "AAPL"
+    r, q = 0.02, 0.0
+    S, T_vals, K_vals, sigma_imp, sigma_loc, table = dupire_local_vol_surface(
+        ticker=ticker, max_expiries=6, r=r, q=q, clip_sigma_loc=(0.05, 2.5)
+    )
+
+    # Visualize implied vol vs local vol
+    plot_surface(K_vals, T_vals, sigma_imp, f"{ticker} Implied Vol Surface", "σ_imp")
+    plot_surface(K_vals, T_vals, sigma_loc, f"{ticker} Local Vol (Dupire) Surface", "σ_loc")
+
+    # Heatmaps for a quick glance
+    plot_heatmap(K_vals, T_vals, sigma_imp, f"{ticker} IV Heatmap", "σ_imp")
+    plot_heatmap(K_vals, T_vals, sigma_loc, f"{ticker} Local Vol Heatmap", "σ_loc")
+
+    # Save points
+    table.to_csv(f"{ticker}_dupire_local_vol_points.csv", index=False)
+    print(f"Saved: {ticker}_dupire_local_vol_points.csv")
+    print(table.head())
+```
+
+### Implementation notes / guards
+
+* Uses **calls mid** (falls back logic removed here for clarity).
+* Computes **BS call prices** on the IV grid; then **central differences** in (T) and (K).
+* Clips ( \sigma_{\text{loc}} ) into a sane band (defaults to 5%–250%) to prevent visual blow-ups from tiny (\partial_{KK}C).
+* Requires at **least 3 expiries and 3 strikes** for stable second derivatives.
+* For serious use, add **smoothing / regularization** (e.g., spline fits, Tikhonov) before differencing.
+
+---
+
+## Real-life scenario (desk use)
+
+An exotics desk needs a **calibrated local vol** to price **barrier/Asian options** consistently with vanilla quotes. During morning calibration:
+
+1. Ingest order book → build **IV surface**.
+2. Smooth & enforce **no-arbitrage**.
+3. Compute **Dupire local vol** → feed into PDE / Monte Carlo pricer for exotics.
+4. Sensitivities (Vega/Skew) and **scenario shocks** (term or strike) are run off the local-vol engine.
+
+---
+
+## Articles & references
+
+* **Gatheral, J.** *The Volatility Surface* — core reference on smiles, local/stochastic vol.
+* **Dupire, B.** “Pricing with a smile” — original local vol derivation.
+* **Derman & Kani** — implied trees / smile modeling.
+* Numerical stability & smoothing: spline/P-splines, Tikhonov regularization, SSVI (arbitrage-free implied-vol parametrization) as a pre-fit before Dupire.
+
+---
