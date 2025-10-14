@@ -1,0 +1,147 @@
+Perfect — welcome to **Step 14: Volatility and Correlation Networks in Option Markets**.
+You’ve already built smooth implied and local-vol surfaces; now we move to **cross-asset structure**—how volatilities co-move, cluster, and transmit risk.
+
+---
+
+# 📘 Step 14 — Volatility & Correlation Network Analysis
+
+---
+
+## 🔹 1️⃣ The Concept
+
+We study how **volatility changes across multiple assets** correlate in time.
+This reveals:
+
+* Systemic risk hotspots
+* Sector volatility clusters
+* Diversification breakdown zones
+
+Given assets (i,j):
+[
+\rho_{ij} = \text{corr}(\Delta\sigma_i,\ \Delta\sigma_j)
+]
+where (\Delta\sigma_i) is the daily change in implied or realized volatility.
+
+We’ll build a **correlation matrix → graph network** where:
+
+* Nodes = assets
+* Edges = correlation strength
+* Layout = spring/force or sector clusters
+* Edge width ∝ | ρ |, color ∝ sign(ρ)
+
+---
+
+## 🔹 2️⃣ Dataset Choice
+
+Use the same `clean_time_series` pipeline from Step 4–6 but for **multiple tickers** (e.g. AAPL, MSFT, GOOG, META, NVDA).
+From each, compute a rolling realized volatility or fetch **IV 30d** from `yfinance` if available.
+
+---
+
+## 🔹 3️⃣ One-Cell Python Implementation
+
+```python
+# Step 14 — Volatility and Correlation Network
+import numpy as np, pandas as pd, matplotlib.pyplot as plt, networkx as nx, yfinance as yf
+
+tickers = ["AAPL","MSFT","GOOG","META","NVDA","AMZN","TSLA","NFLX"]
+period = "1y"; interval = "1d"
+
+def realized_vol(series, window=20):
+    returns = np.log(series/series.shift(1))
+    vol = returns.rolling(window).std() * np.sqrt(252)
+    return vol
+
+# 1. Download prices & compute realized vol
+data = yf.download(tickers, period=period, interval=interval, auto_adjust=True, progress=False)["Close"]
+vol_df = data.apply(realized_vol)
+vol_df = vol_df.dropna()
+
+# 2. Compute daily vol change correlations
+delta_vol = vol_df.diff().dropna()
+corr = delta_vol.corr()
+
+# 3. Build correlation network
+G = nx.Graph()
+for t in tickers:
+    G.add_node(t)
+for i in range(len(tickers)):
+    for j in range(i+1,len(tickers)):
+        r = corr.iloc[i,j]
+        if abs(r) > 0.3:  # threshold for clarity
+            G.add_edge(tickers[i], tickers[j], weight=abs(r), sign=np.sign(r))
+
+# 4. Draw network
+plt.figure(figsize=(9,7))
+pos = nx.spring_layout(G, seed=42, k=0.8)
+edges = G.edges(data=True)
+colors = ['red' if e[2]['sign']<0 else 'green' for e in edges]
+widths = [4*e[2]['weight'] for e in edges]
+nx.draw(G,pos,with_labels=True,node_size=1200,node_color="#CCE5FF",
+        edge_color=colors,width=widths,font_size=10,font_weight="bold")
+plt.title("Volatility Correlation Network (1-Year Realized Vol Changes)")
+plt.show()
+
+# 5. Eigen decomposition for systemic clustering
+vals, vecs = np.linalg.eig(corr)
+plt.figure(figsize=(8,4))
+plt.bar(range(1,len(vals)+1),sorted(vals,reverse=True))
+plt.title("Eigenvalue Spectrum of Volatility Correlation Matrix")
+plt.xlabel("Component #"); plt.ylabel("Eigenvalue")
+plt.tight_layout(); plt.show()
+
+# 6. Export correlation matrix
+corr.to_csv("vol_correlation_matrix.csv")
+print(corr.round(2))
+```
+
+---
+
+## 🔹 4️⃣ Interpretation
+
+| Feature                            | Insight                                                             |
+| :--------------------------------- | :------------------------------------------------------------------ |
+| **Dense green cluster**            | Positive vol co-movements (sector tightening, systemic risk rising) |
+| **Sparse network**                 | Diversified vol structure                                           |
+| **Red edges**                      | Hedging relationships (e.g., TSLA vs META)                          |
+| **Large eigenvalue > market mode** | Common factor driving vols (“market vol factor”)                    |
+
+---
+
+## 🔹 5️⃣ Quant Applications
+
+1️⃣ **Risk clustering** → group portfolios by vol correlation rather than returns.
+2️⃣ **Vol spillover analysis** → detect how tech or crypto vol spreads to indices.
+3️⃣ **Stress testing** → simulate vol shock to a hub node (e.g., NVDA) and observe propagation.
+4️⃣ **Volatility ETFs hedging** → select low-ρ pairs for dispersion trades.
+
+---
+
+## 🔹 6️⃣ Practice Extensions
+
+| Task                                                   | Goal                                    |
+| :----------------------------------------------------- | :-------------------------------------- |
+| Replace realized vol with 30-day IV from option chains | Get market-implied network              |
+| Compute rolling ρ(t) windows                           | Visualize time-varying vol connectivity |
+| Use sector color codes + centrality scores             | Identify vol “hubs”                     |
+| Compare 2022 vs 2024 network                           | Structural vol regime change            |
+
+---
+
+## 🔹 7️⃣ Key References
+
+* Engle, R. *Dynamic Conditional Correlation Models (DCC-GARCH)*
+* Doyle & Miccichè (2020) — Volatility network topology
+* QuantStart tutorials on “Volatility Spillover Networks”
+* Barabási — *Network Science* (chapters on correlation graphs)
+
+---
+
+✅ **Step Summary**
+
+| Aspect    | Result                                                                          |
+| :-------- | :------------------------------------------------------------------------------ |
+| Built     | Realized vol for 8 tech tickers                                                 |
+| Computed  | Correlation matrix + network graph                                              |
+| Revealed  | Sector connectivity + systemic factor                                           |
+| Next Step | **Step 15 – Dynamic Volatility Regimes (Clustering & Regime Switching Models)** |
