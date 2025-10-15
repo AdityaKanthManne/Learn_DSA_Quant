@@ -1,0 +1,283 @@
+Awesome — let’s tackle **Step 16: Dynamic Programming + Optimal Trade Scheduling** (aka “best time to trade with cooldown & costs”). This bridges classic DSA DP with a real trading constraint: **you can’t trade every day** (cooldown & fees), so you must schedule trades optimally.
+
+---
+
+# Step 16 — Optimal Trade Scheduling with Cooldown (DP)
+
+## Theory (quick but dense)
+
+* You have a daily price series ( p_t ).
+* You can hold **at most one share** at a time.
+* After selling, you must **cool down** for (c) days (no buys).
+* Each transaction incurs a **fee** (f) (round-trip approximated as per sell or per buy—here we deduct at sell).
+* Objective: **maximize total profit** over the horizon.
+
+### DP state machine (LeetCode-309 style, extended)
+
+Define three states at day (t):
+
+* **hold[t]** — max cash if you **currently hold** a share at end of day (t).
+* **rest[t]** — max cash if you **hold nothing** and are **free to buy** at end of day (t).
+* **cool[t]** — max cash if you **hold nothing** and are in **cooldown** at end of day (t).
+
+Transitions (for cooldown (c=1); we’ll generalize in code):
+
+* **Buy (rest → hold):**
+  ( \text{hold}[t] = \max(\text{hold}[t-1],\ \text{rest}[t-1] - p_t) )
+* **Sell (hold → cool):**
+  ( \text{cool}[t] = \text{hold}[t-1] + p_t - f )
+* **Idle:**
+  ( \text{rest}[t] = \max(\text{rest}[t-1],\ \text{cool}[t-1]) )
+
+For **cooldown (c>1)**, we propagate a queue of cooldown buckets so buy isn’t allowed until (c) days after a sell.
+
+### Why DP?
+
+The states capture all path-dependent constraints (holding, cooldown, costs). Greedy fails when fees/cooldowns mute frequent trading; DP finds the globally optimal schedule.
+
+---
+
+## Your task (problem)
+
+1. Download a ticker’s daily prices (e.g., **AAPL**, 3y).
+2. Solve the **optimal schedule** with DP under:
+
+   * cooldown (c) days,
+   * per-sale fee (f).
+3. Compare against:
+
+   * **Buy & Hold** baseline,
+   * **Naive frequent trading** (threshold rule).
+4. Plot equity curves and print trade list (buy/sell dates) for the DP policy.
+
+---
+
+## One-cell Python (run as-is)
+
+```python
+# Step 16 — Dynamic Programming: Optimal Trade Scheduling with Cooldown & Fees
+import numpy as np, pandas as pd, yfinance as yf, matplotlib.pyplot as plt
+from dataclasses import dataclass
+
+# ---------------- Config ----------------
+TICKER = "AAPL"
+PERIOD = "3y"
+INTERVAL = "1d"
+COOLDOWN_DAYS = 1           # cooldown after a sell
+FEE_PER_TRADE = 0.001 * 1.0 # fee as fraction of notional; here 10 bps on sells (set 0.0 to ignore)
+SLIPPAGE_PCT = 0.000        # optional slippage per trade (extra cost)
+
+# ---------------- Data ----------------
+px = yf.download(TICKER, period=PERIOD, interval=INTERVAL, auto_adjust=True, progress=False)["Close"].dropna()
+dates = px.index.to_list()
+prices = px.values.astype(float)
+n = len(prices)
+if n < 10:
+    raise SystemExit("Not enough data.")
+
+# ---------------- DP with general cooldown ----------------
+# We model:
+#  hold[t]  = max cash when holding 1 share at end of day t
+#  free[t]  = max cash when flat & free to buy at end of day t
+#  cool[k][t] for k=1..COOLDOWN_DAYS = max cash when flat with k remaining cooldown days at end of day t
+# Transitions:
+#  Buy:    free[t-1] -> hold[t]     (pay price + slippage)
+#  Sell:   hold[t-1] -> cool[c][t]  (receive price - fee - slippage)
+#  Idle:   stay in same state
+#  Cooldown aging: cool[k] -> cool[k-1], cool[1] -> free
+
+cool_levels = COOLDOWN_DAYS
+hold = np.full(n, -np.inf)
+free = np.full(n, -np.inf)
+cool = np.full((cool_levels+1, n), -np.inf)  # cool[k,t], k in [0..c]; cool[0] is an alias for free at transitions
+
+# Init (day 0)
+buy_cost0 = prices[0] * (1.0 + SLIPPAGE_PCT)
+hold[0] = -buy_cost0                    # bought at t=0
+free[0] = 0.0                           # or do nothing
+for k in range(1, cool_levels+1):
+    cool[k,0] = -np.inf                 # impossible on day 0
+
+# To reconstruct trades
+@dataclass
+class Prev:
+    state: str
+    idx: int
+    extra: int | None = None  # cooldown level if needed
+
+prev_ptr = {("hold",0): ("free",-1,None)}  # pretend came from "free" buy at t=-1 for init
+prev_ptr[("free",0)] = ("free",-1,None)
+for k in range(1, cool_levels+1):
+    prev_ptr[(f"cool{k}",0)] = (f"cool{k}",-1,None)
+
+# DP forward pass
+for t in range(1, n):
+    price = prices[t]
+    buy_cost = price * (1.0 + SLIPPAGE_PCT)
+    sell_recv = price * (1.0 - FEE_PER_TRADE - SLIPPAGE_PCT)
+
+    # 1) HOLD: either keep holding, or buy today from FREE
+    stay_hold = hold[t-1]
+    buy = free[t-1] - buy_cost
+    if buy > stay_hold:
+        hold[t] = buy
+        prev_ptr[("hold",t)] = ("free", t-1, None)
+    else:
+        hold[t] = stay_hold
+        prev_ptr[("hold",t)] = ("hold", t-1, None)
+
+    # 2) SELL -> enter max cooldown bucket
+    new_cool_val = hold[t-1] + sell_recv
+    if new_cool_val > cool[cool_levels, t-1]:  # we compare to “stay in same cool level” placeholder below
+        cool[cool_levels, t] = new_cool_val
+        prev_ptr[(f"cool{cool_levels}",t)] = ("hold", t-1, None)
+    else:
+        cool[cool_levels, t] = cool[cool_levels, t-1]
+        prev_ptr[(f"cool{cool_levels}",t)] = (f"cool{cool_levels}", t-1, None)
+
+    # 3) COOLDOWN decay and FREE
+    # Move existing cooldown states down by one level
+    for k in range(cool_levels-1, 0, -1):
+        # either continue cooling from previous k at t-1, or inherit from k+1 we just set
+        stay = cool[k, t-1]
+        from_above = cool[k+1, t]    # progressed by one day
+        if from_above >= stay:
+            cool[k, t] = from_above
+            prev_ptr[(f"cool{k}",t)] = (f"cool{k+1}", t, None)
+        else:
+            cool[k, t] = stay
+            prev_ptr[(f"cool{k}",t)] = (f"cool{k}", t-1, None)
+
+    # FREE: either stay free, or cooldown finishes (k=1 -> free)
+    stay_free = free[t-1]
+    from_cool1 = cool[1, t] if cool_levels >= 1 else -np.inf
+    if from_cool1 >= stay_free:
+        free[t] = from_cool1
+        prev_ptr[("free",t)] = (f"cool1", t, None)
+    else:
+        free[t] = stay_free
+        prev_ptr[("free",t)] = ("free", t-1, None)
+
+# Choose best terminal state
+terminal_candidates = [("free", free[n-1])]
+for k in range(1, cool_levels+1):
+    terminal_candidates.append((f"cool{k}", cool[k,n-1]))
+terminal_candidates.append(("hold", hold[n-1]))  # you could close at last price; here we forbid end holding
+best_state, best_val = max(terminal_candidates, key=lambda x: x[1])
+
+# ---------------- Reconstruct trades ----------------
+actions = []
+state, t = best_state, n-1
+while t >= 0 and (state, t) in prev_ptr:
+    prev_state, prev_t, _ = prev_ptr[(state, t)]
+    # infer action between (prev_state, prev_t) -> (state, t)
+    if prev_t >= 0:
+        if prev_state == "free" and state == "hold":
+            actions.append(("BUY", dates[t], prices[t]))
+        elif prev_state == "hold" and state.startswith("cool"):
+            actions.append(("SELL", dates[t], prices[t]))
+    state, t = prev_state, prev_t
+
+actions.reverse()
+
+# Build trade list prettily
+trades = []
+position = 0
+for a, d, p in actions:
+    if a == "BUY" and position == 0:
+        trades.append({"action":"BUY","date":d.date(),"price":float(p)})
+        position = 1
+    elif a == "SELL" and position == 1:
+        trades.append({"action":"SELL","date":d.date(),"price":float(p)})
+        position = 0
+trades_df = pd.DataFrame(trades)
+
+# Compute equity curve of DP policy
+cash = 0.0
+pos = 0
+equity = []
+last_buy_price = None
+for t, price in enumerate(prices):
+    # execute trades at close
+    todays = [x for x in trades if x["date"] == dates[t].date()]
+    for tr in todays:
+        if tr["action"] == "BUY" and pos == 0:
+            pos = 1
+            last_buy_price = price * (1.0 + SLIPPAGE_PCT)
+            cash -= last_buy_price
+        elif tr["action"] == "SELL" and pos == 1:
+            pos = 0
+            cash += price * (1.0 - FEE_PER_TRADE - SLIPPAGE_PCT)
+            last_buy_price = None
+    # mark-to-market
+    eq = cash + (price if pos==1 else 0.0)
+    equity.append(eq)
+
+equity = np.array(equity)
+equity = equity - equity[0]  # start at 0
+
+# Baselines
+# Buy & Hold: 1 share from day 0
+bh_equity = prices - prices[0]
+# Naive momentum (threshold): buy if 5d return > 0; else flat (very naive)
+ret5 = pd.Series(prices).pct_change(5).fillna(0.0).values
+pos_rule = (ret5 > 0).astype(int)
+rule_equity = np.cumsum(np.diff(prices, prepend=prices[0]) * pos_rule)
+
+# ---------------- Plots ----------------
+plt.figure(figsize=(11,6))
+plt.plot(dates, equity, label="DP (cooldown & fees)")
+plt.plot(dates, bh_equity, label="Buy & Hold (1 share)")
+plt.plot(dates, rule_equity, label="Naive 5d-mom rule")
+plt.title(f"{TICKER} — Optimal Trade Scheduling (DP) vs Baselines")
+plt.xlabel("Date"); plt.ylabel("PnL (starting at 0)")
+plt.legend(); plt.grid(True); plt.tight_layout(); plt.show()
+
+# ---------------- Stats ----------------
+def ann_stats(pnl_series):
+    # convert PnL to "returns" by differences / prior equity (crude for demo)
+    eq = pnl_series + 1_000.0  # shift to avoid division by zero for demo metrics
+    rets = pd.Series(eq).pct_change().fillna(0.0)
+    mu = rets.mean()*252
+    sig = rets.std()*np.sqrt(252)
+    sharpe = mu/sig if sig>0 else np.nan
+    return mu, sig, sharpe
+
+mu_dp, sig_dp, sh_dp = ann_stats(equity)
+mu_bh, sig_bh, sh_bh = ann_stats(bh_equity)
+mu_rl, sig_rl, sh_rl = ann_stats(rule_equity)
+
+print("=== DP Policy Trades ===")
+print(trades_df.head(20).to_string(index=False))
+print(f"\nTotal trades: {len(trades_df)}  (round-trip count ≈ {len(trades_df)//2})")
+
+print("\n=== Annualized (rough demo metrics) ===")
+print(f"DP:   mu={mu_dp:.3f}, vol={sig_dp:.3f}, Sharpe≈{sh_dp:.2f}")
+print(f"B&H:  mu={mu_bh:.3f}, vol={sig_bh:.3f}, Sharpe≈{sh_bh:.2f}")
+print(f"Rule: mu={mu_rl:.3f}, vol={sig_rl:.3f}, Sharpe≈{sh_rl:.2f}")
+```
+
+---
+
+## Real-life scenario
+
+* **Execution desks** often face liquidity, fees, and internal risk limits; you can’t churn positions. DP-style schedulers pick **when** to flip positions, respecting **cooldowns (risk windows)** and **costs**.
+* **Signal portfolios:** a good signal still needs **trade scheduling**; otherwise, alpha dies to fees/slippage. DP gives the **best trading calendar** for a simple long/flat policy under constraints.
+
+---
+
+## Articles / further reading
+
+* LeetCode 309: *Best Time to Buy and Sell Stock with Cooldown* (DP foundations).
+* Almgren & Chriss (2000): *Optimal Execution of Portfolio Transactions* (execution & cost modeling).
+* Kissell, R.: *The Science of Algorithmic Trading and Portfolio Management*.
+* Gatheral & Schied: market impact, optimal execution with risk aversion.
+
+---
+
+### Tweaks to try next
+
+* Set **COOLDOWN_DAYS=2..5**, **FEE_PER_TRADE=0.0005..0.002**, **SLIPPAGE_PCT** > 0.
+* Enforce a **max trades per month** constraint (add another DP state).
+* Allow **position sizing** (integer shares 0..N) — DP over quantity dimension.
+* Switch objective from cash PnL to **risk-adjusted utility** (mean–variance).
