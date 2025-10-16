@@ -1,0 +1,200 @@
+Awesome — let’s do **Step 17: Segment Trees + Intraday Range Queries** 🎯
+
+You’ll learn how to answer min/max/VWAP queries on price streams in **O(log n)** time using a **segment tree**. This is perfect when you need *lots* of queries over sliding windows (backtests, monitoring, SOR).
+
+---
+
+# Step 17 — Segment Trees for Intraday Range Queries
+
+## Theory (dense & practical)
+
+* A **segment tree** is a complete binary tree built over an array where each internal node stores an aggregate (e.g., **min**, **max**, **sum**) for a subrange.
+* Build time: **O(n)**; memory: **≈4n**; query **O(log n)**; point update **O(log n)**.
+* You can maintain **multiple trees** over different arrays to answer richer queries:
+
+  * **max(High)** → intraday range high
+  * **min(Low)** → intraday range low
+  * **sum(Price×Volume)** and **sum(Volume)** → **VWAP = Σ(P·V)/Σ(V)** over any window
+* Use half-open ranges **[l, r)** indexed into your time series; map timestamps → indices with pandas.
+
+Real systems use variants (Fenwick tree/BIT for sums, sparse table for static RMQ, lazy-prop segtrees for range updates), but this classic tree is a workhorse.
+
+---
+
+## Problem
+
+1. Pull **1-minute** (or 5-minute fallback) data for a ticker (default **AAPL**, last 7 days).
+2. Build three segment trees: **maxHigh**, **minLow**, **sumPV**, **sumV**.
+3. Given any **start/end timestamps**, return:
+
+   * Highest high
+   * Lowest low
+   * **VWAP** of the window
+4. Show a **point update** (simulate a corrected bar) and re-query.
+5. Export last day’s metrics.
+
+---
+
+## One-cell Python (copy–paste and run)
+
+```python
+# Step 17 — Segment Trees + Intraday Range Queries (min/max/VWAP) in O(log n)
+import numpy as np, pandas as pd, yfinance as yf
+from datetime import timedelta
+
+# ---------------- Segment Tree ----------------
+class SegmentTree:
+    """
+    Generic segment tree for associative operations (min, max, sum).
+    - op: callable taking two scalars -> scalar (e.g., min, max, lambda a,b:a+b)
+    - ide: identity element (e.g., +inf for min, -inf for max, 0 for sum)
+    Stores values as float for simplicity.
+    """
+    def __init__(self, data, op, ide):
+        arr = np.asarray(data, dtype=float)
+        self.n = len(arr)
+        self.op = op
+        self.ide = ide
+        self.size = 1
+        while self.size < self.n:
+            self.size <<= 1
+        self.seg = np.full(2*self.size, ide, dtype=float)
+        # build leaves
+        self.seg[self.size:self.size+self.n] = arr
+        # build up
+        for i in range(self.size-1, 0, -1):
+            self.seg[i] = op(self.seg[2*i], self.seg[2*i+1])
+
+    def update(self, idx, value):
+        """Point update: a[idx] = value."""
+        i = idx + self.size
+        self.seg[i] = float(value)
+        i //= 2
+        while i >= 1:
+            self.seg[i] = self.op(self.seg[2*i], self.seg[2*i+1])
+            i //= 2
+
+    def query(self, l, r):
+        """Query on [l, r) half-open."""
+        resL, resR = self.ide, self.ide
+        l += self.size; r += self.size
+        while l < r:
+            if l & 1:
+                resL = self.op(resL, self.seg[l]); l += 1
+            if r & 1:
+                r -= 1; resR = self.op(self.seg[r], resR)
+            l //= 2; r //= 2
+        return self.op(resL, resR)
+
+# ---------------- Data pull (1m with fallback) ----------------
+def load_intraday(ticker="AAPL"):
+    # Try 1-minute (limited to ~7 days). If empty, fallback to 5m 30d.
+    for period, interval in [("7d","1m"), ("30d","5m"), ("60d","15m")]:
+        df = yf.download(ticker, period=period, interval=interval, auto_adjust=False, progress=False)
+        if not df.empty:
+            df = df.loc[:, ["Open","High","Low","Close","Volume"]].dropna()
+            df.index = pd.to_datetime(df.index)  # ensure DateTimeIndex
+            return df, period, interval
+    raise SystemExit("No intraday data available for this ticker.")
+
+df, period_used, interval_used = load_intraday("AAPL")
+
+# Add PV for VWAP
+df["PV"] = df["Close"] * df["Volume"]
+
+# ------------- Build segment trees -------------
+maxHigh = SegmentTree(df["High"].values, op=max, ide=-np.inf)
+minLow  = SegmentTree(df["Low"].values,  op=min, ide=np.inf)
+sumPV   = SegmentTree(df["PV"].values,   op=lambda a,b: a+b, ide=0.0)
+sumV    = SegmentTree(df["Volume"].values, op=lambda a,b: a+b, ide=0.0)
+
+# ------------- Helpers: time -> index mapping -------------
+def idx_range(start_ts, end_ts):
+    """
+    Map timestamps to half-open index range [l, r).
+    If timestamp not exactly present, use nearest indices within the bounds.
+    """
+    idx = df.index
+    # clip to df bounds
+    start_ts = max(idx[0], pd.to_datetime(start_ts))
+    end_ts   = min(idx[-1], pd.to_datetime(end_ts))
+    # inclusive range on timestamps -> half-open indices
+    l = idx.get_indexer([start_ts], method="nearest")[0]
+    r = idx.get_indexer([end_ts],   method="nearest")[0]
+    if r < l: l, r = r, l
+    r = min(r+1, len(idx))  # make half-open
+    return l, r
+
+def range_stats(start_ts, end_ts):
+    l, r = idx_range(start_ts, end_ts)
+    hi = maxHigh.query(l, r)
+    lo = minLow.query(l, r)
+    pv = sumPV.query(l, r)
+    vv = sumV.query(l, r)
+    vwap = pv / vv if vv > 0 else np.nan
+    return {"bars": r-l, "high": hi, "low": lo, "vwap": vwap, "l": l, "r": r}
+
+# ------------- Example queries -------------
+# Choose the last trading day window
+last_day = df.index[-1].date()
+start = pd.Timestamp.combine(last_day, pd.Timestamp("09:30").time())
+end   = pd.Timestamp.combine(last_day, pd.Timestamp("16:00").time())
+
+stats_last_day = range_stats(start, end)
+
+# Also query an arbitrary rolling window (e.g., last 1000 bars)
+N = 1000 if len(df) > 1000 else len(df)
+stats_last_window = range_stats(df.index[-N], df.index[-1])
+
+print(f"Data interval used: period={period_used}, interval={interval_used}, bars={len(df)}")
+print("\n=== Last day session stats ===")
+print({k: (round(v,4) if isinstance(v,(int,float,np.floating)) else v) for k,v in stats_last_day.items()})
+print("\n=== Last window stats (tail) ===")
+print({k: (round(v,4) if isinstance(v,(int,float,np.floating)) else v) for k,v in stats_last_window.items()})
+
+# ------------- Demonstrate point update (correction) -------------
+# Suppose exchange published a correction: the last bar's High should be Close*1.01
+last_idx = len(df) - 1
+corrected_high = float(df["Close"].iloc[-1] * 1.01)
+old_high = float(df["High"].iloc[-1])
+if corrected_high != old_high:
+    maxHigh.update(last_idx, corrected_high)
+    df.loc[df.index[-1], "High"] = corrected_high  # keep DF in sync
+    stats_after_fix = range_stats(df.index[-50], df.index[-1])
+    print("\nApplied correction to last bar High.")
+    print({k: (round(v,4) if isinstance(v,(int,float,np.floating)) else v) for k,v in stats_after_fix.items()})
+
+# ------------- Export a summary CSV for the last session -------------
+out = pd.DataFrame(
+    {
+        "metric": ["bars","session_high","session_low","session_vwap"],
+        "value": [
+            stats_last_day["bars"],
+            stats_last_day["high"],
+            stats_last_day["low"],
+            stats_last_day["vwap"],
+        ],
+    }
+)
+out_path = "intraday_range_summary.csv"
+out.to_csv(out_path, index=False)
+print(f"\nSaved {out_path}")
+```
+
+---
+
+## Real-life scenario
+
+* **Smart Order Routing / TCA:** constantly compute **range highs/lows** and **VWAP** over micro-windows to decide *where* and *when* to route, and to benchmark execution quality.
+* **Backtesting scanners:** scan thousands of (start, end) windows for **breakouts** (price>rolling-max) or **mean-revert zones** (price≈VWAP) without O(n) recomputation.
+* **Risk limits:** real-time alerts if current price pierces the **intraday min/max** of a monitoring window.
+
+---
+
+## Articles to read
+
+* CP-Algorithms: *Segment Tree* (build/query/update patterns)
+* MIT 6.851 notes (RMQ and segment trees vs sparse tables)
+* “Fenwick Trees (Binary Indexed Trees)” for sums (lighter alternative when you only need sums)
+
+Want a follow-up where we add **lazy propagation** for **range updates** or support **rolling percentile** queries (using order-statistics trees)?
