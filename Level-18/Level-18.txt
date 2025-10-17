@@ -1,0 +1,321 @@
+Let’s crush **Step 18: Tries + Ticker Autocomplete** 🚀
+
+---
+
+# Theory (dense & practical)
+
+A **Trie (prefix tree)** is a rooted tree where each edge stores one character and a path from root → node spells a prefix. It supports:
+
+* **Insert(word)**: O(L) where L is length
+* **Prefix query** (“all words starting with p”): O(|p| + k) where k is results traversed
+* **Memory**: proportional to total characters (often compressed as a **radix/DAWG** in production)
+
+Why a trie for tickers?
+
+* **Instant prefix hits** for **symbols** (“A”, “AA”, “AAPL”) and **company names** (“apple”, “alphabet”)—way faster than scanning arrays each keystroke.
+* **Ranking**: store metadata (e.g., popularity, volume, market-cap proxy) at terminals; return **top-k** with a heap/partial DFS.
+* **Fuzzy**: you can add edit-distance (Levenshtein) or use a **BK-tree**; for a quick win, Python’s `difflib` gives “did you mean…?” suggestions.
+
+Design notes:
+
+* **Dual indexing**: insert both the **symbol** and the **company name tokens** (e.g., “apple”, “inc”). Map them back to the **canonical symbol**.
+* **Normalization**: uppercase symbols, lowercase names; strip punctuation; keep a **display label**.
+* **Top-k** retrieval**: descend to the node for the prefix; DFS collecting terminals; maintain a small max-heap of size k by score.
+* **Scoring** (simple): `score = base + bonus` where `base` comes from a curated popularity list, or a heuristic (shorter symbol, S&P500 membership, etc.). In production you’d feed recent **volume**, **search frequency**, or **personalization**.
+
+---
+
+# Problem
+
+Build a **ticker autocomplete** that:
+
+1. Loads tickers (try S&P500 from Wikipedia; if offline, fall back to a small demo list or a user-provided CSV).
+2. Builds a **Trie** over both symbols and company name tokens.
+3. Returns **top-k** suggestions for any prefix (case-insensitive for names, case-sensitive for symbols).
+4. Supports **fuzzy “did you mean?”** via `difflib` when no exact-prefix hit.
+5. Optional: enrich the **top results** with live price (single batch of a few tickers via `yfinance`).
+6. Save suggestions for a few demo prefixes to CSV.
+
+---
+
+# One-cell Python (copy–paste & run)
+
+```python
+# Step 18 — Tries + Ticker Autocomplete (symbols + company names, ranking, fuzzy fallback)
+import re, string, heapq, difflib
+from dataclasses import dataclass
+from typing import Dict, List, Tuple, Optional
+import pandas as pd
+import numpy as np
+import yfinance as yf
+
+# -----------------------------
+# 1) Load universe (robust)
+# -----------------------------
+def load_universe():
+    """
+    Try: S&P 500 from Wikipedia; else look for local CSV with columns ['Symbol','Security'].
+    Fallback: small demo list.
+    Returns DataFrame with columns: Symbol (UPPER), Security (original case), score (float)
+    """
+    # Attempt read_html (requires internet)
+    try:
+        tables = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
+        sp = tables[0]
+        df = sp.rename(columns={"Symbol":"Symbol", "Security":"Security"})[["Symbol","Security"]]
+        # Clean known quirks like BRK.B -> BRK-B style; we normalize dots/dashes alike
+    except Exception:
+        # Try local CSV
+        try:
+            df = pd.read_csv("tickers.csv")  # user-provided fallback
+            df = df.rename(columns={"Symbol":"Symbol", "Security":"Security"})[["Symbol","Security"]]
+        except Exception:
+            # Tiny demo fallback
+            data = [
+                ("AAPL","Apple Inc."),
+                ("GOOGL","Alphabet Inc. (Class A)"),
+                ("MSFT","Microsoft Corporation"),
+                ("AMZN","Amazon.com, Inc."),
+                ("TSLA","Tesla, Inc."),
+                ("NVDA","NVIDIA Corporation"),
+                ("META","Meta Platforms, Inc."),
+                ("NFLX","Netflix, Inc."),
+                ("BRK.B","Berkshire Hathaway Inc. Class B"),
+                ("JPM","JPMorgan Chase & Co."),
+                ("V","Visa Inc."),
+                ("WMT","Walmart Inc."),
+                ("DIS","Walt Disney Company"),
+            ]
+            df = pd.DataFrame(data, columns=["Symbol","Security"])
+
+    # Normalize tickers: keep dots/dashes consistent, uppercase
+    df["Symbol"] = df["Symbol"].astype(str).str.upper().str.replace(" ", "", regex=False)
+    # Basic score heuristic: shorter symbols + appear earlier get slight boosts
+    base = 1.0
+    df["score"] = base + (10.0 - df["Symbol"].str.len()).clip(lower=0) * 0.05
+    # You can add more features here (e.g., S&P member bonus, sector weights, personal freq)
+    return df
+
+universe = load_universe()
+
+# -----------------------------
+# 2) Trie implementation
+# -----------------------------
+@dataclass
+class Entry:
+    symbol: str
+    display: str  # e.g., "AAPL — Apple Inc."
+    score: float
+
+class TrieNode:
+    __slots__ = ("children", "ends")  # ends: list[Entry] stored at terminal nodes
+    def __init__(self):
+        self.children: Dict[str, "TrieNode"] = {}
+        self.ends: List[Entry] = []
+
+class Trie:
+    def __init__(self):
+        self.root = TrieNode()
+
+    def insert(self, key: str, entry: Entry):
+        node = self.root
+        for ch in key:
+            if ch not in node.children:
+                node.children[ch] = TrieNode()
+            node = node.children[ch]
+        # Store terminal entry (avoid duplicates of same symbol+display)
+        if all(e.symbol != entry.symbol for e in node.ends):
+            node.ends.append(entry)
+
+    def _collect(self, node: TrieNode, heap: list, k: int):
+        # Push terminals
+        for e in node.ends:
+            # Use (-score, display) for max-heap via heapq (minheap on negative score)
+            heapq.heappush(heap, (-e.score, e.display, e.symbol, e))
+            if len(heap) > k:
+                heapq.heappop(heap)
+        # DFS children
+        for ch, nxt in node.children.items():
+            self._collect(nxt, heap, k)
+
+    def top_k_with_prefix(self, prefix: str, k: int = 10) -> List[Entry]:
+        node = self.root
+        for ch in prefix:
+            if ch not in node.children:
+                return []
+            node = node.children[ch]
+        heap: list = []
+        self._collect(node, heap, k)
+        # heap now has at most k best; return sorted best-first
+        return [item[-1] for item in sorted(heap, key=lambda x: (x[0], x[1]))]
+
+# -----------------------------
+# 3) Normalization helpers
+# -----------------------------
+_punct_tbl = str.maketrans({c:" " for c in string.punctuation})
+
+def normalize_name(s: str) -> List[str]:
+    """
+    Lower-case, remove punctuation to spaces, split tokens, drop tiny tokens.
+    """
+    s = (s or "").lower().translate(_punct_tbl)
+    toks = [t for t in re.split(r"\s+", s.strip()) if len(t) >= 2]
+    return toks
+
+def normalize_symbol(s: str) -> str:
+    return (s or "").upper().strip()
+
+def display_label(symbol: str, name: str) -> str:
+    return f"{symbol} — {name}"
+
+# -----------------------------
+# 4) Build trie over symbols + names
+# -----------------------------
+trie = Trie()
+
+# Insert symbols
+for _, row in universe.iterrows():
+    sym = normalize_symbol(row["Symbol"])
+    name = str(row["Security"])
+    lab = display_label(sym, name)
+    score = float(row.get("score", 1.0))
+    entry = Entry(symbol=sym, display=lab, score=score)
+    trie.insert(sym, entry)
+
+# Insert name tokens -> map to the ticker entry
+for _, row in universe.iterrows():
+    sym = normalize_symbol(row["Symbol"])
+    name = str(row["Security"])
+    lab = display_label(sym, name)
+    score = float(row.get("score", 1.0)) * 0.98  # slight penalty so symbol-matches rank higher
+    entry = Entry(symbol=sym, display=lab, score=score)
+    for tok in normalize_name(name):
+        trie.insert(tok, entry)
+
+# -----------------------------
+# 5) Query API
+# -----------------------------
+def autocomplete(query: str, k: int = 10, enrich_prices: bool = True) -> pd.DataFrame:
+    """
+    If query looks like a ticker (any uppercase char), try symbol-space too.
+    Also search name tokens. Fuzzy fallback if no results.
+    """
+    q = query.strip()
+    if not q:
+        return pd.DataFrame(columns=["symbol","display","score","price"])
+    # Two tries: symbol-space + name-space
+    sym_pref = normalize_symbol(q)
+    name_pref = " ".join(normalize_name(q))
+    results: List[Entry] = []
+
+    # Gather from symbol trie
+    if sym_pref:
+        results.extend(trie.top_k_with_prefix(sym_pref, k))
+    # Gather from name trie (use first token; for multi-token we can intersect, but prefix on first works well)
+    if name_pref:
+        first_tok = name_pref.split()[0]
+        results.extend(trie.top_k_with_prefix(first_tok, k))
+
+    # Deduplicate by symbol, keep best score
+    best: Dict[str, Entry] = {}
+    for e in results:
+        if (e.symbol not in best) or (e.score > best[e.symbol].score):
+            best[e.symbol] = e
+
+    deduped = sorted(best.values(), key=lambda e: (-e.score, e.symbol))[:k]
+
+    # Fuzzy fallback
+    if not deduped:
+        # Build a small vocabulary of symbols + name tokens for fuzzy
+        vocab_syms = universe["Symbol"].tolist()
+        # choose close matches among symbols
+        guess = difflib.get_close_matches(sym_pref, vocab_syms, n=k, cutoff=0.6)
+        for g in guess:
+            row = universe.loc[universe["Symbol"] == g].head(1)
+            if len(row):
+                name = str(row.iloc[0]["Security"])
+                lab = display_label(g, name)
+                score = float(row.iloc[0].get("score", 1.0)) * 0.9
+                deduped.append(Entry(symbol=g, display=lab, score=score))
+
+    # Optional: price enrichment for the small top list
+    price_map = {}
+    if enrich_prices and len(deduped) > 0:
+        symbols = [e.symbol for e in deduped]
+        # yfinance multi-ticker (few symbols) is okay
+        try:
+            data = yf.download(" ".join(symbols), period="1d", interval="1m", auto_adjust=True, progress=False)
+            # yfinance may return panel-like with column MultiIndex when multiple tickers
+            if isinstance(data.columns, pd.MultiIndex):
+                # Close across tickers in wide form
+                closes = data["Close"].ffill().tail(1)
+                for s in symbols:
+                    try:
+                        price = float(closes[s].iloc[-1])
+                    except Exception:
+                        price = np.nan
+                    price_map[s] = price
+            else:
+                # Single ticker DataFrame
+                price_map[symbols[0]] = float(data["Close"].ffill().iloc[-1]) if not data.empty else np.nan
+        except Exception:
+            price_map = {s: np.nan for s in symbols}
+
+    out = pd.DataFrame(
+        {
+            "symbol": [e.symbol for e in deduped],
+            "display": [e.display for e in deduped],
+            "score": [round(e.score, 4) for e in deduped],
+            "price": [price_map.get(e.symbol, np.nan) for e in deduped],
+        }
+    )
+    return out
+
+# -----------------------------
+# 6) Demo + export
+# -----------------------------
+demo_prefixes = ["A", "AA", "AAP", "appl", "goog", "alph", "micro", "tes", "berk", "wal"]
+rows = []
+for q in demo_prefixes:
+    df = autocomplete(q, k=8, enrich_prices=False)
+    df.insert(0, "query", q)
+    rows.append(df)
+
+demo_out = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame(columns=["query","symbol","display","score","price"])
+print("Sample Suggestions:")
+print(demo_out.head(30).to_string(index=False))
+
+# Save suggestions to CSV
+demo_out.to_csv("ticker_autocomplete_samples.csv", index=False)
+print("\nSaved ticker_autocomplete_samples.csv")
+
+# Try a few live enrichments
+try:
+    print("\nEnriched suggestions for 'AAPL':")
+    print(autocomplete("AAPL", k=5, enrich_prices=True).to_string(index=False))
+except Exception as e:
+    print("\nEnrichment skipped (connection issue):", e)
+```
+
+---
+
+# Real-life scenarios
+
+* **Brokerage & trading UIs:** instant search over **symbols and names** with type-ahead, ranked by your watchlists, holdings, or venue hit-rates.
+* **Terminal tools (IBKR, Bloomberg-like)**: reduce latency and cognitive load when launching orders or charts.
+* **Compliance/surveillance dashboards:** low-latency lookup across **aliases**, **listings**, and **entity names**.
+
+---
+
+# Articles to read
+
+* Classic **Trie / Prefix Tree** intros: time/space tradeoffs; radix tries, DAWGs.
+* **Information Retrieval** for ranking: BM25/TF-IDF for name tokens; aggregating multiple signals (popularity, click-through).
+* **Fuzzy search** structures: BK-trees for edit distance; k-gram indexes; SymSpell.
+* **Scaling autocomplete**: prefix shards, memory-mapped tries, compressing nodes, or switching to **FST** (finite-state transducers).
+
+If you want, I can extend this to:
+
+* **Personalized ranking** (learned scores),
+* **Fuzzy prefix** (edit distance ≤ 1 directly in the trie), or
+* **Server API** (FastAPI endpoint + React widget).
