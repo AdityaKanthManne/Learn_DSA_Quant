@@ -1,0 +1,13 @@
+query,symbol,display,score,price
+A,AAPL,AAPL — Apple Inc.,1.3,
+A,AMZN,"AMZN — Amazon.com, Inc.",1.3,
+AA,AAPL,AAPL — Apple Inc.,1.3,
+AAP,AAPL,AAPL — Apple Inc.,1.3,
+appl,AAPL,AAPL — Apple Inc.,1.274,
+goog,GOOGL,GOOGL — Alphabet Inc. (Class A),1.25,
+alph,GOOGL,GOOGL — Alphabet Inc. (Class A),1.225,
+micro,MSFT,MSFT — Microsoft Corporation,1.274,
+tes,TSLA,"TSLA — Tesla, Inc.",1.274,
+berk,BRK.B,BRK.B — Berkshire Hathaway Inc. Class B,1.225,
+wal,DIS,DIS — Walt Disney Company,1.323,
+wal,WMT,WMT — Walmart Inc.,1.323,
