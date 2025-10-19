@@ -1,0 +1,281 @@
+Let’s tackle **Step 20 — Greedy + Order Execution Cost Minimization** 🎯
+
+---
+
+# Theory (compact but dense)
+
+Large orders move markets. Two core frictions:
+
+1. **Temporary impact**: price concession you pay when you “walk the book” right now; it decays quickly.
+2. **Permanent impact**: information leakage pushes the *future* mid in your trade direction.
+
+A classic stylized model (Almgren–Chriss family) writes **expected execution price** for a buy slice of size (x_t) at time (t) as:
+[
+p_t^{\text{fill}} \approx p_t ;+; \underbrace{\eta,\bigg(\frac{x_t}{V_t}\bigg)^\beta p_t}*{\text{temporary}} ;+; \underbrace{\gamma,p_t,\sqrt{\frac{\sum*{\tau\le t} x_\tau}{\text{ADV}}}}_{\text{permanent}}
+]
+with market volume (V_t), day ADV, and parameters (\eta,\beta,\gamma).
+Your **implementation shortfall** (IS) for buying (Q) shares starting ref price (p_0) is:
+[
+\text{IS} \equiv \frac{\sum_t x_t,p_t^{\text{fill}} - Q,p_0}{Q,p_0}
+]
+
+**Greedy idea:** In each bar, buy **more** when (a) volume is high (impact per share falls), (b) price is **cheap** vs a short-term signal (e.g., below EMA/VWAP), (c) time is running out (to avoid end-of-window risk) — but cap per-bar participation ((x_t \le \lambda V_t)) to avoid blowing through the book.
+
+We’ll compare three schedules:
+
+* **VWAP**: proportion to bar volume share (benchmark).
+* **POV(k%)**: fixed participation of market volume (capped).
+* **Greedy**: re-allocates intra-day to cheap & liquid bars while respecting caps and finish-by deadline.
+
+---
+
+# Problem
+
+Given a ticker’s 1-minute bars for the last session and a target buy size (Q):
+
+1. Build a simple impact model (temp + perm).
+2. Simulate executions for **VWAP**, **POV**, and **Greedy** schedules.
+3. Report **cost per share**, **IS**, **slippage vs session VWAP**, and **% of bars used**.
+4. Save a CSV of fills; plot the schedule vs price.
+
+---
+
+# One-cell Python (copy/paste & run)
+
+```python
+# Step 20 — Greedy + Order Execution Cost Minimization
+# Compares VWAP, POV, and a Greedy scheduler under a simple impact model.
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+import matplotlib.pyplot as plt
+from pathlib import Path
+
+# ------------------ Data: 1m bars (fallbacks + timezone) ------------------
+def load_intraday(ticker="AAPL"):
+    for period, interval in [("7d","1m"), ("30d","5m"), ("60d","15m")]:
+        df = yf.download(ticker, period=period, interval=interval, auto_adjust=True, progress=False)
+        if not df.empty:
+            df = df.loc[:, ["Open","High","Low","Close","Volume"]].dropna()
+            df.index = pd.to_datetime(df.index)
+            if df.index.tz is None:
+                df.index = df.index.tz_localize("UTC").tz_convert("America/New_York")
+            else:
+                df.index = df.index.tz_convert("America/New_York")
+            return df, period, interval
+    raise SystemExit("No intraday data available (or network issue).")
+
+df, period_used, interval_used = load_intraday("AAPL")
+
+# Pick the last full trading day window 09:30–16:00 ET
+tz = df.index.tz
+last_day = df.index[-1].astimezone(tz).date()
+start = pd.Timestamp.combine(last_day, pd.Timestamp("09:30").time()).tz_localize(tz)
+end   = pd.Timestamp.combine(last_day, pd.Timestamp("16:00").time()).tz_localize(tz)
+day = df.loc[(df.index >= start) & (df.index <= end)].copy()
+if len(day) < 200:
+    raise SystemExit("Not enough bars in last session window.")
+
+# ------------------ Parameters ------------------
+Q = 100_000              # target shares to BUY
+max_part = 0.15          # hard cap per-bar participation (<= 15% of bar volume)
+p0 = float(day["Open"].iloc[0])   # reference price for IS
+ADV = float(df["Volume"].resample("1D").sum().dropna().iloc[-1])  # yesterday’s approximate ADV
+
+# Impact model params (tweak to taste)
+eta   = 0.10   # temporary impact coefficient
+beta  = 0.60   # concavity for temp impact
+gamma = 0.05   # permanent impact coefficient
+
+# ------------------ Helpers ------------------
+def temp_impact(p, x, V, eta=eta, beta=beta):
+    """Temporary impact (per-share) in $: eta * (x/V)**beta * p . Safe for V=0."""
+    if V <= 0 or x <= 0:
+        return 0.0
+    return eta * (x / V)**beta * p
+
+def perm_impact(p, cum_x, ADV=ADV, gamma=gamma):
+    """Permanent drift from cumulative executed (per-share) in $: gamma * p * sqrt(cum_x / ADV)."""
+    if ADV <= 0 or cum_x <= 0:
+        return 0.0
+    return gamma * p * np.sqrt(cum_x / ADV)
+
+def simulate_schedule(bars, x_schedule):
+    """
+    bars: DataFrame with Close, Volume
+    x_schedule: array of shares to buy each bar (len == len(bars))
+    Returns fills DataFrame with realized price, cost, cum, etc.
+    """
+    close = bars["Close"].to_numpy(dtype=float)
+    vol   = bars["Volume"].to_numpy(dtype=float)
+    x     = np.clip(np.asarray(x_schedule, dtype=float), 0, None)
+
+    fills = []
+    cum = 0.0
+    cost = 0.0
+    for i in range(len(bars)):
+        xi = x[i]
+        if xi <= 0:
+            fills.append((bars.index[i], 0.0, 0.0, 0.0, cum, cost)); continue
+        p = close[i]
+        V = max(1.0, vol[i])
+        # impact components
+        ti = temp_impact(p, xi, V)
+        pi = perm_impact(p, cum)  # drift up as we accumulate (buy side)
+        exec_price = p + ti + pi
+        fill_cost = xi * exec_price
+        cum += xi
+        cost += fill_cost
+        fills.append((bars.index[i], xi, exec_price, fill_cost, cum, cost))
+
+    out = pd.DataFrame(fills, columns=["ts","qty","px","notional","cum_qty","cum_cost"]).set_index("ts")
+    return out
+
+def summarize(fills, p_ref=p0, session_vwap=None):
+    """
+    Return dict: total, avg_px, cost_per_share, IS, slippage_vs_sessionVWAP.
+    """
+    total = fills["cum_qty"].iloc[-1]
+    notional = fills["cum_cost"].iloc[-1]
+    avg_px = notional / max(1.0, total)
+    is_ = (notional - total * p_ref) / max(1.0, total * p_ref)
+    slip_vwap = np.nan
+    if session_vwap is not None and session_vwap > 0:
+        slip_vwap = (avg_px - session_vwap) / session_vwap
+    return {
+        "filled": int(total),
+        "avg_px": round(avg_px, 4),
+        "cost_per_share": round(avg_px - p_ref, 4),
+        "IS": round(is_, 6),
+        "slip_vs_sessionVWAP": (None if np.isnan(slip_vwap) else round(slip_vwap, 6)),
+        "bars_used_%": round(100 * (fills["qty"] > 0).mean(), 2),
+    }
+
+# Session VWAP for slippage benchmark
+session_vwap = (day["Close"] * day["Volume"]).sum() / max(1.0, day["Volume"].sum())
+
+# ------------------ 1) VWAP schedule ------------------
+vol_share = day["Volume"] / day["Volume"].sum()
+x_vwap = (vol_share * Q).to_numpy(dtype=float)
+# Enforce per-bar cap
+cap = max_part * day["Volume"].to_numpy(dtype=float)
+x_vwap = np.minimum(x_vwap, cap)
+# If we underfill due to caps, smear the remainder forward greedily within caps
+def smear_remainder(x, cap):
+    rem = Q - x.sum()
+    if rem <= 0: return x
+    for i in range(len(x)):
+        add = min(cap[i] - x[i], rem)
+        if add > 0:
+            x[i] += add
+            rem -= add
+            if rem <= 0: break
+    return x
+x_vwap = smear_remainder(x_vwap, cap)
+fills_vwap = simulate_schedule(day, x_vwap)
+sum_vwap = summarize(fills_vwap, p_ref=p0, session_vwap=session_vwap)
+
+# ------------------ 2) POV schedule (k% of market volume) ------------------
+k = 0.10  # 10% participation
+x_pov = np.minimum(k * day["Volume"].to_numpy(dtype=float), cap)
+# Smear remainder if any
+x_pov = smear_remainder(x_pov, cap)
+fills_pov = simulate_schedule(day, x_pov)
+sum_pov = summarize(fills_pov, p_ref=p0, session_vwap=session_vwap)
+
+# ------------------ 3) Greedy schedule ------------------
+# Intuition: weight bars by (liquidity * cheapness * urgency)
+price = day["Close"].to_numpy(dtype=float)
+volume = day["Volume"].to_numpy(dtype=float)
+ema_fast = pd.Series(price, index=day.index).ewm(span=20, adjust=False).mean().to_numpy()
+cheap = np.maximum(0.0, (ema_fast - price) / np.maximum(1e-9, ema_fast))   # positive when price < EMA (good for buy)
+liq = volume / np.maximum(1.0, volume.max())                                # 0..1
+tgrid = np.linspace(0.0, 1.0, len(day))                                     # 0 at start, 1 at end
+urgency = tgrid**2                                                           # gently ramps urgency late in day
+
+score = 0.60*cheap + 0.35*liq + 0.05*urgency
+score = np.maximum(score, 0)
+if score.sum() == 0: score[:] = 1.0
+
+# Initial proportional allocation by score, capped by max_part*Vol
+x_greedy = (score / score.sum()) * Q
+x_greedy = np.minimum(x_greedy, cap)
+
+# Iterate a couple of passes: push leftover to next highest-score bars within caps
+def redistribute(x, scores, cap, passes=2):
+    rem = Q - x.sum()
+    if rem <= 0: return x
+    order = np.argsort(-scores)  # descending score
+    for _ in range(passes):
+        if rem <= 0: break
+        for i in order:
+            if rem <= 0: break
+            add = min(cap[i] - x[i], rem)
+            if add > 0:
+                x[i] += add; rem -= add
+    return x
+
+x_greedy = redistribute(x_greedy, score, cap, passes=3)
+fills_greedy = simulate_schedule(day, x_greedy)
+sum_greedy = summarize(fills_greedy, p_ref=p0, session_vwap=session_vwap)
+
+# ------------------ Results ------------------
+print(f"Data: period={period_used}, interval={interval_used}, bars={len(day)}, Q={Q:,} shares, max_part={int(max_part*100)}%")
+print(f"Session VWAP: {session_vwap:.4f} | Ref p0: {p0:.4f}")
+print("\nVWAP :", sum_vwap)
+print("POV  :", sum_pov)
+print("Greedy:", sum_greedy)
+
+# ------------------ Save fills ------------------
+out_dir = Path(r"C:\Users\adity\Downloads\Learn_DSA_Quant\Level-20")
+out_dir.mkdir(parents=True, exist_ok=True)
+fills_vwap.assign(strategy="VWAP").to_csv(out_dir / "fills_vwap.csv")
+fills_pov.assign(strategy="POV").to_csv(out_dir / "fills_pov.csv")
+fills_greedy.assign(strategy="Greedy").to_csv(out_dir / "fills_greedy.csv")
+print(f"\nSaved fills to {out_dir}")
+
+# ------------------ Plots ------------------
+fig, ax = plt.subplots(figsize=(11,6))
+ax.plot(day.index, day["Close"], label="Price")
+ax.set_ylabel("Price"); ax.set_title("Execution Schedules vs Price")
+ax2 = ax.twinx()
+ax2.plot(day.index, fills_vwap["cum_qty"],  linestyle="--", label="VWAP cum")
+ax2.plot(day.index, fills_pov["cum_qty"],   linestyle="--", label="POV cum")
+ax2.plot(day.index, fills_greedy["cum_qty"],linestyle="--", label="Greedy cum")
+ax2.set_ylabel("Cumulative shares")
+ax.legend(loc="upper left")
+ax2.legend(loc="lower right")
+plt.tight_layout(); plt.show()
+
+# Per-bar participation (sanity)
+fig2, ax3 = plt.subplots(figsize=(11,4))
+part_vwap = np.divide(fills_vwap["qty"].to_numpy(), np.maximum(1.0, day["Volume"].to_numpy()))*100
+part_pov  = np.divide(fills_pov["qty"].to_numpy(),  np.maximum(1.0, day["Volume"].to_numpy()))*100
+part_gre  = np.divide(fills_greedy["qty"].to_numpy(),np.maximum(1.0, day["Volume"].to_numpy()))*100
+ax3.plot(day.index, part_vwap, label="VWAP %Vol")
+ax3.plot(day.index, part_pov,  label="POV %Vol")
+ax3.plot(day.index, part_gre,  label="Greedy %Vol")
+ax3.axhline(max_part*100, linestyle=":", linewidth=1)
+ax3.set_ylabel("Participation % of bar volume"); ax3.set_title("Per-bar Participation (cap dotted)")
+ax3.legend(); plt.tight_layout(); plt.show()
+```
+
+---
+
+## Real-world scenarios
+
+* **Execution algos in brokers/OMS/EMS**: VWAP/POV/TWAP variants dynamically re-allocate clips when liquidity spikes or price dips, while capping participation to reduce signaling risk.
+* **Buybacks & mutual fund flows**: daily programs seeking low footprint, minimizing **implementation shortfall** vs arrival price or benchmark VWAP.
+* **Signal-driven schedulers**: if your alpha says “cheap now”, the scheduler boosts participation *now* (within caps) and throttles later.
+
+---
+
+## Further reading
+
+* Almgren & Chriss, *Optimal Execution of Portfolio Transactions* (2000): foundational IS/impact model and efficient schedules.
+* Gatheral, *The Price of Financial Market Liquidity* (square-root law, impact empirics).
+* Kissell, *The Science of Algorithmic Trading and Portfolio Management* (practical execution algos, constraints, and benchmarks).
+* Broker whitepapers (Goldman/Barclays/J.P. Morgan) on modern VWAP/POV/TWAP/Implementation-Shortfall algos and anti-gaming measures.
+
+If you want, I can add **risk controls** (finish-by guarantee, hard min/max clips, iceberg constraints), **sell side** symmetry, or **compliance logs** in the CSV (child order IDs, venues, flags).
