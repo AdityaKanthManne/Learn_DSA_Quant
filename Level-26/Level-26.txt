@@ -1,0 +1,311 @@
+**Step 26 — Dynamic Programming + Optimal Trade Scheduling (with Cooldown)** 🧠📈
+
+### Theory (dense + practical)
+
+We want the **maximum trading profit** on a single asset given:
+
+* Unlimited transactions (buy→sell→buy…),
+* A fixed **cooldown** of (C) sessions after each **sell** (you can’t buy again until the cooldown expires),
+* Optional **per-trade fee** (slippage/commissions),
+* No shorting (position is either **flat** or **long 1**).
+
+A clean DP framing (end-of-day states):
+
+* **ready[t]**: max cash **not holding**, and you’re allowed to **buy today** (cooldown satisfied).
+* **hold[t]**: max cash **holding one share** at the end of day (t).
+* **sell@t** (intermediate): if you **sold today**, cash = `hold[t-1] + price[t] - fee`. This **enters cooldown** and becomes eligible to update **ready** only after (C) days.
+
+Recurrences (iterating days (t=0..n-1)):
+
+* Process any **sell values** whose cooldown **expires at t** to update `ready[t] = max(ready[t-1], expired_sells_profit)`.
+* **Buy / keep holding:**
+  [
+  \text{hold}[t] = \max\big(\text{hold}[t-1],\ \text{ready}[t] - \text{price}[t] - \text{fee}\big)
+  ]
+* **Sell today (push into cooldown queue):**
+  [
+  \text{sell_today} = \text{hold}[t-1] + \text{price}[t] - \text{fee}
+  ]
+  It enters a queue with **expiry day** (t+C). When the queue item **expires**, it can update `ready`.
+
+This gives **(O(n)) time, (O(n)) memory** (we’ll also store **back-pointers** to reconstruct the exact sequence of **BUY/SELL** that attains the optimum).
+
+---
+
+### Problem
+
+Given daily prices (from `yfinance`, or synth fallback), a **cooldown C** and **fee**, compute:
+
+1. **Optimal total P&L** and **trade list** (BUY/SELL dates & prices).
+2. **Equity curve** (1-share trading) vs **Buy & Hold**.
+3. Save a tidy CSV of trades and plot the result.
+
+---
+
+### One-cell Python (hardened, backtracking, no seaborn)
+
+```python
+# Step 26 — DP Optimal Trade Scheduling with Cooldown (one cell, hardened)
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+import matplotlib.pyplot as plt
+from collections import deque
+from pathlib import Path
+
+# ----------------- User params -----------------
+TICKER = "AAPL"
+YEARS   = 3
+COOLDOWN = 1          # number of sessions you must wait after SELL before next BUY
+FEE      = 0.00       # per transaction fee (applied on each BUY and SELL)
+OUT_DIR  = Path(r"C:\Users\adity\Downloads\Learn_DSA_Quant\Level-26")
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# ----------------- Data load (adj close) -----------------
+def download_close(ticker: str, years: int = 3) -> pd.Series:
+    df = yf.download(ticker, period=f"{years}y", interval="1d",
+                     auto_adjust=True, progress=False)
+    if df.empty:
+        return pd.Series(dtype=float)
+    col = "Close" if "Close" in df.columns else ( "Adj Close" if "Adj Close" in df.columns else None )
+    if col is None: return pd.Series(dtype=float)
+    s = df[col].dropna().astype(float)
+    s = s[~s.index.duplicated(keep="last")]
+    return s
+
+def make_synth(n=3*252, seed=26):
+    np.random.seed(seed)
+    dates = pd.bdate_range(end=pd.Timestamp.today().normalize(), periods=n)
+    mu, vol = 0.12, 0.25  # annualized drift/vol
+    dt = 1/252
+    r = (mu - 0.5*vol**2)*dt + vol*np.sqrt(dt)*np.random.randn(n)
+    p = 100*np.exp(np.cumsum(r))
+    return pd.Series(p, index=dates, name="SYNTH")
+
+px = download_close(TICKER, YEARS)
+if px.empty:
+    print("Using synthetic price series fallback.")
+    px = make_synth()
+    TICKER = "SYNTH"
+
+px = px.sort_index()
+n  = len(px)
+p  = px.to_numpy(dtype=float)
+
+# ----------------- DP with cooldown queue + backpointers -----------------
+# Arrays
+ready = np.full(n, -np.inf)
+hold  = np.full(n, -np.inf)
+
+# Backpointers (for reconstruction)
+# ready_from[t]: ("KEEP", t-1) or ("COOLDONE", sell_day) indicating which expired sell created this ready
+ready_from = [("INIT", -1)] * n
+# hold_from[t]: ("HOLD", t-1) or ("BUY", t, prev=ready_source_at_t)
+hold_from  = [("INIT", -1)] * n
+
+# cooldown queue of sells: elements are tuples (expire_day, profit_value, sell_day)
+coolq = deque()
+
+# Init day 0
+# At day 0, we are allowed to be ready with cash = 0
+ready[0] = 0.0
+ready_from[0] = ("INIT", -1)
+
+# hold at day 0: either buy today or not
+buy0 = ready[0] - p[0] - FEE
+hold[0] = max(-np.inf, buy0)
+hold_from[0] = ("BUY", 0) if hold[0] == buy0 else ("INIT", -1)
+
+# Sell at day 0 (if we were holding day -1 -> not possible), so skip pushing a sell here
+
+# Iterate days
+for t in range(1, n):
+    # 1) propagate previous ready
+    rdy = ready[t-1]
+    src = ("KEEP", t-1)
+
+    # 2) expire any sells that complete cooldown at day t
+    #    if multiple sells expire, take the best
+    expired_best = -np.inf
+    expired_best_sell_day = -1
+    while coolq and coolq[0][0] <= t:
+        exp_day, val, sday = coolq.popleft()
+        if val > expired_best:
+            expired_best = val
+            expired_best_sell_day = sday
+
+    if expired_best > rdy:
+        rdy = expired_best
+        src = ("COOLDONE", expired_best_sell_day)
+
+    ready[t] = rdy
+    ready_from[t] = src
+
+    # 3) update hold: either keep holding or buy today using ready[t]
+    keep_hold = hold[t-1]
+    buy_today = ready[t] - p[t] - FEE
+    if buy_today > keep_hold:
+        hold[t] = buy_today
+        hold_from[t] = ("BUY", t)  # buy today; backtracking will follow ready_from[t] next
+    else:
+        hold[t] = keep_hold
+        hold_from[t] = ("HOLD", t-1)
+
+    # 4) compute today's sell (from yesterday's hold) and push into cooldown queue
+    sell_today = hold[t-1] + p[t] - FEE
+    if np.isfinite(sell_today):
+        exp_day = t + COOLDOWN
+        coolq.append((exp_day, sell_today, t))  # selling at day t becomes eligible at exp_day
+
+# At the end, the optimal result is in ready[n-1] (flat, allowed to buy).
+opt_profit = float(ready[-1])
+
+# ----------------- Backtracking to recover trades -----------------
+trades = []  # list of dicts: {"action":"BUY"/"SELL","t":int,"price":float}
+state = ("READY", n-1)
+
+# Helper: find which sell expired into ready[t] if it came from cooldown
+# We stored ("COOLDONE", sell_day) in ready_from. That sell_day is the day we sold.
+# Before selling at sell_day, we were holding at sell_day-1. We'll switch to HOLD at sell_day-1 and continue.
+
+t = n-1
+while t >= 0:
+    if state[0] == "READY":
+        how, idx = ready_from[t]
+        if how == "INIT":
+            # start of chain
+            break
+        elif how == "KEEP":
+            t = idx
+            state = ("READY", t)
+        elif how == "COOLDONE":
+            sell_day = idx
+            # record SELL at sell_day
+            trades.append({"action":"SELL","t":sell_day,"price":float(p[sell_day])})
+            # move to HOLD at sell_day-1
+            t = sell_day - 1
+            if t < 0: break
+            state = ("HOLD", t)
+        else:
+            break
+
+    elif state[0] == "HOLD":
+        how, idx = hold_from[t]
+        if how == "HOLD":
+            t = idx
+            state = ("HOLD", t)
+        elif how == "BUY":
+            # record BUY at day t (we used ready[t] to buy)
+            trades.append({"action":"BUY","t":t,"price":float(p[t])})
+            # after buy, we must backtrack through ready[t]
+            state = ("READY", t)
+        else:
+            break
+    else:
+        break
+
+# Trades were collected backward; reverse chronologically
+trades = list(reversed(trades))
+
+# ----------------- Sanity: enforce alternating BUY/SELL and cooldown correctness ---------------
+cleaned = []
+last_buy_t = None
+for tr in trades:
+    if tr["action"] == "BUY":
+        # if a buy follows a buy (shouldn't), skip duplicates
+        if last_buy_t is None:
+            cleaned.append(tr); last_buy_t = tr["t"]
+        else:
+            # keep only the earliest BUY before a SELL
+            continue
+    else:  # SELL
+        if last_buy_t is None:
+            # stray SELL without a BUY before; skip
+            continue
+        # respect cooldown: next BUY must be >= SELL_day + COOLDOWN
+        cleaned.append(tr)
+        last_buy_t = None
+trades = cleaned
+
+# ----------------- Build equity curve from trades -----------------
+equity = []
+cash = 0.0
+pos  = 0
+for i, (d, price) in enumerate(zip(px.index, p)):
+    # execute trades that happen today
+    for tr in trades:
+        if tr["t"] == i and tr["action"] == "BUY" and pos == 0:
+            cash -= price + FEE
+            pos = 1
+        elif tr["t"] == i and tr["action"] == "SELL" and pos == 1:
+            cash += price - FEE
+            pos = 0
+    eq = cash + (price if pos==1 else 0.0)
+    equity.append(eq)
+
+equity = np.array(equity, dtype=float)
+equity -= equity[0]  # start at 0
+
+# Baseline: Buy & Hold 1 share from day 0
+bh_equity = p - p[0]
+
+# ----------------- Output & plots -----------------
+trades_df = pd.DataFrame(trades)
+if not trades_df.empty:
+    trades_df["date"] = [px.index[t] for t in trades_df["t"]]
+    trades_df = trades_df[["date","action","t","price"]]
+
+trades_csv = OUT_DIR / f"{TICKER}_dp_trades.csv"
+trades_df.to_csv(trades_csv, index=False)
+print(f"Optimal DP profit: {opt_profit:.2f}  |  Trades: {len(trades)}  |  Saved -> {trades_csv}")
+
+plt.figure(figsize=(11,5))
+plt.plot(px.index, bh_equity, label="Buy & Hold (1 sh)")
+plt.plot(px.index, equity, label="DP Strategy Equity")
+# annotate trades
+for tr in trades:
+    d = px.index[tr["t"]]
+    y = equity[tr["t"]]
+    if tr["action"] == "BUY":
+        plt.scatter([d],[y], marker="^")
+    else:
+        plt.scatter([d],[y], marker="v")
+plt.title(f"{TICKER} — DP with Cooldown={COOLDOWN}, Fee={FEE}")
+plt.xlabel("Date"); plt.ylabel("P&L (currency units)")
+plt.legend(); plt.tight_layout(); plt.show()
+
+# Summary table
+if not trades_df.empty:
+    print("\nTrades:")
+    print(trades_df.to_string(index=False))
+else:
+    print("\nNo trades found (strategy may choose to stay flat under these params).")
+```
+
+**What this cell does**
+
+* Robust price loading (falls back to synthetic).
+* **DP** with a cooldown **queue** (single pass).
+* **Backtracking** to recover an optimal **BUY/SELL** sequence.
+* **Equity curve** vs **Buy & Hold** with clear markers.
+* Exports `…_dp_trades.csv`.
+
+> Tip: Experiment with `COOLDOWN` and `FEE`. Larger fees or longer cooldown reduce trade frequency and can favor sitting flat.
+
+---
+
+### Real-life scenario
+
+* **Execution scheduling with constraints**: After finishing a sell program (or risk unwind), you might face **operational or liquidity cooldowns** (e.g., internal risk rules, regulatory settlement, market impact). The DP structure mirrors this: **don’t re-enter** until constraints expire.
+* **Signal throttling**: Even with frequent alpha signals, desks enforce a **cooldown** to avoid **over-trading** and reduce **impact/fees**, optimizing long-run P&L under frictions.
+
+---
+
+### Articles to read
+
+* LeetCode 309: *Best Time to Buy and Sell Stock with Cooldown* (classic DP state model).
+* Almgren–Chriss framework (execution cost and optimal scheduling under market impact).
+* Practical slippage modeling: fixed + proportional costs, and how frictions change optimal trading cadence.
+
+Want me to extend this to **position sizing** (not just 0/1 share), add **stop-loss / take-profit**, or enforce **max trades per month** constraints?
