@@ -1,0 +1,210 @@
+**Level-27 — Deep Reinforcement Learning for Trading Decisions (DQN / Policy-Gradient Hybrid)** 🧠📊
+
+---
+
+### 🎯 Objective
+
+Move beyond deterministic or dynamic-programming trading rules into **model-free reinforcement learning**.
+At this level, you’ll:
+
+* Formulate the trading environment as an **MDP**
+* Use a **Deep Q-Network (DQN)** to learn a policy from experience
+* Compare its learned behaviour against buy-and-hold or the DP strategy from Level-26
+
+---
+
+### 🧩 Core Idea
+
+At every time step *t*:
+**State sₜ** = [normalized price history window, position (0/1), cash].
+**Action aₜ** ∈ { Buy , Sell , Hold }.
+**Reward rₜ** = change in portfolio value after executing aₜ − fee.
+The agent seeks to maximize discounted cumulative reward.
+
+We’ll use:
+
+* **Replay buffer** for experience replay
+* **Target network** for stable Q-updates
+* **ε-greedy exploration**
+
+---
+
+### ⚙️ One-Cell Prototype (minimal but functional DQN)
+
+```python
+# Level 27 — Deep Q-Learning Trading Agent (scalar-safe)
+
+import numpy as np, pandas as pd, torch, torch.nn as nn, torch.optim as optim, random, yfinance as yf
+import matplotlib.pyplot as plt
+from pathlib import Path
+
+# ---------------- Config ----------------
+TICKER   = "AAPL"
+YEARS    = 3
+WINDOW   = 10          # lookback window for state
+FEE      = 0.001       # proportional fee
+EPISODES = 30
+BATCH    = 64
+GAMMA    = 0.95
+LR       = 1e-3
+EPS_DECAY= 0.995
+MIN_EPS  = 0.05
+OUT_DIR  = Path(r"C:\Users\adity\Downloads\Learn_DSA_Quant\Level-27")
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+# ---------------- Data ----------------
+def load_px(ticker, years=3):
+    df = yf.download(ticker, period=f"{years}y", interval="1d", auto_adjust=True, progress=False)
+    if "Close" not in df: return pd.Series(dtype=float)
+    return df["Close"].dropna().astype(float)
+
+px = load_px(TICKER, YEARS)
+if px.empty:
+    n=800; np.random.seed(27)
+    dates=pd.bdate_range(end=pd.Timestamp.today(),periods=n)
+    r=np.random.normal(0,0.01,n)
+    px=pd.Series(100*np.exp(np.cumsum(r)),index=dates)
+p = px.to_numpy(dtype=np.float32)
+rets = np.diff(p)/p[:-1]
+print(f"Loaded {len(p)} prices for {TICKER}")
+
+# ---------------- Environment ----------------
+class TradingEnv:
+    def __init__(self, prices, fee=0.001, window=10):
+        self.p, self.n = prices, len(prices)
+        self.fee, self.window = fee, window
+        self.reset()
+    def reset(self):
+        self.t = self.window
+        self.pos = 0  # 0 flat, 1 long
+        self.cash = 1.0
+        self.asset = 0.0
+        return self._state()
+    def _state(self):
+        w = self.p[self.t-self.window:self.t]
+        norm = (w/w[0])-1.0
+        return np.concatenate([norm, [float(self.pos)]])
+    def step(self, action):
+        price = self.p[self.t]
+        reward = 0.0
+        # 0=Hold,1=Buy,2=Sell
+        if action==1 and self.pos==0:
+            self.pos=1; cost=price*(1+self.fee)
+            self.asset=self.cash/cost; self.cash=0
+        elif action==2 and self.pos==1:
+            sale=price*(1-self.fee)*self.asset
+            reward = sale - 1.0  # profit vs initial 1.0
+            self.cash=sale; self.asset=0; self.pos=0
+        self.t+=1
+        done = self.t>=self.n
+        next_state = self._state() if not done else np.zeros(self.window+1)
+        portfolio = self.cash + self.asset*self.p[self.t-1]
+        reward += (portfolio-1.0)
+        return next_state, reward, done
+env = TradingEnv(p, FEE, WINDOW)
+
+# ---------------- DQN ----------------
+class QNet(nn.Module):
+    def __init__(self, dim_state, dim_action):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(dim_state,64), nn.ReLU(),
+            nn.Linear(64,64), nn.ReLU(),
+            nn.Linear(64,dim_action)
+        )
+    def forward(self,x): return self.net(x)
+
+state_dim = WINDOW+1; n_actions=3
+qnet = QNet(state_dim,n_actions).to(device)
+target = QNet(state_dim,n_actions).to(device)
+target.load_state_dict(qnet.state_dict())
+opt = optim.Adam(qnet.parameters(),lr=LR)
+loss_fn = nn.MSELoss()
+
+# ---------------- Replay Buffer ----------------
+from collections import deque
+buf = deque(maxlen=5000)
+def sample_batch():
+    batch = random.sample(buf, min(len(buf),BATCH))
+    s,a,r,ns,d = map(np.array,zip(*batch))
+    return torch.tensor(s,dtype=torch.float32,device=device), \
+           torch.tensor(a,dtype=torch.long,device=device), \
+           torch.tensor(r,dtype=torch.float32,device=device), \
+           torch.tensor(ns,dtype=torch.float32,device=device), \
+           torch.tensor(d,dtype=torch.float32,device=device)
+
+# ---------------- Training ----------------
+eps = 1.0
+episode_rewards=[]
+for ep in range(EPISODES):
+    s = env.reset()
+    total = 0.0
+    while True:
+        if random.random()<eps: a = random.randrange(n_actions)
+        else:
+            with torch.no_grad():
+                qvals = qnet(torch.tensor(s,dtype=torch.float32,device=device).unsqueeze(0))
+                a = int(torch.argmax(qvals).item())
+        ns, r, done = env.step(a)
+        buf.append((s,a,r,ns,done))
+        s = ns; total += r
+        if done: break
+
+        if len(buf)>=BATCH:
+            S,A,R,NS,D = sample_batch()
+            with torch.no_grad():
+                q_next = target(NS).max(1)[0]
+                q_target = R + GAMMA*(1-D)*q_next
+            q_pred = qnet(S).gather(1,A.unsqueeze(1)).squeeze(1)
+            loss = loss_fn(q_pred,q_target)
+            opt.zero_grad(); loss.backward(); opt.step()
+    eps = max(MIN_EPS, eps*EPS_DECAY)
+    target.load_state_dict(qnet.state_dict())
+    episode_rewards.append(total)
+    print(f"Episode {ep+1:02d} | Reward {total:.3f} | eps {eps:.3f}")
+
+# ---------------- Evaluation ----------------
+s = env.reset(); eq=[]
+for t in range(env.window,env.n):
+    with torch.no_grad():
+        q = qnet(torch.tensor(s,dtype=torch.float32,device=device).unsqueeze(0))
+        a = int(torch.argmax(q).item())
+    ns, r, done = env.step(a)
+    port = env.cash + env.asset*env.p[env.t-1]
+    eq.append(port)
+    s = ns
+    if done: break
+eq = np.array(eq)
+
+plt.figure(figsize=(10,5))
+plt.plot(px.index[-len(eq):], eq, label="DQN Portfolio Value")
+plt.plot(px.index[-len(eq):], p[-len(eq):]/p[-len(eq)], label="Buy & Hold (norm)")
+plt.title(f"Level-27 DQN Trading — {TICKER}")
+plt.legend(); plt.tight_layout(); plt.show()
+
+# Save model
+torch.save(qnet.state_dict(), OUT_DIR/f"{TICKER}_dqn.pth")
+print(f"Saved model to {OUT_DIR}")
+```
+
+---
+
+### 🧠 Key Notes
+
+* Uses **price-window normalization** (stationary input).
+* Reward ties to **portfolio delta**, not absolute price.
+* Trains over several passes (episodes); replay buffer ensures stability.
+* You can change `EPISODES`, `WINDOW`, or `FEE` to explore trade frequency vs. cost.
+
+---
+
+### 📊 What You’ll Learn
+
+✅ Formulating a trading task as an RL environment.
+✅ Implementing a replay buffer, target network, and epsilon-decay exploration.
+✅ Seeing how **transaction costs** shift learned behaviour.
+✅ Building toward **Policy-Gradient (A2C/PPO)** or **Actor–Critic** in Level-28.
+
+---
