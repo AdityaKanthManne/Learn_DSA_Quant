@@ -1,0 +1,367 @@
+**Level-28 — Policy-Gradient Trading with PPO (continuous position sizing)** 🧠📈
+
+---
+
+### Theory (dense + practical)
+
+**From discrete to continuous decisions.**
+Level-27’s DQN picked actions from {Hold, Buy, Sell}. Many execution problems are **continuous**—e.g., *what fraction of capital* to allocate, or *how strongly* to tilt a position. **Policy gradients** optimize a parameterized **stochastic policy** (\pi_\theta(a\mid s)) **directly** by ascending the expected return (\mathbb{E}[\sum \gamma^t r_t]).
+
+**Advantage actor–critic.**
+We write the **policy (actor)** (\pi_\theta) and a **value function (critic)** (V_\phi(s)). The **advantage** (A_t \approx G_t - V_\phi(s_t)) tells us how much better an action was than typical for that state. Using **GAE(λ)** stabilizes and de-biases advantage estimates:
+[
+A_t=\sum_{l=0}^{\infty}(\gamma\lambda)^l,\delta_{t+l},\quad
+\delta_t=r_t+\gamma V_\phi(s_{t+1})-V_\phi(s_t).
+]
+
+**PPO (Proximal Policy Optimization).**
+Naïve policy-gradient steps can be too large. PPO maximizes a **clipped surrogate**:
+[
+L^{\text{CLIP}}(\theta)=\mathbb{E}\big[\min\big(r_t(\theta)A_t,
+\text{clip}(r_t(\theta),1-\epsilon,1+\epsilon)A_t\big)\big],
+]
+with (r_t(\theta)=\frac{\pi_\theta(a_t!\mid s_t)}{\pi_{\theta_{\text{old}}}(a_t!\mid s_t)}). The clip keeps updates “proximal” to the old policy. We **jointly** fit the critic with MSE to bootstrap targets.
+
+**Action distribution (continuous).**
+We’ll use a **Beta distribution** (\text{Beta}(\alpha,\beta)) on ([0,1]) to model **position fraction** (a_t\in[0,1]). It’s well-behaved on a bounded domain and avoids tanh-Gaussian log-prob correction headaches.
+
+**Reward design.**
+We use **portfolio delta** reward: (r_t = \text{PV}*t - \text{PV}*{t-1}). Transaction costs are applied on **turnover** (|a_t-a_{t-1}|) via a proportional **fee**. This makes the agent **cost-aware** and discourages thrashing.
+
+**State.**
+Window-normalized returns/levels (stationary-ish) + current position; i.e., (s_t=[(p_{t-W:t}/p_{t-W})-1,, \text{pos}_{t-1}]).
+
+---
+
+### Problem
+
+Train a **PPO agent** that outputs a **continuous position size** (a_t\in[0,1]) on daily OHLC close data (or synthetic fallback). Compare the PPO equity curve to **Buy & Hold**. Save model weights and a CSV with the equity path.
+
+---
+
+### One-cell Python (PPO, scalar-safe, no seaborn)
+
+```python
+# Level 28 — PPO for continuous position sizing (Beta policy), one cell
+
+import numpy as np, pandas as pd, yfinance as yf, torch, torch.nn as nn, torch.optim as optim
+import matplotlib.pyplot as plt
+from torch.distributions import Beta
+from pathlib import Path
+
+# ---------------- Config ----------------
+TICKER   = "AAPL"
+YEARS    = 3
+WINDOW   = 15          # lookback length in days
+FEE      = 0.001       # proportional fee on turnover |a_t - a_{t-1}|
+GAMMA    = 0.99
+LAMBDA   = 0.95        # GAE lambda
+CLIP_EPS = 0.20
+PI_LR    = 3e-4
+VF_LR    = 1e-3
+EPOCHS   = 25
+STEPS_PER_EPOCH = 512  # per rollout
+TRAIN_ITERS = 10
+VF_COEF  = 0.5
+ENT_COEF = 1e-3
+REWARD_NORM = True
+
+OUT_DIR = Path(r"C:\Users\adity\Downloads\Learn_DSA_Quant\Level-28")
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+# ---------------- Data (1-D prices) ----------------
+def load_prices_1d(ticker, years=3) -> np.ndarray:
+    df = yf.download(ticker, period=f"{years}y", interval="1d",
+                     auto_adjust=True, progress=False)
+    if df is None or df.empty:
+        return np.array([], dtype=np.float32)
+    col = "Close" if "Close" in df.columns else ("Adj Close" if "Adj Close" in df.columns else df.columns[-1])
+    s = df[col].dropna().astype(float)
+    s = s[~s.index.duplicated(keep="last")]
+    p = s.to_numpy(dtype=np.float32).reshape(-1)
+    return p
+
+def synth_prices(n=1000, seed=28) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    # geometric random walk with mild drift, noise
+    r = rng.normal(0.0004, 0.012, n)
+    p = 100.0 * np.exp(np.cumsum(r))
+    return p.astype(np.float32)
+
+p = load_prices_1d(TICKER, YEARS)
+if p.size == 0:
+    print("Using synthetic price series fallback.")
+    p = synth_prices(1000, 28)
+    TICKER = "SYNTH"
+
+# Ensure enough length
+MIN_LEN = max(800, WINDOW + 100)
+if p.size < MIN_LEN:
+    need = MIN_LEN - p.size
+    tail = synth_prices(need, 2801)
+    tail = tail / tail[0] * p[-1]
+    p = np.concatenate([p, tail]).astype(np.float32)
+
+# ---------------- Environment ----------------
+class PositionEnv:
+    """
+    Continuous action a_t in [0,1] = fraction long.
+    State: [(p[t-W:t]/p[t-W])-1, position_{t-1}].
+    Reward: ΔPortfolio - fee*turnover, where turnover = |a_t - a_{t-1}|.
+    """
+    def __init__(self, prices: np.ndarray, window=15, fee=0.001):
+        self.p = prices.astype(np.float32).reshape(-1)
+        self.n = int(self.p.size)
+        self.W = int(window)
+        self.fee = float(fee)
+        self.reset()
+
+    def reset(self):
+        self.t = self.W
+        self.pos = 0.0
+        self.cash = 1.0
+        self.prev_port = 1.0
+        return self._state()
+
+    def _state(self):
+        w = self.p[self.t - self.W:self.t]
+        w0 = float(w[0])
+        norm = (w / (w0 if w0 != 0.0 else 1.0)) - 1.0
+        return np.concatenate([norm.astype(np.float32), np.array([self.pos], dtype=np.float32)])
+
+    def step(self, a):  # a in [0,1]
+        a = float(np.clip(a, 0.0, 1.0))
+        price = float(self.p[self.t])
+
+        # rebalance (cost applied on turnover)
+        turnover = abs(a - self.pos)
+        port = float(self.cash + self.pos * self.p[self.t-1])  # before trade PV (mark to mkt with last price)
+        # after rebalancing, invest fraction a at current price
+        port_after_fee = port * (1.0 - self.fee * turnover)
+        self.pos = a
+        self.cash = float(port_after_fee * (1.0 - self.pos))  # remainder stays cash
+
+        # advance to end-of-step valuation
+        self.t += 1
+        done = self.t >= self.n
+        last_price = float(self.p[self.t-1])
+        portfolio = float(self.cash + self.pos * last_price)
+
+        reward = portfolio - self.prev_port
+        self.prev_port = portfolio
+
+        next_state = self._state() if not done else np.zeros(self.W + 1, dtype=np.float32)
+        info = {"portfolio": portfolio}
+        return next_state, float(reward), bool(done), info
+
+env = PositionEnv(p, window=WINDOW, fee=FEE)
+
+state_dim = WINDOW + 1
+act_dim   = 1  # Beta in [0,1]
+
+# ---------------- Actor-Critic (Beta policy) ----------------
+class Actor(nn.Module):
+    def __init__(self, sdim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(sdim, 64), nn.ReLU(),
+            nn.Linear(64, 64), nn.ReLU()
+        )
+        self.alpha_head = nn.Linear(64, 1)
+        self.beta_head  = nn.Linear(64, 1)
+
+    def forward(self, s):
+        h = self.net(s)
+        # alpha, beta > 0; use softplus + 1 to avoid extreme smalls
+        alpha = torch.softplus(self.alpha_head(h)) + 1.0
+        beta  = torch.softplus(self.beta_head(h))  + 1.0
+        return alpha, beta
+
+    def dist(self, s):
+        alpha, beta = self.forward(s)
+        return Beta(alpha, beta)
+
+class Critic(nn.Module):
+    def __init__(self, sdim):
+        super().__init__()
+        self.v = nn.Sequential(
+            nn.Linear(sdim, 64), nn.ReLU(),
+            nn.Linear(64, 64), nn.ReLU(),
+            nn.Linear(64, 1)
+        )
+    def forward(self, s):
+        return self.v(s).squeeze(-1)
+
+actor = Actor(state_dim).to(device)
+critic = Critic(state_dim).to(device)
+pi_opt = optim.Adam(actor.parameters(), lr=PI_LR)
+vf_opt = optim.Adam(critic.parameters(), lr=VF_LR)
+
+# ---------------- Rollout buffer ----------------
+class Buffer:
+    def __init__(self, sdim, size, gamma, lam):
+        self.s = np.zeros((size, sdim), dtype=np.float32)
+        self.a = np.zeros((size, 1), dtype=np.float32)
+        self.r = np.zeros(size, dtype=np.float32)
+        self.v = np.zeros(size, dtype=np.float32)
+        self.logp = np.zeros(size, dtype=np.float32)
+        self.done = np.zeros(size, dtype=np.float32)
+        self.ptr = 0; self.path_start = 0
+        self.gamma, self.lam = gamma, lam
+
+    def store(self, s, a, r, v, logp, done):
+        i = self.ptr
+        self.s[i] = s
+        self.a[i] = a
+        self.r[i] = r
+        self.v[i] = v
+        self.logp[i] = logp
+        self.done[i] = done
+        self.ptr += 1
+
+    def finish(self, last_val=0.0):
+        """Compute GAE advantages and returns over the trajectory just collected."""
+        path_slice = slice(self.path_start, self.ptr)
+        rews = np.append(self.r[path_slice], last_val)
+        vals = np.append(self.v[path_slice], last_val)
+        # deltas
+        deltas = rews[:-1] + self.gamma * vals[1:] - vals[:-1]
+        adv = np.zeros_like(deltas, dtype=np.float32)
+        gae = 0.0
+        for t in reversed(range(len(deltas))):
+            gae = deltas[t] + self.gamma * self.lam * gae
+            adv[t] = gae
+        ret = adv + vals[:-1]
+        self.adv = adv
+        self.ret = ret
+        self.path_start = self.ptr
+
+    def get(self):
+        assert self.ptr == len(self.s)
+        adv = self.adv
+        if REWARD_NORM:
+            adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+        data = dict(
+            s=torch.tensor(self.s, dtype=torch.float32, device=device),
+            a=torch.tensor(self.a, dtype=torch.float32, device=device),
+            ret=torch.tensor(self.ret, dtype=torch.float32, device=device),
+            adv=torch.tensor(adv, dtype=torch.float32, device=device),
+            logp=torch.tensor(self.logp, dtype=torch.float32, device=device),
+        )
+        return data
+
+# ---------------- Training loop ----------------
+def ppo_update(data):
+    s,a,ret,adv,logp_old = data["s"], data["a"], data["ret"], data["adv"], data["logp"]
+    for _ in range(TRAIN_ITERS):
+        dist = actor.dist(s)
+        logp = dist.log_prob(a.clamp(0,1)).sum(-1)
+        ratio = torch.exp(logp - logp_old)
+        clip_adv = torch.clamp(ratio, 1.0 - CLIP_EPS, 1.0 + CLIP_EPS) * adv
+        loss_pi = -(torch.min(ratio * adv, clip_adv)).mean()
+        ent = dist.entropy().mean()
+
+        v = critic(s)
+        loss_v = ((v - ret)**2).mean()
+
+        pi_opt.zero_grad(); loss_pi.backward(); pi_opt.step()
+        vf_opt.zero_grad(); loss_v.backward(); vf_opt.step()
+
+    return loss_pi.item(), loss_v.item(), ent.item()
+
+def rollout(env, steps):
+    buf = Buffer(state_dim, steps, GAMMA, LAMBDA)
+    s = env.reset()
+    for t in range(steps):
+        st = torch.tensor(s, dtype=torch.float32, device=device).unsqueeze(0)
+        with torch.no_grad():
+            dist = actor.dist(st)
+            a = dist.sample().squeeze(0)                  # [1] -> []
+            logp = dist.log_prob(a).sum(-1)               # scalar
+            v = critic(st).squeeze(0)                     # scalar
+        a_np = float(a.clamp(0,1).cpu().item())
+        ns, r, d, info = env.step(a_np)
+        buf.store(s, a_np, r, float(v.cpu().item()), float(logp.cpu().item()), float(d))
+        s = ns
+        if d:
+            # bootstrap value for terminal state = 0
+            buf.finish(0.0)
+            s = env.reset()
+    # If final path didn’t terminate, bootstrap with critic
+    st = torch.tensor(s, dtype=torch.float32, device=device).unsqueeze(0)
+    with torch.no_grad():
+        last_v = float(critic(st).cpu().item())
+    buf.finish(last_v)
+    return buf.get()
+
+# Train
+episode_returns = []
+for ep in range(1, EPOCHS + 1):
+    data = rollout(env, STEPS_PER_EPOCH)
+    lpi, lvf, ent = ppo_update(data)
+    # Track a quick evaluation roll
+    s = env.reset(); eq = []
+    while True:
+        st = torch.tensor(s, dtype=torch.float32, device=device).unsqueeze(0)
+        with torch.no_grad():
+            a = actor.dist(st).mean.squeeze(0)  # greedy = mean
+        a_np = float(a.clamp(0,1).cpu().item())
+        ns, r, d, info = env.step(a_np)
+        eq.append(float(info["portfolio"]))
+        s = ns
+        if d: break
+    episode_returns.append(eq[-1])
+    print(f"Epoch {ep:02d} | π:{lpi:.4f}  V:{lvf:.4f}  H:{ent:.4f}  EvalPV:{eq[-1]:.4f}")
+
+# Save models
+torch.save(actor.state_dict(), OUT_DIR / f"{TICKER}_ppo_actor.pth")
+torch.save(critic.state_dict(), OUT_DIR / f"{TICKER}_ppo_critic.pth")
+
+# ---------------- Final evaluation & plot ----------------
+s = env.reset(); eq=[]
+while True:
+    st = torch.tensor(s, dtype=torch.float32, device=device).unsqueeze(0)
+    with torch.no_grad():
+        a = actor.dist(st).mean.squeeze(0)
+    a_np = float(a.clamp(0,1).cpu().item())
+    ns, r, d, info = env.step(a_np)
+    eq.append(float(info["portfolio"]))
+    s = ns
+    if d: break
+
+eq = np.array(eq, dtype=float)
+bh = p[-len(eq):] / float(p[-len(eq)])
+
+# Save equity CSV
+eq_df = pd.DataFrame({"step": np.arange(len(eq)), "ppo_portfolio": eq, "bh_norm": bh})
+eq_df.to_csv(OUT_DIR / f"{TICKER}_ppo_equity.csv", index=False)
+
+plt.figure(figsize=(10,5))
+plt.plot(eq, label="PPO Portfolio Value")
+plt.plot(bh, label="Buy & Hold (norm)")
+plt.title(f"Level-28 PPO (Beta policy) — {TICKER}, fee={FEE}")
+plt.legend(); plt.tight_layout(); plt.show()
+
+print(f"Saved weights and equity to {OUT_DIR}")
+```
+
+---
+
+### Real-life scenario
+
+* **Execution with participation targets.** PPO learns a **smooth trading rate** (continuous position) that balances alpha with **impact/fees** via turnover penalties—akin to real participation constraints (e.g., 20–30% POV) while remaining cost-aware.
+* **Risk dial.** Your action is a **risk budget** (0..1). PPO can learn to **de-risk in chop** and **press in trends**, influenced only by reward and costs—no hand-crafted regimes.
+* **Policy constraints.** Beta policy naturally keeps actions in ([0,1]), matching **long-only** mandate or regulated risk bands.
+
+---
+
+### Articles to read
+
+* Schulman et al., **“Proximal Policy Optimization Algorithms.”**
+* Schulman et al., **“High-Dimensional Continuous Control Using Generalized Advantage Estimation.”**
+* Sutton & Barto, **“Reinforcement Learning: An Introduction.”** (Policy gradients, actor–critic).
+* Practical fin-RL notes: transaction-cost modeling, turnover penalties, and risk-adjusted rewards (e.g., Sharpe-style shaping).
+
+---
