@@ -1,0 +1,415 @@
+Awesome — **Level 31** coming up. This one adds **true out-of-sample walk-forward testing**, **probability calibration (isotonic)**, **risk overlays (vol targeting + turnover cap)**, **plots**, and **CSV outputs**. Drop the whole cell into your notebook and run.
+
+> Output files go to `C:\Users\adity\Downloads\Learn_DSA_Quant\Level-31\` (change `BASE_DIR` if you want).
+
+```python
+# ===== Level 31: Walk-Forward OOS + Calibrated Probabilities + Risk Overlays =====
+# Dependencies: pandas, numpy, scikit-learn, matplotlib, yfinance
+# No seaborn; single-figure charts; Windows-safe paths.
+
+import os
+from pathlib import Path
+from datetime import datetime, timedelta, timezone
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+import matplotlib.pyplot as plt
+
+from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.metrics import roc_auc_score
+
+# ----------------------------- Config -----------------------------
+TICKER      = "AAPL"
+YEARS       = 5                # price history
+FREQ        = "1D"            # sampling freq after download
+H_BARS      = 10              # initial vertical barrier horizon (days)
+UP_M, DN_M  = 1.0, 1.0        # upper/lower barrier multipliers
+CUSUM_GRID  = np.linspace(0.003, 0.02, 10)   # adaptive threshold candidates (on returns)
+VOL_SPAN    = 50              # EWMA vol span
+N_SPLITS    = 6               # walk-forward slices (time-ordered)
+TURNOVER_CAP= 0.5             # max |pos_t - pos_{t-1}|
+TC_BPS      = 5.0             # transaction cost per side (basis points)
+VOL_TARGET  = 0.10            # annualized vol target for position scaling (long/flat)
+MIN_EVENTS  = 300             # minimum labeled events required
+RNG_SEED    = 42
+
+BASE_DIR = Path(r"C:\Users\adity\Downloads\Learn_DSA_Quant\Level-31")
+BASE_DIR.mkdir(parents=True, exist_ok=True)
+
+np.random.default_rng(RNG_SEED)
+
+# ----------------------------- Utilities -----------------------------
+def load_prices(ticker="AAPL", years=3, freq="1D"):
+    start = (datetime.now(timezone.utc) - timedelta(days=int(365*years + 20))).date()
+    df = yf.download(ticker, start=str(start), interval="1d", auto_adjust=True, progress=False)
+    if df.empty:
+        raise SystemExit("No data downloaded—check ticker or internet.")
+    # Prefer Adj Close if present
+    if "Adj Close" in df.columns:
+        close = df["Adj Close"].rename("Close")
+    elif "Close" in df.columns:
+        close = df["Close"].rename("Close")
+    else:
+        raise RuntimeError("No Close/Adj Close column in downloaded data.")
+    # Ensure monotonic index, no dupes
+    close = close[~close.index.duplicated(keep="last")].sort_index()
+    if freq and freq.upper() != "1D":
+        close = close.asfreq(freq).ffill()
+    return close
+
+def ewma_vol(r, span=50):
+    # Daily vol (ann not applied yet)
+    return r.ewm(span=span, min_periods=max(2, span//2)).std()
+
+def cusum_filter(r: pd.Series, threshold: float) -> pd.DatetimeIndex:
+    """Basic CUSUM on *returns* series -> event timestamps."""
+    s_pos, s_neg = 0.0, 0.0
+    t_events = []
+    # iterate numeric values to avoid ambiguous truth checks
+    for t, x in r.items():
+        x = float(x)
+        s_pos = max(0.0, s_pos + x)
+        s_neg = min(0.0, s_neg + x)
+        if s_pos > threshold:
+            s_pos = 0.0
+            t_events.append(t)
+        elif s_neg < -threshold:
+            s_neg = 0.0
+            t_events.append(t)
+    return pd.DatetimeIndex(t_events)
+
+def get_vertical_barriers(t_events: pd.DatetimeIndex, h: int, index: pd.DatetimeIndex) -> pd.Series:
+    if len(t_events) == 0:
+        return pd.Series(dtype="datetime64[ns]")
+    # For each t_event, set t1 = min(t_event + h days, last index)
+    out = {}
+    for t in t_events:
+        # next h-th index forward (calendar)
+        loc = index.get_indexer([t], method="nearest")[0]
+        j = min(loc + h, len(index)-1)
+        out[t] = index[j]
+    return pd.Series(out)
+
+def get_triple_barrier_labels(close: pd.Series,
+                              t_events: pd.DatetimeIndex,
+                              vbar: pd.Series,
+                              up_m: float, dn_m: float,
+                              daily_vol: pd.Series) -> pd.DataFrame:
+    rows = []
+    for t0 in t_events:
+        if t0 not in vbar.index:
+            continue
+        t1 = vbar.loc[t0]
+        if pd.isna(t1):
+            continue
+        if t0 not in daily_vol.index:
+            continue
+        c0 = float(close.loc[t0])
+        trgt = float(daily_vol.loc[t0])
+        if trgt <= 0 or np.isnan(trgt):
+            continue
+        up_lvl = c0 * (1.0 + up_m * trgt)
+        dn_lvl = c0 * (1.0 - dn_m * trgt)
+
+        path = close.loc[t0:t1]
+        # Find first hit up/down if any
+        hit_up = path.index[(path >= up_lvl).values]
+        hit_dn = path.index[(path <= dn_lvl).values]
+        hu = hit_up[0] if len(hit_up) else None
+        hd = hit_dn[0] if len(hit_dn) else None
+
+        if hu is not None and hd is not None:
+            t_hit = hu if hu < hd else hd
+            label = 1 if hu < hd else -1
+        elif hu is not None:
+            t_hit = hu; label = 1
+        elif hd is not None:
+            t_hit = hd; label = -1
+        else:
+            # no hit -> sign of return at t1
+            ret = float(close.loc[t1] / c0 - 1.0)
+            label = 1 if ret > 0 else (-1 if ret < 0 else 0)
+            t_hit = t1
+        rows.append((t0, t_hit, label, trgt))
+    if not rows:
+        return pd.DataFrame(columns=["t1","label","trgt"])
+    lab = pd.DataFrame(rows, columns=["t0","t1","label","trgt"]).set_index("t0").sort_index()
+    return lab
+
+def make_features(close: pd.Series) -> pd.DataFrame:
+    r1  = close.pct_change()
+    r5  = close.pct_change(5)
+    r20 = close.pct_change(20)
+    mom5 = close/close.shift(5) - 1.0
+    mom20= close/close.shift(20)- 1.0
+    vol10= r1.rolling(10, min_periods=5).std()
+    vol20= r1.rolling(20, min_periods=10).std()
+    z20  = (close - close.rolling(20, min_periods=10).mean()) / (close.rolling(20, min_periods=10).std())
+    # RSI(14) without TA lib
+    delta = close.diff()
+    up = delta.clip(lower=0.0)
+    dn = -delta.clip(upper=0.0)
+    roll_up = up.ewm(alpha=1/14, adjust=False).mean()
+    roll_dn = dn.ewm(alpha=1/14, adjust=False).mean()
+    rs = roll_up / (roll_dn.replace(0.0, np.nan))
+    rsi = 100 - (100 / (1 + rs))
+    X = pd.DataFrame({
+        "r1": r1, "r5": r5, "r20": r20,
+        "mom5": mom5, "mom20": mom20,
+        "vol10": vol10, "vol20": vol20,
+        "z20": z20, "rsi14": rsi
+    })
+    return X.replace([np.inf,-np.inf], 0.0).fillna(0.0)
+
+def annualize_sharpe(daily_rets, risk_free=0.0):
+    x = np.array(daily_rets, dtype=float)
+    if x.size == 0 or np.allclose(x.std(ddof=1), 0):
+        return 0.0
+    sr = (x.mean() - risk_free/252.0) / (x.std(ddof=1) + 1e-12)
+    return float(sr*np.sqrt(252.0))
+
+def max_drawdown_from_equity(eq):
+    x = np.array(eq, dtype=float)
+    highwater = np.maximum.accumulate(x)
+    dd = x/highwater - 1.0
+    return float(dd.min())
+
+def turnover_cap(positions, cap=0.5):
+    """Limit |pos_t - pos_{t-1}| <= cap; keep within [0,1]."""
+    pos = np.array(positions, dtype=float)
+    if pos.size == 0: return pos
+    out = np.zeros_like(pos)
+    out[0] = np.clip(pos[0], 0.0, 1.0)
+    for t in range(1, len(pos)):
+        step = np.clip(pos[t], 0.0, 1.0)
+        delta = np.clip(step - out[t-1], -cap, cap)
+        out[t] = np.clip(out[t-1] + delta, 0.0, 1.0)
+    return out
+
+def vol_scale_weights(daily_rets, target_ann_vol=0.10):
+    """Scalar leverage to hit target annualized vol on signal; clamp to [0,1.5] for safety."""
+    realized = np.array(daily_rets, dtype=float)
+    if realized.size < 20 or np.allclose(realized.std(ddof=1),0):
+        return 1.0
+    ann_vol = realized.std(ddof=1) * np.sqrt(252.0)
+    if ann_vol <= 1e-8: return 1.0
+    lev = target_ann_vol / ann_vol
+    return float(np.clip(lev, 0.2, 1.5))
+
+# --------------------- Adaptive events + labels ---------------------
+def adaptive_events_and_labels(close, rets, base_H, cusum_grid, vol_span, up_m, dn_m, min_events):
+    daily_vol = ewma_vol(rets, span=vol_span).clip(lower=1e-8).fillna(0.0)
+    chosen_thr = None
+    labels = None
+    events_idx = pd.DatetimeIndex([])
+    H_used = base_H
+
+    # Try thresholds until enough labels
+    for thr in cusum_grid:
+        events_idx = cusum_filter(rets, thr)
+        vbar = get_vertical_barriers(events_idx, base_H, close.index)
+        lab = get_triple_barrier_labels(close, events_idx, vbar, up_m, dn_m, daily_vol).dropna()
+        if len(lab) >= min_events:
+            chosen_thr = thr
+            labels = lab
+            break
+
+    # If still none, relax H (increase) and repeat once
+    if labels is None:
+        H_used = int(base_H*2)
+        for thr in cusum_grid:
+            events_idx = cusum_filter(rets, thr)
+            vbar = get_vertical_barriers(events_idx, H_used, close.index)
+            lab = get_triple_barrier_labels(close, events_idx, vbar, up_m, dn_m, daily_vol).dropna()
+            if len(lab) >= min_events//2:
+                chosen_thr = thr
+                labels = lab
+                break
+
+    if labels is None or labels.empty:
+        raise SystemExit("No labeled events after adaptive search. Widen YEARS or relax MIN_EVENTS.")
+
+    print(f"[Adaptive] events={len(labels)}  H={H_used}  thr≈{chosen_thr}")
+    return labels, daily_vol, events_idx, H_used, float(chosen_thr if chosen_thr is not None else 0.0)
+
+# ----------------------------- Main Flow -----------------------------
+close = load_prices(TICKER, YEARS, FREQ)
+rets  = close.pct_change().replace([np.inf,-np.inf], 0.0).fillna(0.0)
+
+labels, daily_vol, events_idx, H_used, thr_used = adaptive_events_and_labels(
+    close, rets, H_BARS, CUSUM_GRID, VOL_SPAN, UP_M, DN_M, MIN_EVENTS
+)
+
+# Supervised set
+y_signed = labels["label"].astype(int)
+y = (y_signed == 1).astype(int)                 # binary: up (1) vs others (0)
+t1 = labels["t1"]
+weights = labels["trgt"].clip(lower=1e-6)
+X_all = make_features(close)
+
+# Align features to event timestamps (information available at t0)
+idx = labels.index.intersection(X_all.index)
+X_evt = X_all.loc[idx]
+y     = y.loc[idx]
+t1    = t1.loc[idx]
+weights = weights.loc[idx]
+
+# --------------------- Walk-forward (time-ordered) ---------------------
+# Split indices into N_SPLITS sequential blocks
+times = idx.sort_values()
+n = len(times)
+splits = np.array_split(np.arange(n), N_SPLITS)
+
+# We will use a small *training* split for fitting, then a further split of that training
+# for finding the best probability threshold (by Sharpe) to avoid peeking into test.
+records = []
+test_rows = []
+
+for i in range(1, N_SPLITS):
+    tr_idx = times[np.concatenate(splits[:i])]     # all prior blocks
+    te_idx = times[splits[i]]                      # next block
+
+    # ----- Split the training time range into inner-train/inner-valid (80/20 time-split) -----
+    m = len(tr_idx)
+    cut = int(m*0.8)
+    inner_tr = tr_idx[:cut]
+    inner_va = tr_idx[cut:] if cut < m else tr_idx[-max(1, m//5):]
+
+    X_tr, y_tr, w_tr = X_evt.loc[inner_tr], y.loc[inner_tr], weights.loc[inner_tr]
+    X_va, y_va, w_va = X_evt.loc[inner_va], y.loc[inner_va], weights.loc[inner_va]
+    X_te, y_te       = X_evt.loc[te_idx],   y.loc[te_idx]
+
+    # ----- Base classifier + isotonic calibration -----
+    base = GradientBoostingClassifier(random_state=RNG_SEED)
+    # Fit base on inner_tr only
+    base.fit(X_tr, y_tr, sample_weight=w_tr)
+
+    # Calibrate on inner_va (avoid leakage into test)
+    cal = CalibratedClassifierCV(base_estimator=base, method="isotonic", cv="prefit")
+    cal.fit(X_va, y_va, sample_weight=w_va)
+
+    # ----- Choose probability threshold on inner_va by maximizing Sharpe of next-day returns -----
+    # Build validation PnL using calibrated probs on inner_va and realized next-day returns
+    proba_va = pd.Series(cal.predict_proba(X_va)[:,1], index=X_va.index)
+    # Realized next-day returns aligned to signal time
+    rets_next = close.pct_change().shift(-1).reindex(proba_va.index).fillna(0.0)
+
+    # grid thresholds
+    thr_grid = np.linspace(0.45, 0.65, 9)
+    best_sharpe, best_thr = -np.inf, 0.55
+    for thr in thr_grid:
+        pos = (proba_va >= thr).astype(float)
+        pos_cap = turnover_cap(pos.values, cap=TURNOVER_CAP)
+        tc = (np.abs(np.diff(np.r_[0.0, pos_cap])) * (TC_BPS/1e4)).astype(float)
+        pnl = pos_cap * rets_next.values - tc
+        sr = annualize_sharpe(pnl)
+        if sr > best_sharpe:
+            best_sharpe, best_thr = sr, float(thr)
+
+    # ----- OOS on test block with chosen threshold -----
+    proba_te = pd.Series(cal.predict_proba(X_te)[:,1], index=X_te.index)
+    pos_raw  = (proba_te >= best_thr).astype(float)
+    pos_cap  = turnover_cap(pos_raw.values, cap=TURNOVER_CAP)
+
+    # Vol targeting: compute leverage from *training validation* pnl to avoid peeking
+    # (rough proxy—uses inner_va pnl to determine a stable scalar)
+    pos_va_cap = turnover_cap((proba_va >= best_thr).astype(float).values, TURNOVER_CAP)
+    tc_va = (np.abs(np.diff(np.r_[0.0, pos_va_cap])) * (TC_BPS/1e4)).astype(float)
+    pnl_va = pos_va_cap * rets_next.values - tc_va
+    lev = vol_scale_weights(pnl_va, target_ann_vol=VOL_TARGET)
+
+    rets_next_te = close.pct_change().shift(-1).reindex(proba_te.index).fillna(0.0)
+    tc_te = (np.abs(np.diff(np.r_[0.0, pos_cap])) * (TC_BPS/1e4)).astype(float)
+    pnl_te = (lev * pos_cap) * rets_next_te.values - tc_te
+
+    # Collect OOS rows
+    df_te = pd.DataFrame({
+        "proba": proba_te.values,
+        "pos_raw": pos_raw.values,
+        "pos_capped": pos_cap,
+        "lev": lev,
+        "rets_next": rets_next_te.values,
+        "tc": tc_te,
+        "pnl": pnl_te
+    }, index=proba_te.index)
+    test_rows.append(df_te)
+
+    # Keep fold stats
+    fold_auc = roc_auc_score(y_va.values, proba_va.values) if len(np.unique(y_va.values))>1 else np.nan
+    records.append({
+        "fold": i,
+        "train_start": str(tr_idx.min().date()),
+        "train_end":   str(tr_idx.max().date()),
+        "test_start":  str(te_idx.min().date()),
+        "test_end":    str(te_idx.max().date()),
+        "chosen_thr":  best_thr,
+        "val_auc":     round(float(fold_auc), 4) if not np.isnan(fold_auc) else np.nan,
+        "val_sharpe":  round(float(best_sharpe), 3),
+        "lev":         round(float(lev), 3)
+    })
+
+cv_summary = pd.DataFrame.from_records(records)
+backtest   = pd.concat(test_rows, axis=0).sort_index()
+backtest["equity"] = (1.0 + backtest["pnl"]).cumprod()
+
+# --------------------- Aggregate Performance ---------------------
+sr   = annualize_sharpe(backtest["pnl"].values)
+cagr = (backtest["equity"].iloc[-1])**(252.0/len(backtest)) - 1.0 if len(backtest)>0 else 0.0
+mdd  = max_drawdown_from_equity(backtest["equity"].values)
+hit  = float((backtest["pnl"] > 0).mean()) if len(backtest)>0 else 0.0
+turn = float(np.abs(np.diff(np.r_[0.0, backtest["pos_capped"].values])).mean())
+tc_bp_avg = float(1e4 * backtest["tc"].mean()) if len(backtest)>0 else 0.0
+
+print("\n=== OOS Walk-forward (calibrated, vol-targeted, turnover-capped) ===")
+print(f"Sharpe: {sr:.3f}  CAGR: {100*cagr:.2f}%  MaxDD: {100*mdd:.2f}%  Hit%: {100*hit:.2f}%")
+print(f"Avg daily turnover: {turn:.3f}  (cap {TURNOVER_CAP})")
+print(f"Avg daily TC paid (bp): {tc_bp_avg:.2f}")
+
+# --------------------- Save CSVs ---------------------
+cv_path  = BASE_DIR / f"{TICKER}_level31_cv_summary.csv"
+bt_path  = BASE_DIR / f"{TICKER}_level31_backtest.csv"
+cv_summary.to_csv(cv_path, index=False)
+backtest.to_csv(bt_path, index=True)
+print(f"\nSaved: {cv_path.name}, {bt_path.name}")
+
+# --------------------- Plots ---------------------
+plt.figure(figsize=(11,6))
+plt.plot(backtest.index, backtest["equity"].values)
+plt.title(f"{TICKER} Level 31 — OOS Equity (walk-forward)")
+plt.xlabel("Date"); plt.ylabel("Equity (start=1.0)")
+plt.tight_layout(); plt.show()
+
+# Rolling Sharpe (63 trading days)
+roll = backtest["pnl"].rolling(63)
+roll_sr = roll.apply(lambda x: annualize_sharpe(x.values) if len(x.dropna())>=20 else np.nan, raw=False)
+plt.figure(figsize=(11,5))
+plt.plot(roll_sr.index, roll_sr.values)
+plt.title("Rolling 3-month Sharpe")
+plt.xlabel("Date"); plt.ylabel("Sharpe")
+plt.tight_layout(); plt.show()
+
+# Drawdown
+eq = backtest["equity"].values
+hwm = np.maximum.accumulate(eq)
+dd = eq/hwm - 1.0
+plt.figure(figsize=(11,4))
+plt.plot(backtest.index, dd)
+plt.title("Drawdown")
+plt.xlabel("Date"); plt.ylabel("Drawdown")
+plt.tight_layout(); plt.show()
+```
+
+### What’s new in Level 31
+
+* **True OOS walk-forward** (time blocks): train → calibrate on a small holdout → pick threshold → test only on the next block.
+* **Isotonic calibration** to fix probability miscalibration before thresholding.
+* **Risk overlays:**
+
+  * **Turnover cap** (limits position jumps).
+  * **Vol targeting** (scales exposure to ~10% annualized using only validation PnL to avoid test leakage).
+* **Metrics & charts:** Equity curve, rolling Sharpe, and drawdown.
+* **Artifacts:** `*_level31_cv_summary.csv` and `*_level31_backtest.csv` in your Level-31 folder.
+
+If you want me to add **feature importance plots, PDP/ICE**, or a **multi-asset batch runner**, say the word and we’ll make it Level 32.
