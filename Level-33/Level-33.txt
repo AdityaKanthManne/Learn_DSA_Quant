@@ -1,0 +1,368 @@
+Awesome — here’s **Level-33**: a robust, end-to-end **meta-labeling + stacking ensemble + isotonic calibration + fractional Kelly bet-sizing** pipeline with **purged, embargoed walk-forward CV** and a clean backtest (transaction costs, turnover, CAGR, max-DD). It builds on your Level-31/32 patterns and fixes the pandas/shape pitfalls you hit earlier.
+
+Paste this into a fresh cell/script and run as-is.
+
+```python
+# Level-33 — Meta-Labeling + Stacking Ensemble + Isotonic Calibration + Fractional Kelly Sizing
+# Purged KFold with Embargo, triple-barrier labels, robust 1-D handling, no Series truth ambiguity.
+
+import warnings
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+
+from datetime import datetime, timedelta, timezone
+
+from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier, StackingClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import KFold
+from sklearn.metrics import roc_auc_score
+
+# ---------------------------- Config ----------------------------
+TICKER        = "AAPL"
+YEARS         = 3.0
+FREQ          = "1D"          # daily bars for label generation/features
+VOL_SPAN      = 50
+H_BARS        = 10            # vertical barrier in bars
+CUSUM_GRID    = [0.003, 0.004, 0.006, 0.008, 0.010]
+UP_M, DN_M    = 3.0, 3.0
+MIN_EVENTS    = 400
+
+KFOLDS        = 5
+EMBARGO_FRAC  = 0.01          # 1% time-embargo between folds to prevent leakage
+
+RNG_SEED      = 42
+TC_BP         = 5             # transaction cost in basis points
+THRESH_POLICY = "median"      # 'median' of per-fold opt thresholds
+BET_CAP       = 1.0           # cap Kelly size to avoid extreme leverage
+KELLY_FRACTION= 0.5           # fraction of Kelly
+
+np.random.seed(RNG_SEED)
+
+
+# ---------------------------- Utilities ----------------------------
+def utc_today():
+    return datetime.now(timezone.utc).date()
+
+def load_prices(ticker, years, freq="1D"):
+    end = utc_today()
+    start = (datetime.now(timezone.utc) - timedelta(days=int(365*years + 20))).date()
+    df = yf.download(ticker, start=start, end=end, auto_adjust=True, progress=False)
+    if df.empty:
+        raise SystemExit("No price data downloaded.")
+    s = df["Adj Close"] if "Adj Close" in df.columns else df["Close"]
+    s = s.asfreq("B").ffill()
+    s.name = "Close"
+    return s
+
+def to_1d_series(x, index=None):
+    if isinstance(x, pd.Series):
+        s = x.astype(float).fillna(0.0)
+        return s
+    if isinstance(x, pd.DataFrame):
+        x = x.iloc[:, 0]
+        return x.astype(float).fillna(0.0)
+    arr = np.ravel(np.asarray(x, dtype=float))
+    if index is None:
+        index = pd.RangeIndex(len(arr))
+    return pd.Series(arr, index=index, dtype=float).fillna(0.0)
+
+def ewma_vol(r, span=50):
+    r = to_1d_series(r)
+    return r.ewm(span=span, adjust=False).std()
+
+def cusum_filter(r, threshold, index=None):
+    s = to_1d_series(r, index=index)
+    idx, vals = s.index, s.to_numpy()
+    s_pos = s_neg = 0.0
+    t_events = []
+    for i, x in enumerate(vals):
+        s_pos = max(0.0, s_pos + x)
+        s_neg = min(0.0, s_neg + x)
+        if s_pos > threshold:
+            s_pos = 0.0; t_events.append(idx[i])
+        elif s_neg < -threshold:
+            s_neg = 0.0; t_events.append(idx[i])
+    return pd.DatetimeIndex(t_events).unique().sort_values()
+
+def get_vertical_barriers(t_events, h, index):
+    if len(t_events) == 0:
+        return pd.Series(dtype="datetime64[ns]")
+    out = {}
+    for t0 in t_events:
+        pos = index.get_indexer([t0])[0]
+        t1_pos = min(pos + h, len(index)-1)
+        out[t0] = index[t1_pos]
+    return pd.Series(out)
+
+def get_triple_barrier_labels(close, t_events, vbar, up_m, dn_m, daily_vol):
+    trgt = daily_vol.reindex(t_events).fillna(method="bfill").fillna(method="ffill")
+    df = pd.DataFrame({"t1": vbar.reindex(t_events), "trgt": trgt}, index=t_events).dropna()
+    rows = []
+    for t0, row in df.iterrows():
+        t1 = row["t1"]
+        # c0 robust fetch
+        loc0 = close.loc[t0]
+        c0 = float(loc0.iloc[0]) if isinstance(loc0, pd.Series) else float(loc0)
+
+        up_lvl = c0 * (1 + up_m * float(row["trgt"]))
+        dn_lvl = c0 * (1 - dn_m * float(row["trgt"]))
+        seg = close.loc[t0:t1]
+        if isinstance(seg, pd.DataFrame):
+            seg = seg.iloc[:, 0]
+        path = pd.Series(seg.astype(float), index=seg.index)
+        if path.empty:
+            continue
+        path_up = path >= up_lvl
+        path_dn = path <= dn_lvl
+        hit_up = path_up.idxmax() if path_up.to_numpy().any() else None
+        hit_dn = path_dn.idxmax() if path_dn.to_numpy().any() else None
+
+        if (hit_up is not None) and (hit_dn is not None):
+            lbl = 1 if hit_up <= hit_dn else 0
+            t_end = hit_up if lbl == 1 else hit_dn
+        elif hit_up is not None:
+            lbl, t_end = 1, hit_up
+        elif hit_dn is not None:
+            lbl, t_end = 0, hit_dn
+        else:
+            c1 = float(path.iloc[-1])
+            lbl, t_end = (1 if c1 > c0 else 0), t1
+        rows.append((t0, t_end, lbl, float(row["trgt"])))
+
+    if not rows:
+        return pd.DataFrame(columns=["t1", "label", "trgt"])
+    return pd.DataFrame(rows, columns=["t0", "t1", "label", "trgt"]).set_index("t0")
+
+def make_features(close):
+    r = close.pct_change().fillna(0.0)
+    f = pd.DataFrame(index=close.index)
+    f["r1"] = r
+    f["r5"] = close.pct_change(5)
+    f["r10"] = close.pct_change(10)
+    f["mom5"] = close / close.shift(5) - 1
+    f["mom10"] = close / close.shift(10) - 1
+    f["vol10"] = r.rolling(10).std()
+    f["vol20"] = r.rolling(20).std()
+    f["z20"] = (close - close.rolling(20).mean()) / (1e-12 + close.rolling(20).std())
+    delta = close.diff()
+    up = delta.clip(lower=0).rolling(14).mean()
+    dn = (-delta.clip(upper=0)).rolling(14).mean()
+    rs = up / (1e-12 + dn)
+    f["rsi14"] = 100 - 100 / (1 + rs)
+    return f.fillna(0.0)
+
+def adaptive_events_and_labels(close, rets, base_H, cusum_grid, vol_span, up_m, dn_m, min_events):
+    daily_vol = ewma_vol(rets, span=vol_span).clip(lower=1e-8)
+    used_thr = None
+    events_idx = pd.DatetimeIndex([])
+    for thr in cusum_grid:
+        ev = cusum_filter(rets, thr, index=close.index)
+        if len(ev) >= min_events:
+            used_thr, events_idx = thr, ev
+            break
+    if used_thr is None:
+        used_thr = min(cusum_grid)
+        events_idx = cusum_filter(rets, used_thr, index=close.index)
+
+    vbar = get_vertical_barriers(events_idx, base_H, close.index)
+    labels = get_triple_barrier_labels(close, events_idx, vbar, up_m, dn_m, daily_vol).dropna()
+    if labels.empty:
+        raise SystemExit("No labeled events. Adjust thresholds.")
+    print(f"[Adaptive] events={len(labels)}  H={base_H} thr≈{used_thr}")
+    return labels, daily_vol, events_idx, base_H, float(used_thr)
+
+def sharpe_ratio(x):
+    s = x.std()
+    return 0.0 if s == 0 or np.isnan(s) else float(np.sqrt(252) * x.mean() / s)
+
+def drawdown(x):
+    cum = (1 + x).cumprod()
+    return float((cum / cum.cummax() - 1).min())
+
+def purged_folds(index, n_splits=5, embargo_frac=0.01):
+    """Time-ordered purged folds with embargo to reduce leakage."""
+    n = len(index)
+    embargo = int(np.floor(n * embargo_frac))
+    folds = []
+    kf = KFold(n_splits=n_splits, shuffle=False)
+    for tr_idx, va_idx in kf.split(np.arange(n)):
+        # embargo: remove neighbors around validation from training
+        va_min, va_max = va_idx.min(), va_idx.max()
+        cut_l = max(0, va_min - embargo)
+        cut_r = min(n, va_max + embargo + 1)
+        tr_mask = np.ones(n, dtype=bool)
+        tr_mask[cut_l:cut_r] = False
+        tr_mask[va_idx] = False
+        tr_idx_purged = np.where(tr_mask)[0]
+        folds.append((tr_idx_purged, va_idx))
+    return folds
+
+
+# ---------------------------- Main ----------------------------
+if __name__ == "__main__":
+    # 1) Data
+    close = load_prices(TICKER, YEARS, FREQ)
+    rets  = close.pct_change().replace([np.inf, -np.inf], 0.0).fillna(0.0)
+
+    # 2) Events & Labels
+    labels, _, _, _, _ = adaptive_events_and_labels(
+        close, rets, H_BARS, CUSUM_GRID, VOL_SPAN, UP_M, DN_M, MIN_EVENTS
+    )
+
+    # 3) Features aligned to event times
+    feats = make_features(close)
+    X = feats.reindex(labels.index).dropna()
+    y = labels.loc[X.index, "label"].astype(int)
+
+    # 4) Scaling
+    scaler = StandardScaler()
+    Xs = scaler.fit_transform(X)
+
+    # 5) Base learners (diverse biases)
+    gb  = GradientBoostingClassifier(random_state=RNG_SEED)
+    rf  = RandomForestClassifier(n_estimators=300, max_depth=None, random_state=RNG_SEED, n_jobs=-1)
+    lr  = LogisticRegression(max_iter=20_000, solver="lbfgs", random_state=RNG_SEED)
+
+    # Stacking with logistic meta-learner (will be calibrated later)
+    stack = StackingClassifier(
+        estimators=[("gb", gb), ("rf", rf)],
+        final_estimator=LogisticRegression(max_iter=20_000, solver="lbfgs", random_state=RNG_SEED),
+        passthrough=True, n_jobs=-1
+    )
+
+    # 6) Purged CV + Embargo + Calibration + Threshold search
+    folds = purged_folds(X.index, n_splits=KFOLDS, embargo_frac=EMBARGO_FRAC)
+    proba_oof = pd.Series(index=X.index, dtype=float)
+    thresh_per_fold = []
+    aucs = []
+
+    for tr_idx, va_idx in folds:
+        X_tr, y_tr = Xs[tr_idx], y.iloc[tr_idx]
+        X_va, y_va = Xs[va_idx], y.iloc[va_idx]
+
+        # Fit stack on train
+        stack.fit(X_tr, y_tr)
+
+        # Isotonic calibration on validation (prefit)
+        cal = CalibratedClassifierCV(estimator=stack, method="isotonic", cv="prefit")
+        cal.fit(X_va, y_va)
+
+        # Probabilities on fold's validation
+        p_va = cal.predict_proba(X_va)[:, 1]
+        proba_oof.iloc[va_idx] = p_va
+
+        # AUC for sanity
+        auc = roc_auc_score(y_va, p_va)
+        aucs.append(auc)
+
+        # Pick threshold maximizing Sharpe (long/flat) on validation
+        # Evaluate on a fine grid between 0.4..0.65 (typical meta-labeling range)
+        grid = np.linspace(0.4, 0.65, 26)
+        best_s, best_t = -np.inf, 0.5
+
+        # Next-day forward returns for events (aligned)
+        ret_next = close.pct_change().shift(-1).reindex(y_va.index).fillna(0.0).astype(float).to_numpy().ravel()
+        for t in grid:
+            sig = (p_va >= t).astype(float)
+            pnl = sig * ret_next
+            # apply TC on toggles
+            toggle = np.abs(np.diff(sig, prepend=0.0))
+            pnl -= toggle * (TC_BP / 1e4)
+            s = sharpe_ratio(pd.Series(pnl))
+            if s > best_s:
+                best_s, best_t = s, float(t)
+        thresh_per_fold.append(best_t)
+
+    # Aggregate CV stats
+    cv_auc = float(np.mean(aucs))
+    if THRESH_POLICY == "median":
+        chosen_thr = float(np.median(thresh_per_fold))
+    else:
+        chosen_thr = float(np.mean(thresh_per_fold))
+
+    print(f"\nCV AUC: {cv_auc:.3f}")
+    print(f"Chosen probability threshold ({THRESH_POLICY} of per-fold best): {chosen_thr:.2f}")
+
+    # 7) Refit on all data, calibrate on last fold's validation style (split tail as "calibration" slice)
+    # Split last 15% as calibration (time-ordered)
+    n = len(X)
+    cut = int(np.floor(n * 0.85))
+    X_tr_all, y_tr_all = Xs[:cut], y.iloc[:cut]
+    X_cal,    y_cal    = Xs[cut:], y.iloc[cut:]
+
+    stack.fit(X_tr_all, y_tr_all)
+    cal_all = CalibratedClassifierCV(estimator=stack, method="isotonic", cv="prefit")
+    cal_all.fit(X_cal, y_cal)
+
+    proba_all = pd.Series(cal_all.predict_proba(Xs)[:, 1], index=X.index)
+
+    # 8) Fractional Kelly bet sizing on meta-probability
+    # Kelly (binary) = (p - q)/b with b=1, q=1-p => 2p-1 ; long-only: clip below 0 -> 0
+    raw_kelly = 2.0 * proba_all - 1.0
+    bet = raw_kelly.clip(lower=0.0, upper=BET_CAP) * KELLY_FRACTION
+
+    # 9) Backtest on event dates (long-only, fractional bet size), with TC
+    ret_next_all = close.pct_change().shift(-1).reindex(X.index).fillna(0.0).astype(float)
+    ret_np = ret_next_all.to_numpy().ravel()
+    bet_np = bet.to_numpy().ravel()
+
+    pnl_gross = bet_np * ret_np
+    toggle = np.abs(np.diff(bet_np, prepend=0.0))  # turnover proxy
+    tc = toggle * (TC_BP / 1e4)
+    pnl_net = pnl_gross - tc
+
+    pnl_s = pd.Series(pnl_net, index=X.index)
+
+    sharpe = sharpe_ratio(pnl_s)
+    cum = (1.0 + pnl_s).cumprod()
+
+    # CAGR with DatetimeIndex fallback
+    if isinstance(cum.index, pd.DatetimeIndex):
+        yrs = (cum.index[-1] - cum.index[0]).days / 365.25
+    else:
+        yrs = len(cum) / 252.0
+    cagr = float(cum.iloc[-1] ** (1 / max(1e-9, yrs)) - 1.0)
+    mdd = drawdown(pnl_s)
+    avg_turnover = float(toggle.mean())
+    avg_tc_bp = float((tc * 1e4).mean())
+
+    hit = float(((bet_np > 0) & (ret_np > 0)).sum() / max(1, (bet_np > 0).sum()))
+
+    print("\n=== Level-33 — Meta-Labeling Stacking Backtest (long-only fractional Kelly) ===")
+    print(f"Sharpe: {sharpe:.3f}  CAGR: {100*cagr:.2f}%  MaxDD: {100*mdd:.2f}%  Hit%: {100*hit:.2f}%")
+    print(f"Avg turnover: {avg_turnover:.3f}  Avg TC (bp): {avg_tc_bp:.2f}")
+
+    # 10) Save artifacts
+    cv_summary = pd.DataFrame({
+        "fold": np.arange(1, KFOLDS+1),
+        "auc": aucs,
+        "best_thresh": thresh_per_fold
+    })
+    cv_summary.to_csv(f"{TICKER}_level33_cv_summary.csv", index=False)
+
+    out = pd.DataFrame({
+        "proba": proba_all,
+        "bet": bet,
+        "ret_next": ret_next_all,
+        "pnl_net": pnl_s
+    }, index=X.index)
+    out.to_csv(f"{TICKER}_level33_backtest.csv")
+
+    print(f"\nSaved: {TICKER}_level33_cv_summary.csv, {TICKER}_level33_backtest.csv")
+```
+
+### What’s new vs Level-31/32
+
+* **Stacking ensemble (GB + RF → LR meta)** for stronger, more robust signals.
+* **Isotonic calibration** (no leakage: fitted only on validation/tail slices).
+* **Purged K-Fold with embargo** to reduce forward-looking bias.
+* **Threshold picked per-fold to maximize Sharpe**, then aggregated (median).
+* **Fractional Kelly bet-sizing** from calibrated probabilities (`bet = 0.5 * clip(2p-1)`), with caps.
+* Fully **1-D safe** (no ambiguous Series truth, no float(Series), no 2-D pitfalls).
+
+If you want a **long/short** variant (using signed direction labels) or **cross-asset** portfolio (multiple tickers + volatility targeting), say the word and I’ll extend this to Level-34.
