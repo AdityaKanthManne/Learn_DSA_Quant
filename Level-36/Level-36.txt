@@ -1,0 +1,468 @@
+Boom — here’s **Level-36**: everything from Level-35 **plus** (1) **permutation importance** (leakage-safe, evaluated on the last CV fold’s validation slice) and (2) a clean **rolling out-of-sample equity curve CSV**. Still fully **1-D hardened** to avoid the pandas shape traps you hit earlier.
+
+> Drop this in one cell and run it as-is.
+
+```python
+# Level-36 — Purged CV + Platt + Vol-Targeted Kelly + Permutation Importance + OOS Equity (1-D hardened)
+
+import warnings
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+from datetime import datetime, timedelta, timezone
+
+from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import roc_auc_score
+from sklearn.inspection import permutation_importance
+
+# ---------------- Config ----------------
+TICKER        = "AAPL"
+YEARS         = 3.0
+FREQ          = "1D"
+
+VOL_SPAN      = 50
+H_BARS        = 10
+CUSUM_GRID    = [0.003, 0.004, 0.006, 0.008, 0.010]
+UP_M, DN_M    = 3.0, 3.0
+MIN_EVENTS    = 400
+
+BASE_SEED     = 42
+N_SPLITS      = 5
+EMBARGO_DAYS  = 5                 # for purging leakage
+TC_BP         = 5                 # round-trip cost in bp
+BAND          = 0.05
+BET_CAP       = 0.5
+KELLY_EDGE_B  = 1.0
+
+# Vol-targeting (annualized). Position scaled by ratio(target/realized)
+TARGET_VOL_ANNUAL = 0.12          # 12% annual target vol
+REALVOL_WIN       = 20            # lookback for realized vol
+
+np.random.seed(BASE_SEED)
+
+# --------------- 1-D Hardeners ---------------
+def to1d(a):
+    if isinstance(a, pd.Series):
+        return a.to_numpy().ravel()
+    if isinstance(a, pd.DataFrame):
+        return a.iloc[:, 0].to_numpy().ravel()
+    return np.asarray(a).ravel()
+
+def series_1d(x, index=None, dtype=None):
+    if isinstance(x, pd.DataFrame):
+        vals = x.iloc[:, 0].to_numpy()
+        idx  = x.index
+    elif isinstance(x, pd.Series):
+        vals = x.to_numpy()
+        idx  = x.index
+    else:
+        vals = np.asarray(x)
+        idx  = None
+    vals = np.ravel(vals)
+    if dtype is not None:
+        vals = vals.astype(dtype, copy=False)
+    if index is None:
+        index = idx if (idx is not None and len(idx) == len(vals)) else None
+    return pd.Series(vals, index=index)
+
+# --------------- Data & Features ---------------
+def utc_today():
+    return datetime.now(timezone.utc).date()
+
+def load_prices(ticker, years, freq="1D"):
+    end = utc_today()
+    start = (datetime.now(timezone.utc) - timedelta(days=int(365*years + 20))).date()
+    df = yf.download(ticker, start=start, end=end, auto_adjust=True, progress=False)
+    if df.empty:
+        raise SystemExit("No data downloaded.")
+    s = df["Adj Close"] if "Adj Close" in df.columns else df["Close"]
+    s = s.asfreq("B").ffill()
+    s.name = "Close"
+    return s
+
+def ewma_vol(r, span=50):
+    return r.ewm(span=span, adjust=False).std()
+
+def make_features(close):
+    r = close.pct_change().fillna(0.0)
+    f = pd.DataFrame(index=close.index)
+    f["r1"]    = r
+    f["r5"]    = close.pct_change(5)
+    f["r10"]   = close.pct_change(10)
+    f["mom5"]  = close/close.shift(5)  - 1
+    f["mom10"] = close/close.shift(10) - 1
+    f["vol10"] = r.rolling(10).std()
+    f["vol20"] = r.rolling(20).std()
+    f["z20"]   = (close - close.rolling(20).mean()) / (1e-12 + close.rolling(20).std())
+    d = close.diff()
+    up = d.clip(lower=0).rolling(14).mean()
+    dn = (-d.clip(upper=0)).rolling(14).mean()
+    rs = up / (1e-12 + dn)
+    f["rsi14"] = 100 - 100/(1+rs)
+    return f.fillna(0.0)
+
+# --------------- Labeling (CUSUM + triple barrier) ---------------
+def cusum_filter(r, threshold, index=None):
+    s = series_1d(r, index=index, dtype=float).fillna(0.0)
+    idx = s.index
+    vals = s.to_numpy()
+    s_pos = s_neg = 0.0
+    t_events = []
+    for i, x in enumerate(vals):
+        s_pos = max(0.0, s_pos + x)
+        s_neg = min(0.0, s_neg + x)
+        if s_pos > threshold:
+            s_pos = 0.0
+            t_events.append(idx[i])
+        elif s_neg < -threshold:
+            s_neg = 0.0
+            t_events.append(idx[i])
+    return pd.DatetimeIndex(t_events).unique().sort_values()
+
+def get_vertical_barriers(t_events, h, index):
+    if len(t_events) == 0:
+        return pd.Series(dtype="datetime64[ns]")
+    out = {}
+    for t0 in t_events:
+        pos = index.get_indexer([t0])[0]
+        t1_pos = min(pos + h, len(index) - 1)
+        out[t0] = index[t1_pos]
+    return pd.Series(out)
+
+def get_triple_barrier_labels(close, t_events, vbar, up_m, dn_m, daily_vol):
+    trgt_raw = daily_vol.reindex(t_events).fillna(method="bfill").fillna(method="ffill")
+    trgt = series_1d(trgt_raw, index=t_events, dtype=float)
+
+    t1_raw = vbar.reindex(t_events)
+    t1 = pd.Series(t1_raw.values, index=t_events)
+
+    rows = []
+    for t0 in t_events:
+        t1_i = t1.loc[t0]
+        if pd.isna(t1_i):
+            continue
+        try:
+            c0 = float(close.loc[t0])
+        except Exception:
+            continue
+        up_lvl = c0 * (1 + up_m * float(trgt.loc[t0]))
+        dn_lvl = c0 * (1 - dn_m * float(trgt.loc[t0]))
+
+        seg = close.loc[t0:t1_i]
+        if isinstance(seg, pd.DataFrame):
+            seg = seg.iloc[:, 0]
+        path = series_1d(seg, index=seg.index, dtype=float)
+        if path.empty:
+            continue
+
+        path_up = path >= up_lvl
+        path_dn = path <= dn_lvl
+        hit_up = path_up.idxmax() if path_up.to_numpy().any() else None
+        hit_dn = path_dn.idxmax() if path_dn.to_numpy().any() else None
+
+        if (hit_up is not None) and (hit_dn is not None):
+            lbl = 1 if hit_up <= hit_dn else 0
+            t_end = hit_up if lbl == 1 else hit_dn
+        elif hit_up is not None:
+            lbl, t_end = 1, hit_up
+        elif hit_dn is not None:
+            lbl, t_end = 0, hit_dn
+        else:
+            c1 = float(path.iloc[-1])
+            lbl, t_end = (1 if c1 > c0 else 0), t1_i
+
+        rows.append((t0, t_end, lbl, float(trgt.loc[t0])))
+
+    if not rows:
+        return pd.DataFrame(columns=["t1", "label", "trgt"])
+    df = pd.DataFrame(rows, columns=["t0", "t1", "label", "trgt"]).set_index("t0")
+    return df
+
+def adaptive_events_and_labels(close, rets, base_H, cusum_grid, vol_span, up_m, dn_m, min_events):
+    daily_vol = ewma_vol(rets, span=vol_span).clip(lower=1e-8)
+
+    used_thr = None
+    events_idx = pd.DatetimeIndex([])
+    for thr in cusum_grid:
+        ev = cusum_filter(rets, thr, index=close.index)
+        if len(ev) >= min_events:
+            used_thr, events_idx = thr, ev
+            break
+    if used_thr is None:
+        used_thr = min(cusum_grid)
+        events_idx = cusum_filter(rets, used_thr, index=close.index)
+
+    vbar = get_vertical_barriers(events_idx, base_H, close.index)
+    labels = get_triple_barrier_labels(close, events_idx, vbar, up_m, dn_m, daily_vol).dropna()
+    if labels.empty:
+        raise SystemExit("No labeled events. Adjust thresholds.")
+    print(f"[Adaptive] events={len(labels)}  H={base_H} thr≈{used_thr}")
+    return labels, daily_vol, events_idx, base_H, float(used_thr)
+
+# --------------- Purged Forward CV Splits ---------------
+def purged_forward_splits(index, n_splits=5, embargo_days=5):
+    dates = pd.DatetimeIndex(index)
+    n = len(dates)
+    fold_sizes = np.full(n_splits, n // n_splits, dtype=int)
+    fold_sizes[: n % n_splits] += 1
+    starts = np.cumsum(np.concatenate(([0], fold_sizes[:-1])))
+    ends   = np.cumsum(fold_sizes)
+    embargo = pd.Timedelta(days=embargo_days)
+    for k in range(n_splits):
+        va_start, va_end = starts[k], ends[k]
+        va_idx = np.arange(va_start, va_end)
+        va_dates = dates[va_idx]
+        cutoff = va_dates[0] - embargo
+        tr_idx = np.where(dates < cutoff)[0]
+        yield tr_idx, va_idx
+
+# --------------- Platt (logistic-on-logit) ---------------
+def platt_fit(y_true, raw_prob):
+    eps = 1e-6
+    z = np.clip(to1d(raw_prob), eps, 1 - eps)
+    logit = np.log(z / (1 - z)).reshape(-1, 1)
+    lr = LogisticRegression(solver="lbfgs", max_iter=1000, random_state=BASE_SEED)
+    lr.fit(logit, to1d(y_true).astype(int))
+    return lr
+
+def platt_predict(lr, raw_prob):
+    eps = 1e-6
+    z = np.clip(to1d(raw_prob), eps, 1 - eps)
+    logit = np.log(z / (1 - z)).reshape(-1, 1)
+    return lr.predict_proba(logit)[:, 1]
+
+# --------------- Metrics ---------------
+def sharpe_ratio(x):
+    x = series_1d(x)
+    s = x.std()
+    return 0.0 if s == 0 or np.isnan(s) else float(np.sqrt(252) * x.mean() / s)
+
+def drawdown(x):
+    x = series_1d(x)
+    cum = (1 + x).cumprod()
+    return float((cum / cum.cummax() - 1).min())
+
+# --------------- Bet sizing ---------------
+def kelly_fraction(p, b=1.0):
+    p = to1d(p)
+    f = (p * (b + 1.0) - 1.0) / b  # b=1 -> f=2p-1
+    return np.clip(f, -BET_CAP, BET_CAP)
+
+def apply_rebalance_band(target, band=BAND):
+    t = to1d(target)
+    pos = 0.0
+    out = np.zeros_like(t, dtype=float)
+    for i, v in enumerate(t):
+        if abs(v - pos) > band:
+            pos = v
+        out[i] = pos
+    return out
+
+# --------------- Vol targeting helper ---------------
+def realized_vol_daily(returns, win=20):
+    r = series_1d(returns)
+    sig_d = r.rolling(win).std().fillna(method="bfill").fillna(0.0)
+    return sig_d
+
+# --------------- Main ---------------
+if __name__ == "__main__":
+    # 1) Data
+    close = load_prices(TICKER, YEARS, FREQ)
+    rets  = close.pct_change().replace([np.inf, -np.inf], 0.0).fillna(0.0)
+
+    # 2) Events & Labels
+    labels, _, _, _, _ = adaptive_events_and_labels(
+        close, rets, H_BARS, CUSUM_GRID, VOL_SPAN, UP_M, DN_M, MIN_EVENTS
+    )
+
+    # 3) Features on event times
+    feats = make_features(close)
+    X = feats.reindex(labels.index).dropna()
+    labels = labels.loc[X.index]
+    y = labels["label"].astype(int)
+    feat_names = list(X.columns)
+
+    # 4) Scale
+    scaler = StandardScaler()
+    Xs = scaler.fit_transform(X)
+
+    # 5) Purged forward CV + Platt calibration
+    proba_cv = np.full(len(X), np.nan)
+    aucs, thrs = [], []
+    last_fold = None  # keep last fold data for permutation importance
+    for tr_idx, va_idx in purged_forward_splits(X.index, n_splits=N_SPLITS, embargo_days=EMBARGO_DAYS):
+        if len(tr_idx) < 50 or len(va_idx) < 20:
+            continue
+        X_tr, y_tr = Xs[tr_idx], to1d(y.iloc[tr_idx])
+        X_va, y_va = Xs[va_idx], to1d(y.iloc[va_idx])
+
+        base = GradientBoostingClassifier(random_state=BASE_SEED)
+        base.fit(X_tr, y_tr)
+        p_va_raw = base.predict_proba(X_va)[:, 1]
+
+        pl = platt_fit(y_va, p_va_raw)              # calibrate on val slice
+        p_va = platt_predict(pl, p_va_raw)
+        proba_cv[va_idx] = p_va
+
+        aucs.append(roc_auc_score(y_va, p_va))
+
+        # pick threshold on Sharpe of val pnl
+        r_next_va = to1d(close.pct_change().shift(-1).reindex(X.index[va_idx]).fillna(0.0))
+        grid = np.linspace(0.25, 0.75, 21)
+        best_thr, best_score = 0.5, -1e9
+        for thr in grid:
+            sig = (p_va >= thr).astype(float)
+            pnl = sig * r_next_va
+            score = pnl.mean() / (pnl.std() + 1e-9)
+            if score > best_score:
+                best_score, best_thr = score, thr
+        thrs.append(best_thr)
+
+        # keep last fold
+        last_fold = (base, X_va, y_va)
+
+    cv_auc = float(np.nanmean(aucs)) if len(aucs) else np.nan
+    chosen_thr = float(np.nanmedian(thrs)) if len(thrs) else 0.55
+    print(f"\nCV AUC (purged, {N_SPLITS} folds): {cv_auc:.3f}")
+    print(f"Chosen prob threshold (median across folds): {chosen_thr:.2f}")
+
+    # 6) Rolling walk-forward proba (Platt recalibrated in a rolling window)
+    base_final = GradientBoostingClassifier(random_state=BASE_SEED)
+    proba_all  = np.zeros(len(X), dtype=float)
+    min_fit = max(100, len(X)//N_SPLITS)
+    for i in range(min_fit, len(X)):
+        X_tr, y_tr = Xs[:i], to1d(y.iloc[:i])
+        base_final.fit(X_tr, y_tr)
+        raw = base_final.predict_proba(Xs[i:i+1])[:, 1]
+
+        j0 = max(0, i - 250)
+        p_tr_raw = base_final.predict_proba(Xs[j0:i])[:, 1]
+        pl = platt_fit(y.iloc[j0:i], p_tr_raw)
+        proba_all[i] = platt_predict(pl, raw)[0]
+
+    # 7) Kelly targets + bands
+    kelly_raw = kelly_fraction(proba_all, b=KELLY_EDGE_B)
+    kelly_pos = apply_rebalance_band(kelly_raw, band=BAND)
+
+    # 8) Vol targeting on top of Kelly
+    target_daily = TARGET_VOL_ANNUAL / np.sqrt(252.0)
+    ret_next_full = close.pct_change().shift(-1)
+    realized_d = realized_vol_daily(ret_next_full, win=REALVOL_WIN).reindex(X.index).fillna(method="bfill").fillna(0.0)
+    scale = (target_daily / (realized_d.replace(0.0, np.nan))).clip(upper=3.0).fillna(0.0)
+    kelly_vol = series_1d(kelly_pos, index=X.index) * series_1d(scale, index=X.index)
+    kelly_vol = np.clip(kelly_vol, -BET_CAP, BET_CAP).to_numpy()
+
+    # 9) Backtest — net PnL with tc, stats
+    ret_next = to1d(ret_next_full.reindex(X.index).fillna(0.0))
+    m = min(len(kelly_vol), len(ret_next))
+    pos = to1d(kelly_vol[:m])
+    ret = to1d(ret_next[:m])
+
+    pnl_gross = pos * ret
+    toggle    = np.abs(np.diff(pos, prepend=0.0))
+    tc        = toggle * (TC_BP / 1e4)
+    pnl_net   = pnl_gross - tc
+
+    pnl_series = series_1d(pnl_net, index=X.index[:m])
+    sharpe = sharpe_ratio(pnl_series)
+    cum = (1.0 + pnl_series).cumprod()
+    yrs = (cum.index[-1] - cum.index[0]).days / 365.25 if isinstance(cum.index, pd.DatetimeIndex) else len(cum)/252.0
+    cagr = float(cum.iloc[-1] ** (1.0 / max(1e-9, yrs)) - 1.0)
+    dd   = drawdown(pnl_series)
+
+    long_days = (pos > 0).astype(float)
+    hit = float(((long_days > 0) & (ret > 0)).sum() / max(1, (long_days > 0).sum()))
+
+    print("\n=== Level-36 — Adds Permutation Importance + OOS Equity ===")
+    print(f"Sharpe: {sharpe:.3f}  CAGR: {100*cagr:.2f}%  MaxDD: {100*dd:.2f}%  Hit%: {100*hit:.2f}%")
+    print(f"Avg daily turnover: {toggle.mean():.3f}   Avg TC paid (bp): {(tc * 1e4).mean():.2f}")
+
+    # --- Stability diagnostics: decile buckets of proba vs forward return
+    df_diag = pd.DataFrame(
+        {
+            "proba": proba_all[:m],
+            "ret_next": ret[:m]
+        },
+        index=X.index[:m],
+    ).dropna()
+    df_diag["bucket"] = pd.qcut(df_diag["proba"].rank(method="first"), 10, labels=False)
+    decile_stats = df_diag.groupby("bucket")["ret_next"].agg(["mean","std","count"])
+    decile_stats.index.name = "prob_decile"
+
+    # --- Permutation importance (on last CV fold validation for leakage safety)
+    perm_df = pd.DataFrame(columns=["feature", "mean_importance", "std_importance"])
+    if last_fold is not None:
+        base_last, X_va_last, y_va_last = last_fold
+        # We compute importance on calibrated probabilities by wrapping predict_proba[:,1]
+        # but permutation_importance expects a scorer or score; so we use AUC scorer behavior by recomputing proba each perm.
+        # Simpler: use default estimator.score (accuracy). Instead, define a small helper that returns AUC.
+        from sklearn.metrics import roc_auc_score as _auc
+
+        def auc_scorer(est, Xb, yb):
+            p = est.predict_proba(Xb)[:,1]
+            try:
+                return _auc(yb, p)
+            except ValueError:
+                # fallback if y has single class (rare)
+                return 0.5
+
+        # Monkey patch: wrap estimator so score uses AUC
+        class _AUCWrap:
+            def __init__(self, est): self.est = est
+            def fit(self, *a, **k): return self.est.fit(*a, **k)
+            def predict_proba(self, X): return self.est.predict_proba(X)
+            def score(self, X, y): return auc_scorer(self.est, X, y)
+
+        wrapped = _AUCWrap(base_last)
+        perm = permutation_importance(
+            wrapped, X_va_last, y_va_last, n_repeats=20, random_state=BASE_SEED, n_jobs=1
+        )
+        perm_df = pd.DataFrame({
+            "feature": feat_names,
+            "mean_importance": perm.importances_mean,
+            "std_importance": perm.importances_std
+        }).sort_values("mean_importance", ascending=False)
+
+    # --- Save outputs
+    out_ts = pd.DataFrame(
+        {
+            "proba": proba_all[:m],
+            "kelly_raw": kelly_raw[:m],
+            "kelly_pos_voltgt": pos[:m],
+            "ret_next": ret[:m],
+            "pnl_net": pnl_net[:m],
+        },
+        index=X.index[:m],
+    )
+    ts_file = f"{TICKER}_level36_timeseries.csv"
+    out_ts.to_csv(ts_file)
+
+    dec_file = f"{TICKER}_level36_deciles.csv"
+    decile_stats.to_csv(dec_file)
+
+    # Rolling OOS equity curve
+    equity = (1.0 + pnl_series).cumprod()
+    eq_df = pd.DataFrame({"equity": equity.values}, index=equity.index)
+    eq_file = f"{TICKER}_level36_equity.csv"
+    eq_df.to_csv(eq_file)
+
+    # Permutation importance
+    if not perm_df.empty:
+        pi_file = f"{TICKER}_level36_perm_importance.csv"
+        perm_df.to_csv(pi_file, index=False)
+        print(f"\nSaved: {ts_file}, {dec_file}, {eq_file}, {pi_file}")
+    else:
+        print(f"\nSaved: {ts_file}, {dec_file}, {eq_file} (no permutation importance if CV folds were too small)")
+```
+
+### What’s new vs Level-35
+
+* **Permutation importance** on the **last CV fold’s validation slice** → avoids train leakage and reflects genuine generalization.
+* A tidy **OOS equity CSV** (`*_level36_equity.csv`) you can chart anywhere.
+* Same **purged CV + embargo**, **Platt calibration**, **Kelly with bands**, and **vol targeting**—kept fully **1-D safe** to prevent `ValueError: Data must be 1-dimensional` and the “ambiguous truth value” pitfalls.
+
+Want a Level-37 with **meta-labeling** (side/size separation) and **fractional differencing** for stationarity?
