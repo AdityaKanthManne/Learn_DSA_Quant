@@ -1,0 +1,119 @@
+## Level 38 — Variance Risk Premium (VRP) Proxy
+
+*Description:* Estimate the equity **variance risk premium** as the gap between **implied variance** (VIX²) and **realized variance** (from SPY). Use VRP percentiles to tilt equity exposure.
+*Objective:* **Overweight** equities when VRP is high (market pays a large variance-hedge premium) and **underweight** when VRP is low/negative.
+*DSA Concept:* **Rolling/online statistics + rolling percentile with efficient updates.**
+*Quant/ML Model:* **Rule-based allocator** on VRP percentile (e.g., ≥60% → SPY 100%; 40–60% → 50%; <40% → 0%), with optional **EWMA target-vol** scaling.
+*Real-Time Scope:* **Weekly** (Friday) recompute VRP & rebalance SPY vs SHY (cash proxy). Hold prior weights if inputs are stale.
+*Free Data/APIs:* `yfinance` for **SPY**, **^VIX**, **SHY**; optional OHLC for Garman–Klass realized vol.
+*Deliverables:* `vrp_timeseries.csv` (RV, IV, VRP, percentile), `weights.csv`, `trades.csv`, `metrics.json`; plots of VRP, weights, equity curve (net of TC).
+*Difficulty:* Advanced • *Build:* 4h
+
+---
+
+### DSA Concept — deep dive (how we keep this fast & stable)
+
+**1) Rolling/Online Realized Variance (RV)**
+We want 21-day annualized RV of log returns. Recomputing each day is (O(W)); instead maintain a sliding window using a **deque** (or pandas rolling as a baseline): keep running sum `S=Σr` and sum of squares `Q=Σr²`. On each step, push `x_new`, pop `x_old`, then update (S,Q) in **O(1)** and compute `var = (Q − S²/W)/(W−1)`, annualize by ×252. For expanding streams, **Welford**’s algorithm yields numerically stable online variance in **O(1)** time and **O(1)** memory.
+
+**2) Implied Variance (IV) from VIX**
+Daily ( \text{IV}_t = (\text{VIX}_t/100)^2 ) (VIX is ~30-day, annualized). This is **O(1)** per update.
+
+**3) VRP & Rolling Percentile**
+( \text{VRP}_t = \text{IV}_t - \text{RV}_t ). To map regimes, compute a long-lookback (e.g., 3-year) **rolling percentile**. Exact rolling ranks are (O(L)); acceptable for daily cadence with pandas. If you need intraday speed, maintain a balanced multiset (two-heap or `bisect` on a sorted list, (O(\log L))) or use a **quantile sketch** (P² / t-digest) with ~**O(1)** updates and sublinear memory.
+
+**4) Weekly Rebalance & TC**
+Resample to **W-FRI** for decisions; **ffill** weights across the next week. Track **turnover only on rebalance dates**, and apply a simple TC model (e.g., 2 bps × |Δweight|). Sparse TC vectors keep daily arrays mostly zero and memory-light.
+
+**5) EWMA Target-Vol (optional)**
+Compute EWMA variance: ( \sigma_t^2 = \lambda \sigma_{t-1}^2 + (1-\lambda) r_t^2 ) (×252). Scale equity weight by (k_t=\text{target_vol}/\sigma_t) (clip to a cap); all in **O(1)** time, constant memory.
+
+**6) Online KPIs**
+Maintain cumulative equity, running high, and drawdown in **O(1)** to compute CAGR, Sharpe, MaxDD after each step.
+
+---
+
+### Minimal reference code (free-stack; pandas first, can swap to deque/P² later)
+
+```python
+import numpy as np, pandas as pd, yfinance as yf
+
+START = "2005-01-01"
+TICKER, CASH, VIX = "SPY", "SHY", "^VIX"
+W_RV, L_PCT, REB = 21, 252*3, "W-FRI"
+TC_BPS, TARGET_VOL, LAMBDA = 2e-4, 0.12, 0.94
+
+px = yf.download([TICKER, CASH, VIX], start=START, auto_adjust=True, progress=False)["Adj Close"].dropna()
+spy, cash, vix = px[TICKER], px[CASH], px[VIX]
+r = np.log(spy).diff()
+rv = r.rolling(W_RV).var() * 252.0
+iv = (vix/100.0)**2
+vrp = (iv - rv).dropna()
+vrp_pct = vrp.rolling(L_PCT, min_periods=126).rank(pct=True)
+
+w = pd.Series(0.0, index=vrp_pct.index)
+w[vrp_pct >= 0.60] = 1.0
+w[(vrp_pct >= 0.40) & (vrp_pct < 0.60)] = 0.5
+
+ewma_var = r.pow(2).ewm(alpha=(1-LAMBDA)).mean() * 252.0
+scale = (TARGET_VOL / np.sqrt(ewma_var)).clip(upper=1.5).reindex(w.index).ffill()
+w = (w * scale).clip(0, 1.5); w_cash = 1.0 - w
+
+w_week = w.resample(REB).last().dropna()
+w_cash_week = w_cash.reindex(w_week.index)
+idx = spy.index
+w_daily = w_week.reindex(idx).ffill().fillna(0.0)
+w_cash_daily = w_cash_week.reindex(idx).ffill().fillna(1.0 - w_daily)
+
+ret_spy, ret_cash = spy.pct_change().fillna(0), cash.pct_change().fillna(0)
+gross = w_daily.shift().fillna(0)*ret_spy + w_cash_daily.shift().fillna(0)*ret_cash
+
+turn = w_week.diff().abs().fillna(0)
+tc_daily = turn.reindex(idx).fillna(0) * TC_BPS
+net = gross - tc_daily
+
+def kpis(x):
+    eq = (1+x).cumprod()
+    cagr = eq.iloc[-1]**(252/len(x)) - 1
+    vol = x.std()*np.sqrt(252)
+    sharpe = (x.mean()*252)/(vol+1e-12)
+    mdd = (eq/eq.cummax()-1).min()
+    return {"CAGR": cagr, "Vol": vol, "Sharpe": sharpe, "MaxDD": mdd}
+
+metrics = {"Strategy": kpis(net.dropna()), "BuyHold_SPY": kpis(ret_spy.dropna())}
+
+out = pd.DataFrame({
+    "SPY": spy, "SHY": cash, "VIX": vix,
+    "RV21": rv.reindex(idx), "IV": iv.reindex(idx),
+    "VRP": vrp.reindex(idx), "VRP_pct": vrp_pct.reindex(idx),
+    "w_SPY": w_daily, "w_SHY": w_cash_daily,
+    "ret_gross": gross, "ret_net": net
+}).dropna()
+out.to_csv("level38_vrp_timeseries.csv")
+pd.DataFrame(metrics).to_json("level38_metrics.json", indent=2)
+print("Saved: level38_vrp_timeseries.csv, level38_metrics.json")
+```
+
+---
+
+### External links — where VRP is defined, studied, and used
+
+* **Carr & Wu (2009), *Review of Financial Studies*** — foundational definition/measurement of VRP using options/variance swaps; methodology underpins IV − RV construction. ([NYU Tandon School of Engineering][1])
+* **Bollerslev, Tauchen & Zhou (2009)** — shows that VRP predicts aggregate stock returns; practical guidance for using VRP as a timing signal. ([Duke Economics][2])
+* **Bollerslev & Zhou (Fed FEDS 2007 working paper)** — early evidence linking VRP to expected returns. ([Federal Reserve][3])
+* **Bekaert, Engström & Ermolov (2020)** — equilibrium perspective; documents positive, persistent VRP and macro links (working paper/NBER versions). ([Columbia Business School][4])
+* **Dörries et al. — “How to/Should the long-term investor harvest VRP” (2015–2024 line of work)** — practitioner-style guidance on building implementable VRP strategies and pitfalls (payoff, leverage, maturity). ([FernUniversität in Hagen][5])
+* **Cui et al. (2019, SSRN)** — evidence for VRP predictability in **China**, useful for cross-market extensions. ([SSRN][6])
+* **Trolle & Schwartz (2010)** — applies VRP ideas to **energy commodities** (generalizing beyond equities). ([PM Research][7])
+
+---
+
+If you want, I can swap in (a) a **deque-based rolling variance** + (b) a **P² rolling percentile** to make per-day updates truly **O(1)** and plug this into your **Model #100** CLI scaffold.
+
+[1]: https://engineering.nyu.edu/sites/default/files/2019-01/CarrReviewofFinStudiesMarch2009-a.pdf?utm_source=chatgpt.com "Variance Risk Premia∗"
+[2]: https://public.econ.duke.edu/~boller/Published_Papers/rfs_09.pdf?utm_source=chatgpt.com "Expected Stock Returns and Variance Risk Premia"
+[3]: https://www.federalreserve.gov/pubs/feds/2007/200711/200711pap.pdf?utm_source=chatgpt.com "Expected Stock Returns and Variance Risk Premia"
+[4]: https://business.columbia.edu/sites/default/files-efs/pubfiles/26214/Variance_risk.pdf?utm_source=chatgpt.com "The Variance Risk Premium in Equilibrium Models"
+[5]: https://www.fernuni-hagen.de/bwlbuf/docs/how_to_harvest_variance_risk_premiums_for_the_long-term_investor_.pdf?utm_source=chatgpt.com "How to Harvest Variance Risk Premiums for the Long-term ..."
+[6]: https://papers.ssrn.com/sol3/papers.cfm?abstract_id=3426118&utm_source=chatgpt.com "Variance Risk Premium and Return Predictability"
+[7]: https://www.pm-research.com/content/iijderiv/17/3/15?utm_source=chatgpt.com "Variance Risk Premia in Energy Commodities"
