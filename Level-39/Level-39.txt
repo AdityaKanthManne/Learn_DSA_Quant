@@ -1,0 +1,332 @@
+## Level 39 — Pairs Trading (Cointegration)
+
+*Description:* Market-neutral **mean-reversion** between two cointegrated securities. We estimate a **hedge ratio**, form the **spread**, standardize to a **z-score**, and trade reversion with exits and risk controls.
+*Objective:* Generate **idiosyncratic alpha** with near-zero beta exposure.
+*DSA Concept:* **Time-series + cross-section joins, rolling statistics, OLS cointegration/ADF tests, OU half-life estimation, event-driven state machine** (enter/exit).
+*Quant/ML Model:* **Engle–Granger** cointegration (OLS hedge ratio), **ADF test** on residuals, OU half-life for window sizing, **rule-based** z-score thresholds with transaction-cost-aware backtest.
+*Real-Time Scope:* **Daily** (or intraday if you swap data source) signals; re-fit hedge ratio **weekly/monthly** or when stationarity degrades.
+*Free Data/APIs:* `yfinance` (prices/OHLCV).
+*Deliverables:* Cointegration test report, hedge ratio & half-life, signal & trade logs, net PnL vs costs, equity curve, risk metrics (Sharpe/CAGR/MaxDD), CSV/JSON artifacts.
+*Difficulty:* Intermediate • *Build:* 3h
+
+---
+
+### DSA Concept — what matters for speed & correctness
+
+1. **Hedge ratio via OLS (Engle–Granger step 1)**
+
+   * Regress ( P_A ) on ( P_B ): ( P_A = \beta P_B + \epsilon ).
+   * Use **rolling/periodic** re-estimation (e.g., monthly) to avoid look-ahead. Complexity: OLS per refit ~ (O(N)) with vectorized ops; infrequent refits keep it cheap.
+
+2. **Stationarity check (Engle–Granger step 2)**
+
+   * ADF test on **residuals** (\epsilon). If p-value < α (e.g., 0.05) → residual is stationary ⇒ **cointegration**.
+   * DSA: One-off per refit → (O(N)).
+
+3. **OU half-life estimation**
+
+   * Model spread as OU: ( \Delta s_t = \phi(\mu - s_{t-1}) + \eta_t ). Estimate **speed** by regressing (\Delta s_t) on (s_{t-1}).
+   * Half-life ( \tau_{1/2} = -\ln(2)/\ln(1-\phi) ). Use it to set **rolling window** for mean/std and hold times.
+   * DSA: simple **OLS on shifted vectors** (O(N)) with constant memory.
+
+4. **Fast rolling z-score**
+
+   * Maintain rolling mean/std of spread: either pandas `rolling` (vectorized) or implement **deque + running sums** for (O(1)) updates if you go intraday/heavy.
+   * We standardize: ( z_t = (s_t - \mu_{t})/\sigma_{t} ).
+
+5. **Event-driven state machine (enter/exit)**
+
+   * States: **Flat**, **Long-spread** (long A/short B), **Short-spread** (short A/long B).
+   * Enter when (|z| > z_{\text{enter}}), exit when (|z| < z_{\text{exit}}).
+   * Dollar-neutral sizing uses the **hedge ratio** ( \beta ) (shares scaled so exposure offsets).
+
+6. **Transaction-cost aware, realistic PnL**
+
+   * Cost = bps × **notional traded** on entry/exit/size change.
+   * Maintain **positions and inventory** vectors; compute PnL from **price changes × positions**, subtract costs when trades occur. Sparse application keeps it light.
+
+7. **Risk controls**
+
+   * **Z-cap** (don’t pyramid beyond a cap), **stop** if z-score or drawdown exceeds limits, **ADF recheck**: if stationarity fails, flatten.
+
+---
+
+## Complete Single-File Script (free-data, TC-aware, exports)
+
+```python
+# level39_pairs_cointegration.py
+# Python-only, free data (yfinance). Market-neutral pairs trading via Engle–Granger.
+# Outputs:
+#   - CSV: level39_timeseries.csv (prices, spread, z, signals, positions, returns)
+#   - JSON: level39_metrics.json (CAGR, Vol, Sharpe, MaxDD) + tests summary
+# Usage:
+#   python level39_pairs_cointegration.py
+# Notes:
+#   - Default pair: KO/PEP (historically tight; adjust in Config).
+#   - Refit hedge ratio monthly; ADF on residuals; OU half-life for rolling window.
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+from dataclasses import dataclass, asdict
+from typing import Optional, Dict, Tuple
+from statsmodels.tsa.stattools import adfuller
+import statsmodels.api as sm
+import json
+
+# ----------------------------- Config -----------------------------
+@dataclass
+class Config:
+    start: str = "2005-01-01"
+    end: Optional[str] = None
+    X: str = "KO"      # asset A (we'll model spread = X - beta*Y)
+    Y: str = "PEP"     # asset B
+    auto_adjust: bool = True
+    rebalance_hedge: str = "M"      # 'M' monthly OLS re-fit of beta
+    z_enter: float = 2.0
+    z_exit: float  = 0.5
+    max_hold_days: int = 60         # safety valve if mean reversion is slow
+    tc_bps: float = 0.0002          # 2 bps per notional leg on trade
+    dollar_neutral: bool = True
+    use_close: bool = True          # True: Close/Adj Close prices for hedge; change if needed
+    min_adf_pvalue: float = 0.05    # require stationarity of residuals at this level
+    target_vol_pa: Optional[float] = None  # e.g., 0.10 to target portfolio vol; None disables
+    seed: int = 42
+
+CFG = Config()
+
+# ----------------------------- Data Utils -----------------------------
+def load_adjusted_close(tickers, start, end=None, auto_adjust=True) -> pd.DataFrame:
+    raw = yf.download(tickers, start=start, end=end, auto_adjust=auto_adjust, progress=False)
+    price_key = "Close" if auto_adjust else "Adj Close"
+    if isinstance(raw.columns, pd.MultiIndex):
+        out = raw[price_key].copy()
+    else:
+        # Single ticker: normalize shape
+        name = tickers if isinstance(tickers, str) else tickers[0]
+        out = raw[[price_key]].rename(columns={price_key: name})
+    cols = tickers if isinstance(tickers, (list, tuple)) else [tickers]
+    return out.reindex(columns=cols).dropna(how="all")
+
+def align_index(*series: pd.Series) -> Tuple[pd.DatetimeIndex, Tuple[pd.Series, ...]]:
+    idx = series[0].index
+    for s in series[1:]:
+        idx = idx.intersection(s.index)
+    series = tuple(s.reindex(idx) for s in series)
+    return idx, series
+
+# ----------------------------- Stats & Helpers -----------------------------
+def engle_granger_beta(x: pd.Series, y: pd.Series) -> Tuple[float, pd.Series]:
+    # OLS: x ~ beta * y (no intercept). Use intercept if you prefer: add constant to y.
+    beta = (y.values * x.values).sum() / (y.values**2).sum()
+    resid = x - beta * y
+    return beta, resid
+
+def adf_test(series: pd.Series) -> Dict[str, float]:
+    series = series.dropna()
+    res = adfuller(series, maxlag=None, regression='c', autolag='AIC')
+    stat, pval, lags, nobs = res[0], res[1], res[2], res[3]
+    return {"adf_stat": float(stat), "pvalue": float(pval), "lags": int(lags), "nobs": int(nobs)}
+
+def ou_half_life(spread: pd.Series) -> int:
+    s = spread.dropna()
+    ds = s.diff().dropna()
+    s_lag = s.shift(1).dropna()
+    # Align
+    common = ds.index.intersection(s_lag.index)
+    ds, s_lag = ds.reindex(common), s_lag.reindex(common)
+    if len(ds) < 30:
+        return 20  # fallback
+    X = sm.add_constant(s_lag.values)
+    model = sm.OLS(ds.values, X).fit()
+    phi = -model.params[1]  # since ds = a + b*s_{t-1}; OU speed ≈ -b
+    if phi <= 0 or phi >= 1:
+        return 20
+    hl = -np.log(2) / np.log(1 - phi)
+    # Clamp to sane bounds
+    return int(np.clip(hl, 10, 120))
+
+def rolling_zscore(spread: pd.Series, window: int) -> pd.Series:
+    m = spread.rolling(window).mean()
+    s = spread.rolling(window).std()
+    return (spread - m) / (s + 1e-12)
+
+def kpis(daily: pd.Series) -> Dict[str, float]:
+    x = daily.dropna()
+    if len(x) < 2:
+        return {"CAGR": np.nan, "Vol": np.nan, "Sharpe": np.nan, "MaxDD": np.nan}
+    eq = (1 + x).cumprod()
+    cagr = eq.iloc[-1]**(252/len(x)) - 1
+    vol = x.std() * np.sqrt(252)
+    sharpe = (x.mean()*252) / (vol + 1e-12)
+    mdd = (eq/eq.cummax() - 1).min()
+    return {"CAGR": float(cagr), "Vol": float(vol), "Sharpe": float(sharpe), "MaxDD": float(mdd)}
+
+# ----------------------------- Strategy -----------------------------
+def build_pairs_strategy(cfg: Config):
+    np.random.seed(cfg.seed)
+
+    # 1) Load prices
+    px = load_adjusted_close([cfg.X, cfg.Y], start=cfg.start, end=cfg.end, auto_adjust=cfg.auto_adjust)
+    x, y = px[cfg.X].dropna(), px[cfg.Y].dropna()
+    idx, (x, y) = align_index(x, y)
+
+    # 2) Monthly hedge re-fit and ADF test
+    # Compute beta and residuals piecewise by month end, forward-fill within month
+    month_end = x.resample(cfg.rebalance_hedge).last().index
+    beta_s = pd.Series(index=month_end, dtype=float)
+    adf_p = pd.Series(index=month_end, dtype=float)
+
+    for t in month_end:
+        # Use history up to t for fit (avoid look-ahead)
+        hist = x.loc[:t].index
+        if len(hist) < 252:  # need at least ~1y
+            continue
+        beta, resid = engle_granger_beta(x.loc[hist], y.loc[hist])
+        beta_s.loc[t] = beta
+        adf_p.loc[t] = adf_test(resid)["pvalue"]
+
+    # Forward-fill beta & ADF p-values to daily
+    beta_daily = beta_s.reindex(idx).ffill()
+    adf_p_daily = adf_p.reindex(idx).ffill()
+
+    # If early period lacks beta, drop until first beta available
+    valid = beta_daily.dropna().index
+    x, y = x.reindex(valid), y.reindex(valid)
+    beta_daily, adf_p_daily = beta_daily.reindex(valid), adf_p_daily.reindex(valid)
+
+    # 3) Spread & half-life driven window
+    spread = x - beta_daily * y
+    hl = ou_half_life(spread)  # single half-life from full history (simple & robust)
+    window = int(np.clip(hl, 20, 120))
+    z = rolling_zscore(spread, window)
+
+    # 4) Signals (state machine)
+    # Long-spread when z <= -z_enter: Long X, Short beta*Y
+    # Short-spread when z >= +z_enter: Short X, Long beta*Y
+    # Exit when |z| < z_exit or holding too long
+    state = 0  # 0 flat, +1 long-spread, -1 short-spread
+    hold = 0
+    pos_x = pd.Series(0.0, index=valid)
+    pos_y = pd.Series(0.0, index=valid)
+
+    for t in valid:
+        zz = z.loc[t]
+        b = beta_daily.loc[t]
+        adf_ok = (adf_p_daily.loc[t] is not None) and (adf_p_daily.loc[t] < cfg.min_adf_pvalue)
+
+        # Exit conditions first
+        if state != 0:
+            if abs(zz) < cfg.z_exit or hold >= cfg.max_hold_days or not adf_ok:
+                state = 0
+                hold = 0
+
+        # Entry if flat and stationarity ok
+        if state == 0 and adf_ok and np.isfinite(zz):
+            if zz >= cfg.z_enter:
+                state = -1  # short spread: short X, long beta*Y
+                hold = 0
+            elif zz <= -cfg.z_enter:
+                state = +1  # long spread: long X, short beta*Y
+                hold = 0
+
+        # Size positions (dollar-neutral)
+        if state == +1:
+            # Long X, Short beta*Y
+            pos_x.loc[t] = 1.0
+            pos_y.loc[t] = -b if cfg.dollar_neutral else -1.0
+            hold += 1
+        elif state == -1:
+            # Short X, Long beta*Y
+            pos_x.loc[t] = -1.0
+            pos_y.loc[t] = +b if cfg.dollar_neutral else +1.0
+            hold += 1
+        else:
+            pos_x.loc[t] = 0.0
+            pos_y.loc[t] = 0.0
+
+    # 5) Returns & TC
+    ret_x = x.pct_change().fillna(0.0)
+    ret_y = y.pct_change().fillna(0.0)
+
+    # Target-vol scaling (optional) on portfolio notional = |pos_x| + |pos_y|
+    port_ret_gross = (pos_x.shift().fillna(0.0) * ret_x) + (pos_y.shift().fillna(0.0) * ret_y)
+
+    if cfg.target_vol_pa:
+        # EWMA vol targeting on gross returns
+        lam = 0.94
+        ewma_var = port_ret_gross.pow(2).ewm(alpha=(1-lam)).mean() * 252.0
+        scale = (cfg.target_vol_pa / (np.sqrt(ewma_var) + 1e-12)).clip(upper=2.0)
+        port_ret_gross = port_ret_gross * scale
+
+    # Transaction costs when positions change (turnover on each leg)
+    turn_x = pos_x.diff().abs().fillna(0.0)
+    turn_y = pos_y.diff().abs().fillna(0.0)
+    # Notional per leg assumed 1 unit; cost proportional to abs change
+    tc = cfg.tc_bps * (turn_x + turn_y)
+    port_ret_net = port_ret_gross - tc
+
+    # 6) Package outputs
+    tests = {
+        "config": asdict(cfg),
+        "half_life_days": int(window),
+        "last_beta": float(beta_daily.dropna().iloc[-1]) if len(beta_daily.dropna()) else None,
+        "adf_p_last": float(adf_p_daily.dropna().iloc[-1]) if len(adf_p_daily.dropna()) else None
+    }
+
+    metrics = {
+        "Strategy": kpis(port_ret_net),
+        f"BuyHold_{cfg.X}": kpis(ret_x),
+        f"BuyHold_{cfg.Y}": kpis(ret_y)
+    }
+
+    out = pd.DataFrame({
+        cfg.X: x,
+        cfg.Y: y,
+        "beta": beta_daily,
+        "spread": spread,
+        "z": z,
+        "pos_X": pos_x,
+        "pos_Y": pos_y,
+        "ret_X": ret_x,
+        "ret_Y": ret_y,
+        "ret_gross": port_ret_gross,
+        "ret_net": port_ret_net,
+        "tc": tc,
+        "adf_p": adf_p_daily
+    }).dropna()
+
+    return out, metrics, tests
+
+def main():
+    out, metrics, tests = build_pairs_strategy(CFG)
+    ts_path = "level39_timeseries.csv"
+    m_path = "level39_metrics.json"
+    t_path = "level39_tests.json"
+
+    out.to_csv(ts_path, index=True)
+    with open(m_path, "w") as f:
+        json.dump(metrics, f, indent=2)
+    with open(t_path, "w") as f:
+        json.dump(tests, f, indent=2)
+
+    print(f"[OK] Saved timeseries  → {ts_path}")
+    print(f"[OK] Saved metrics    → {m_path}")
+    print(f"[OK] Saved diagnostics→ {t_path}")
+    print("Metrics summary:")
+    for k, v in metrics.items():
+        print(f"  {k}: ", {kk: round(vv, 4) if vv==vv else None for kk, vv in v.items()})
+
+if __name__ == "__main__":
+    main()
+```
+
+### How to use & adapt
+
+* **Pick your pair** in `Config(X, Y)`. Examples: `("XOM","CVX")`, `("MSFT","AAPL")`, `("SPY","IVV")`.
+* **z-thresholds:** start with `enter=2.0`, `exit=0.5`; tune conservatively.
+* **Hedge refit:** monthly is usually sufficient; increase to weekly if structure drifts.
+* **Stationarity guard:** if **ADF p-value ≥ 0.05**, strategy stays/returns to **flat** until it’s stationary again.
+* **Costs:** `tc_bps=0.0002` (~2 bps per leg); adjust to your venue/liquidity.
+
+Want me to plug this into your **Model #100** scaffold (CLI args, report markdown, plots, and purged CV harness to validate thresholds across rolling windows)?
