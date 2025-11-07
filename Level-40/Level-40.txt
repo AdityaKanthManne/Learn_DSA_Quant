@@ -1,0 +1,277 @@
+## Level 40 — Statistical Arbitrage Basket (PCA Residuals)
+
+*Description:* Cross-sectional **stat-arb** that neutralizes common market/sector moves with **rolling PCA**, then trades **mean-reversion in residuals** across a liquid ETF/equity universe.
+*Objective:* Harvest **idiosyncratic noise** by going long assets with **negative residual z-scores** and short those with **positive residual z-scores**, staying near **dollar-neutral** (optionally beta-neutral).
+*DSA Concept:* **Rolling PCA via SVD** (matrix factorization), **windowed standardization**, **monthly refit / daily inference**, **cross-sectional z-scores**, **event-driven portfolio state** (thresholding), **cost-aware rebalancing**.
+*Quant/ML Model:* **Unsupervised**: rolling PCA (keep K factors by explained-variance threshold); residual = standardized return − PCA reconstruction; **rule-based** sizing on residual z with **volatility scaling** and **gross-exposure normalization**.
+*Real-Time Scope:* **Monthly** PCA fit on a 1-year window; **daily** residuals, weights, and rebalancing.
+*Free Data/APIs:* `yfinance` (daily OHLCV / adjusted closes).
+*Deliverables:* CSV with per-day residual z-scores, weights, PnL (gross/net), and JSON metrics (CAGR/Sharpe/MaxDD), plus basic diagnostics (K chosen, EVR).
+*Difficulty:* **Advanced** • *Build:* **4h**
+
+---
+
+### DSA Concept — how it stays fast & stable
+
+1. **Windowed standardization (O(N·W))**: for each monthly refit, compute column-wise mean/σ on a rolling window (W≈252). Store `(μ, σ)` for later daily inference (**O(1)** per asset/day).
+2. **Rolling PCA via SVD (O(min(NW², N²W)))**: Fit PCA on the standardized return matrix (W×N). Use **explained-variance ratio** to pick **K** up to `K_max`. We refit **monthly**, so it’s tractable.
+3. **Daily inference (O(NK))**: For each day, standardize the return vector with stored `(μ,σ)`, project onto components `C (K×N)` to get scores `s = z·Cᵀ`, reconstruct `ẑ = s·C`, and compute **residual** `ε = z − ẑ`.
+4. **Cross-sectional z of residuals (O(N))**: compute per-day mean/σ across assets and z-score residuals; threshold to avoid micro trades.
+5. **Position construction (O(N))**: weights ∝ **− residual_z / vol**, then **dollar-neutralize** (subtract mean), and **normalize to target gross**; clip by per-name caps.
+6. **TC-aware rebalancing**: apply **bps × turnover** only on days when weights change; sparse cost vector.
+7. **Risk controls**: cap gross exposure, per-name max weight, optional **beta-neutralization** (regress weights to SPY beta and neutralize), and a kill-switch if PCA K collapses or too few names trade.
+
+---
+
+## Complete Single-File Script (free-only, robust loader, cost-aware)
+
+```python
+# level40_pca_residuals_stat_arb.py
+# Python-only, free data (yfinance). PCA residual mean-reversion across a basket.
+# Outputs:
+#   - CSV:  level40_timeseries.csv  (prices, returns, residual_z, weights, returns_gross/net, etc.)
+#   - JSON: level40_metrics.json    (CAGR, Vol, Sharpe, MaxDD) + diagnostics (K, EVR)
+# Usage:
+#   python level40_pca_residuals_stat_arb.py
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+from dataclasses import dataclass, asdict
+from typing import Optional, Dict, List, Tuple
+from sklearn.decomposition import PCA
+import json
+
+# ----------------------------- Config -----------------------------
+@dataclass
+class Config:
+    start: str = "2007-01-01"
+    end: Optional[str] = None
+    # Liquid, diverse ETF basket by default; replace with your equities universe if desired.
+    tickers: Tuple[str, ...] = (
+        "SPY","QQQ","IWM","EFA","EEM",
+        "XLB","XLE","XLF","XLI","XLK","XLP","XLU","XLV","XLY","XLC",
+        "IYR","IYT","XME","GDX","USO","UNG","GLD","SLV"
+    )
+    auto_adjust: bool = True
+    rf_proxy: str = "BIL"               # optional, unused in returns but handy for expansions
+    win_pca: int = 252                  # PCA fit window (trading days)
+    refit_freq: str = "M"               # refit PCA monthly
+    evr_target: float = 0.75            # cumulative explained variance target
+    k_max: int = 8                      # cap number of PCs
+    z_enter: float = 1.0                # soft threshold: only trade names with |z| >= z_enter
+    gross_target: float = 1.0           # target gross exposure (sum |w_i|)
+    w_cap: float = 0.10                 # per-name absolute weight cap
+    vol_win: int = 60                   # lookback for per-asset vol scaling
+    tc_bps: float = 0.0002              # 2 bps per |Δw| per name when weights change
+    seed: int = 7
+
+CFG = Config()
+
+# ----------------------------- Data Utils -----------------------------
+def load_adjusted_close(tickers, start, end=None, auto_adjust=True) -> pd.DataFrame:
+    raw = yf.download(tickers, start=start, end=end, auto_adjust=auto_adjust, progress=False)
+    price_key = "Close" if auto_adjust else "Adj Close"
+    if isinstance(raw.columns, pd.MultiIndex):
+        out = raw[price_key].copy()
+    else:
+        # single ticker shape -> normalize
+        name = tickers if isinstance(tickers, str) else tickers[0]
+        out = raw[[price_key]].rename(columns={price_key: name})
+    # keep only those that actually downloaded
+    have = [c for c in (tickers if isinstance(tickers, (list, tuple)) else [tickers]) if c in out.columns]
+    out = out.reindex(columns=have)
+    # drop columns that are all NaN
+    out = out.dropna(axis=1, how="all")
+    return out
+
+def align_index(df: pd.DataFrame) -> pd.DataFrame:
+    # drop rows with all NaNs, forward-fill occasional gaps, then drop still-NaN rows
+    df = df.sort_index()
+    df = df.ffill().dropna(how="any")  # require full panel for PCA window
+    return df
+
+# ----------------------------- Metrics -----------------------------
+def kpis(port_daily: pd.Series) -> Dict[str, float]:
+    x = port_daily.dropna()
+    if len(x) < 2:
+        return {"CAGR": np.nan, "Vol": np.nan, "Sharpe": np.nan, "MaxDD": np.nan}
+    eq = (1 + x).cumprod()
+    cagr = eq.iloc[-1]**(252/len(x)) - 1
+    vol = x.std()*np.sqrt(252)
+    sharpe = (x.mean()*252)/(vol + 1e-12)
+    mdd = (eq/eq.cummax() - 1).min()
+    return {"CAGR": float(cagr), "Vol": float(vol), "Sharpe": float(sharpe), "MaxDD": float(mdd)}
+
+# ----------------------------- PCA Helpers -----------------------------
+def fit_pca(window_rets: pd.DataFrame, evr_target: float, k_max: int) -> Dict:
+    """Standardize columns, fit PCA, choose K by cumulative EVR or k_max."""
+    # standardize across time: mean/σ per asset on the window
+    mu = window_rets.mean(axis=0)
+    sig = window_rets.std(axis=0).replace(0, np.nan)
+    Z = (window_rets - mu) / (sig + 1e-12)
+    Z = Z.fillna(0.0)
+
+    pca_full = PCA(n_components=min(k_max, Z.shape[1]))
+    pca_full.fit(Z.values)
+    evr = np.cumsum(pca_full.explained_variance_ratio_)
+    K = int(np.searchsorted(evr, evr_target) + 1)
+    K = int(np.clip(K, 1, min(k_max, Z.shape[1])))
+
+    # re-fit with K (scikit can just slice components/evr)
+    comps = pca_full.components_[:K, :]        # shape: (K, N)
+    evr_used = pca_full.explained_variance_ratio_[:K].sum()
+
+    return {
+        "mu": mu, "sig": sig,
+        "components": pd.DataFrame(comps, columns=window_rets.columns, index=[f"PC{i+1}" for i in range(K)]),
+        "K": K, "evr_sum": float(evr_used)
+    }
+
+def infer_residual_z(day_rets: pd.Series, model: Dict) -> pd.Series:
+    """Standardize with stored (μ,σ), project to components, reconstruct, return residual z per asset."""
+    cols = model["components"].columns
+    # align
+    x = day_rets.reindex(cols)
+    z = (x - model["mu"]) / (model["sig"] + 1e-12)
+    z = z.fillna(0.0)
+
+    C = model["components"].values            # (K, N)
+    scores = z.values @ C.T                   # (K,)
+    z_hat = scores @ C                        # (N,)
+    resid_z = z.values - z_hat
+    return pd.Series(resid_z, index=cols)
+
+# ----------------------------- Strategy Core -----------------------------
+def build_pca_stat_arb(cfg: Config):
+    np.random.seed(cfg.seed)
+
+    # 1) Prices & returns
+    px = load_adjusted_close(list(cfg.tickers), start=cfg.start, end=cfg.end, auto_adjust=cfg.auto_adjust)
+    if px.shape[1] < 5:
+        raise ValueError("Too few tickers downloaded. Please supply a larger liquid universe.")
+    px = align_index(px)
+    rets = np.log(px).diff().dropna()
+
+    # 2) Monthly fit points (refit PCA)
+    fit_dates = rets.resample(cfg.refit_freq).last().index
+    fit_dates = fit_dates[fit_dates >= (rets.index[0] + pd.tseries.offsets.BDay(cfg.win_pca))]
+
+    models = {}         # date -> PCA model dict
+    K_series = pd.Series(index=rets.index, dtype=float)
+    EVR_series = pd.Series(index=rets.index, dtype=float)
+
+    for d in fit_dates:
+        w_end = d
+        w_beg = rets.index[rets.index.get_loc(d, method="pad") - cfg.win_pca + 1]
+        window = rets.loc[w_beg:w_end]
+        mdl = fit_pca(window, cfg.evr_target, cfg.k_max)
+        models[d] = mdl
+        # store diagnostics at fit timestamp
+        K_series.loc[d] = mdl["K"]
+        EVR_series.loc[d] = mdl["evr_sum"]
+
+    # 3) Forward daily inference using last available model
+    resid_z_all = pd.DataFrame(index=rets.index, columns=rets.columns, dtype=float)
+    last_fit = None
+    model_dates = sorted(models.keys())
+    m_idx = 0
+
+    for t in rets.index:
+        while m_idx < len(model_dates) and model_dates[m_idx] <= t:
+            last_fit = model_dates[m_idx]
+            m_idx += 1
+        if last_fit is None:
+            continue
+        mdl = models[last_fit]
+        resid_z_all.loc[t] = infer_residual_z(rets.loc[t], mdl)
+
+        # forward-fill diagnostics
+        if np.isnan(K_series.loc[t]) and not np.isnan(K_series.loc[last_fit]):
+            K_series.loc[t] = K_series.loc[last_fit]
+        if np.isnan(EVR_series.loc[t]) and not np.isnan(EVR_series.loc[last_fit]):
+            EVR_series.loc[t] = EVR_series.loc[last_fit]
+
+    resid_z_all = resid_z_all.dropna(how="all")
+
+    # 4) Build weights from residual z (mean-reversion), with vol scaling and constraints
+    vol = rets.rolling(cfg.vol_win).std().replace(0, np.nan)
+    vol = vol.reindex_like(rets)
+
+    raw_w = (-resid_z_all / (vol + 1e-12)).replace([np.inf, -np.inf], 0.0)
+    # Soft threshold: zero-out small |z|
+    mask = resid_z_all.abs() >= cfg.z_enter
+    raw_w = raw_w.where(mask, 0.0)
+
+    # Dollar-neutralize per day: subtract cross-sectional mean
+    raw_w = raw_w.sub(raw_w.mean(axis=1), axis=0).fillna(0.0)
+
+    # Clip per-name weight
+    raw_w = raw_w.clip(lower=-cfg.w_cap, upper=cfg.w_cap)
+
+    # Normalize to target gross
+    gross = raw_w.abs().sum(axis=1).replace(0, np.nan)
+    scale = (cfg.gross_target / gross).clip(upper=5.0)  # guard huge scale
+    w = (raw_w.T * scale).T.fillna(0.0)
+
+    # 5) Portfolio returns & transaction costs
+    port_ret_gross = (w.shift().fillna(0.0) * rets.reindex_like(w)).sum(axis=1)
+    turn = (w - w.shift()).abs().sum(axis=1).fillna(0.0)
+    tc = cfg.tc_bps * turn
+    port_ret_net = port_ret_gross - tc
+
+    # 6) Outputs
+    metrics = {"Strategy": kpis(port_ret_net)}
+    diag = {
+        "config": asdict(cfg),
+        "avg_K": float(pd.Series(K_series).dropna().mean()) if len(pd.Series(K_series).dropna()) else None,
+        "avg_EVR": float(pd.Series(EVR_series).dropna().mean()) if len(pd.Series(EVR_series).dropna()) else None,
+        "first_fit": str(model_dates[0].date()) if model_dates else None,
+        "last_fit": str(model_dates[-1].date()) if model_dates else None
+    }
+
+    out = pd.concat({
+        "price": px.reindex(w.index),
+        "ret": rets.reindex(w.index),
+        "resid_z": resid_z_all.reindex(w.index),
+        "weight": w,
+        "port": pd.DataFrame({"ret_gross": port_ret_gross, "turnover": turn, "tc": tc, "ret_net": port_ret_net})
+    }, axis=1)
+
+    return out.dropna(how="all"), metrics, diag
+
+def main():
+    out, metrics, diag = build_pca_stat_arb(CFG)
+
+    ts_path = "level40_timeseries.csv"
+    m_path  = "level40_metrics.json"
+    d_path  = "level40_diagnostics.json"
+
+    out.to_csv(ts_path)
+    with open(m_path, "w") as f:
+        json.dump(metrics, f, indent=2)
+    with open(d_path, "w") as f:
+        json.dump(diag, f, indent=2)
+
+    print(f"[OK] Saved timeseries  → {ts_path}")
+    print(f"[OK] Saved metrics    → {m_path}")
+    print(f"[OK] Saved diagnostics→ {d_path}")
+    for k, v in metrics.items():
+        print(f"  {k}: ", {kk: round(vv, 4) if vv==vv else None for kk, vv in v.items()})
+
+if __name__ == "__main__":
+    main()
+```
+
+---
+
+### Practical tips
+
+* **Universe:** For equities, use a stable, liquid set (e.g., **S&P-100**). You can pass your own list to `Config(tickers=...)`. Keep **N≥10**.
+* **Refit cadence:** Monthly is a sweet spot; weekly can overfit/churn.
+* **K selection:** `evr_target=0.70–0.85` with `k_max=5–10` usually works; monitor `avg_K` and `avg_EVR` in diagnostics.
+* **Neutralization:** This script is **dollar-neutral**. If you want **beta-neutral**, regress daily weights vs SPY betas and orthogonalize.
+* **Stops:** Add safeguards to zero weights on days when `gross` is tiny or K collapses to 1.
+* **Live use:** Recompute PCA at each **month-end**, then run daily inference and rebalance based on current residual z-scores.
+
+Want me to bolt this into your **Model #100** CLI scaffold (args like `--evr-target`, `--k-max`, `--z-enter`, `--beta-neutral`) and generate a markdown **research report** with plots and tables?
