@@ -1,0 +1,9 @@
+{
+  "avg_spread_bps": 46.13138276023739,
+  "median_spread_bps": 32.47368471594575,
+  "p90_spread_bps": 98.57053790644177,
+  "pct_valid_days": 98.4753192300362,
+  "n_days": 5247,
+  "window": 60,
+  "min_obs": 40
+}

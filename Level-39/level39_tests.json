@@ -1,0 +1,22 @@
+{
+  "config": {
+    "start": "2005-01-01",
+    "end": null,
+    "X": "KO",
+    "Y": "PEP",
+    "auto_adjust": true,
+    "rebalance_hedge": "M",
+    "z_enter": 2.0,
+    "z_exit": 0.5,
+    "max_hold_days": 60,
+    "tc_bps": 0.0002,
+    "dollar_neutral": true,
+    "use_close": true,
+    "min_adf_pvalue": 0.05,
+    "target_vol_pa": null,
+    "seed": 42
+  },
+  "half_life_days": 120,
+  "last_beta": 0.3896050346642024,
+  "adf_p_last": 0.3265388291461785
+}

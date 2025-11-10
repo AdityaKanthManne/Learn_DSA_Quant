@@ -1,0 +1,260 @@
+## Level 42 — VPIN (Flow Toxicity Proxy)
+
+*Description:* Estimate **order-flow toxicity** by converting a high-frequency price/volume stream into **equal-volume buckets** and measuring the **absolute buy–sell volume imbalance** per bucket. Smooth the last *m* buckets to get **VPIN**, a 0–1-ish risk gauge: high VPIN ⇒ “toxic” periods (informational edge against you).
+*Objective:* **Avoid/scale down** entries during toxic windows; feed VPIN into execution schedulers (TWAP/VWAP) or as a **risk gate** for short-horizon models.
+*DSA Concept:* **Volume-time bucketing with two-pointers + prefix sums**, rolling mean via **deque** (O(1) updates), and **online** computation of signed volume using a microstructure rule (tick/return sign).
+*Quant/ML Model:* Rule-based **VPIN = MA_m(|BuyVol − SellVol| / BucketVol)** over the last *m* buckets; alarm when VPIN crosses a high quantile (e.g., 80–95%).
+*Real-Time Scope:* **Intraday** on 1-minute (or faster) bars; update VPIN at each completed volume bucket (seconds–minutes depending on liquidity).
+*Free Data/APIs:* **Binance** public REST (no key) for 1-minute klines (e.g., `BTCUSDT`). Works for many spot symbols.
+*Deliverables:* CSV with bucket-level metrics & VPIN time-series, JSON metrics (means/quantiles), and “toxic” flags; ready to drop into execution/strategy gating.
+*Difficulty:* Advanced • *Build:* 4h
+
+---
+
+### DSA Concept — how we keep it fast
+
+1. **Signed volume per bar (O(1)/bar).**
+   Use a microstructure proxy to split each bar’s volume into **buy vs sell**:
+
+   * **Return sign rule (free, robust):** if `close - open > 0` treat the bar’s *entire* volume as buys; if `< 0` as sells; if `≈0`, split 50/50.
+     This is a coarse proxy (true VPIN uses trade prints), but works with free OHLCV.
+
+2. **Equal-volume bucketing (O(N)).**
+   Let target bucket size be (V_b). Walk the bars once with a **two-pointer**:
+
+   * Maintain **prefix sums** for `cum_vol`, `cum_buy`, `cum_sell`.
+   * When cumulative volume reaches/passes the next multiple of (V_b), **cut** a bucket: allocate *partial* bar volume to fill the bucket (proportional split), and **carry over** the remainder to the next bucket.
+   * Each bar is visited once; at most one split per bucket ⇒ linear.
+
+3. **Bucket imbalance & VPIN (O(1) per bucket).**
+   For bucket (k): `imb_k = |buy_k − sell_k| / V_b`.
+   Maintain a **deque** of the last `m` `imb_k` values and an online sum; VPIN_k = mean of the deque (push/pop amortized O(1)).
+
+4. **Alerts & quantiles (O(1) / step).**
+   Track rolling quantiles if needed (approximate **P²** or fixed thresholds); for simplicity we compute static quantiles at the end and provide live thresholding with a chosen cutoff.
+
+---
+
+## Complete Single-File Script (Binance klines → VPIN)
+
+```python
+# level42_vpin_flow_toxicity.py
+# Free-only VPIN using Binance public 1m klines (no API key). Works for crypto symbols like BTCUSDT.
+# Outputs:
+#   - CSV : level42_vpin_buckets.csv  (bucket_time, buy, sell, vol, imb, vpin, toxic_flag)
+#   - JSON: level42_vpin_metrics.json (means/quantiles/config)
+# Usage:
+#   python level42_vpin_flow_toxicity.py
+# Notes:
+#   - This is a proxy (bar-sign method). True VPIN uses trade prints/signing; adapt loader if you have them.
+#   - You can change SYMBOL, DAYS, BUCKET_MULT, M (smoothing) in Config.
+
+import math
+import time
+import json
+import queue
+import requests
+import numpy as np
+import pandas as pd
+from dataclasses import dataclass, asdict
+from collections import deque
+from typing import List, Tuple, Dict, Optional
+
+# ----------------------------- Config -----------------------------
+@dataclass
+class Config:
+    SYMBOL: str = "BTCUSDT"     # Binance spot symbol
+    INTERVAL: str = "1m"        # 1-minute klines
+    DAYS: int = 3               # how many days back to pull (Binance limit 1000 klines per call)
+    BUCKET_MULT: float = 3.0    # bucket size = BUCKET_MULT * median(1m volume)
+    M: int = 50                 # VPIN smoothing window in buckets
+    TOXIC_Q: float = 0.9        # flag toxic when VPIN >= this quantile (computed at end)
+    BASE_URL: str = "https://api.binance.com"
+    # Export paths
+    CSV_PATH: str = "level42_vpin_buckets.csv"
+    JSON_PATH: str = "level42_vpin_metrics.json"
+    # Robustness
+    SLEEP_SECS: float = 0.15    # between paged requests
+
+CFG = Config()
+
+# ----------------------------- Loader (Binance public klines) -----------------------------
+def fetch_klines(symbol: str, interval: str, start_ms: Optional[int]=None, end_ms: Optional[int]=None, limit: int=1000):
+    url = f"{CFG.BASE_URL}/api/v3/klines"
+    params = {"symbol": symbol, "interval": interval, "limit": limit}
+    if start_ms is not None: params["startTime"] = start_ms
+    if end_ms is not None:   params["endTime"] = end_ms
+    r = requests.get(url, params=params, timeout=10)
+    r.raise_for_status()
+    return r.json()
+
+def load_minutes(symbol: str, interval: str, days: int) -> pd.DataFrame:
+    # Pull last `days` of klines with simple backward pagination by endTime.
+    # Each kline: [openTime, open, high, low, close, volume, closeTime, ... , quoteVolume, trades, ...]
+    end = int(time.time()*1000)
+    start = end - days*24*60*60*1000
+    frames = []
+    cur_start = start
+    while True:
+        chunk = fetch_klines(symbol, interval, start_ms=cur_start, end_ms=end, limit=1000)
+        if not chunk:
+            break
+        df = pd.DataFrame(chunk, columns=[
+            "open_time","open","high","low","close","volume",
+            "close_time","qav","num_trades","taker_buy_vol","taker_buy_qav","ignore"
+        ])
+        df["open_time"]  = pd.to_datetime(df["open_time"], unit="ms", utc=True).dt.tz_convert("UTC")
+        df["close_time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True).dt.tz_convert("UTC")
+        for col in ["open","high","low","close","volume","qav","taker_buy_vol","taker_buy_qav"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        frames.append(df[["open_time","close_time","open","high","low","close","volume"]])
+        # paginate
+        last_open = int(df["open_time"].iloc[-1].value/1e6)  # ms
+        cur_start = last_open + 60_000  # next minute
+        if df.shape[0] < 1000 or cur_start >= end:
+            break
+        time.sleep(CFG.SLEEP_SECS)
+    if not frames:
+        raise RuntimeError("No klines returned; check symbol/interval.")
+    out = pd.concat(frames).drop_duplicates(subset=["open_time"]).set_index("open_time").sort_index()
+    return out
+
+# ----------------------------- Signed Volume (bar-sign rule) -----------------------------
+def split_volume_signed(df: pd.DataFrame) -> pd.DataFrame:
+    """Approximate buy/sell volume using the sign of (close-open)."""
+    ret = df["close"] - df["open"]
+    sign = np.sign(ret.values)
+    buy = np.where(sign > 0, df["volume"].values,
+                   np.where(sign < 0, 0.0, 0.5*df["volume"].values))
+    sell = np.where(sign < 0, df["volume"].values,
+                    np.where(sign > 0, 0.0, 0.5*df["volume"].values))
+    out = df.copy()
+    out["buy_vol"] = buy
+    out["sell_vol"] = sell
+    return out
+
+# ----------------------------- Volume-Time Bucketing -----------------------------
+def build_volume_buckets(bars: pd.DataFrame, bucket_vol: float, m: int) -> pd.DataFrame:
+    """
+    Convert minute bars with (buy_vol, sell_vol, volume) into equal-volume buckets (size = bucket_vol).
+    Use two-pointer accumulation; proportionally split the final bar to fill a bucket.
+    Returns a DataFrame indexed by bucket close time with columns: buy, sell, vol, imb, vpin
+    """
+    buy_cum = 0.0
+    sell_cum = 0.0
+    vol_cum = 0.0
+
+    vpin_window = deque(maxlen=m)
+    vpin_sum = 0.0
+
+    rows = []
+    current_bucket_end = None
+
+    for ts, row in bars.iterrows():
+        v = float(row["volume"])
+        if not np.isfinite(v) or v <= 0:
+            continue
+        buy = float(row["buy_vol"])
+        sell = float(row["sell_vol"])
+        remaining = v
+
+        while remaining > 1e-12:
+            take = min(bucket_vol - vol_cum, remaining)
+            if take <= 0:  # exact bucket boundary
+                take = remaining
+            frac = take / v
+            buy_cum  += buy  * frac
+            sell_cum += sell * frac
+            vol_cum  += take
+            remaining -= take
+            current_bucket_end = ts
+
+            if vol_cum >= bucket_vol - 1e-12:  # close bucket
+                imb = abs(buy_cum - sell_cum) / bucket_vol
+                # Rolling mean over last m buckets (deque)
+                vpin_window.append(imb)
+                vpin_sum = sum(vpin_window)
+                vpin = vpin_sum / len(vpin_window)
+
+                rows.append({
+                    "bucket_time": current_bucket_end,  # last bar timestamp that closed the bucket
+                    "buy": buy_cum, "sell": sell_cum, "vol": vol_cum,
+                    "imb": imb, "vpin": vpin
+                })
+                # reset bucket accumulators (carry over remainder via while loop)
+                buy_cum = sell_cum = vol_cum = 0.0
+
+    if not rows:
+        raise RuntimeError("No buckets formed; try lowering BUCKET_MULT or increase history.")
+
+    out = pd.DataFrame(rows).set_index("bucket_time")
+    return out
+
+# ----------------------------- Pipeline -----------------------------
+def compute_vpin(cfg: Config):
+    # 1) Load 1m bars
+    bars = load_minutes(cfg.SYMBOL, cfg.INTERVAL, cfg.DAYS)
+    # 2) Signed volume proxy
+    bars = split_volume_signed(bars)
+    # 3) Bucket size: multiple of median 1m volume
+    med_vol = float(bars["volume"].median())
+    bucket_vol = cfg.BUCKET_MULT * med_vol
+    # 4) Build buckets + VPIN
+    buckets = build_volume_buckets(bars, bucket_vol, cfg.M)
+    # 5) Toxic flag via quantile threshold (computed on resulting VPIN distribution)
+    q_cut = float(buckets["vpin"].quantile(cfg.TOXIC_Q))
+    buckets["toxic_flag"] = (buckets["vpin"] >= q_cut).astype(int)
+
+    # 6) Metrics
+    metrics = {
+        "config": asdict(cfg),
+        "symbol": cfg.SYMBOL,
+        "bucket_vol": bucket_vol,
+        "median_1m_vol": med_vol,
+        "buckets": int(buckets.shape[0]),
+        "vpin_mean": float(buckets["vpin"].mean()),
+        "vpin_p50": float(buckets["vpin"].quantile(0.50)),
+        "vpin_p80": float(buckets["vpin"].quantile(0.80)),
+        "vpin_p90": float(buckets["vpin"].quantile(0.90)),
+        "toxic_quantile_cut": q_cut,
+        "toxic_share_pct": float(100.0 * buckets["toxic_flag"].mean())
+    }
+    return buckets, metrics
+
+# ----------------------------- Main -----------------------------
+def main():
+    buckets, metrics = compute_vpin(CFG)
+    # Export
+    buckets.to_csv(CFG.CSV_PATH, index=True)
+    with open(CFG.JSON_PATH, "w") as f:
+        json.dump(metrics, f, indent=2)
+    print(f"[OK] Saved buckets → {CFG.CSV_PATH}")
+    print(f"[OK] Saved metrics → {CFG.JSON_PATH}")
+    print("Metrics summary:", {k: (round(v, 4) if isinstance(v, (int, float)) else v) for k, v in metrics.items()})
+
+if __name__ == "__main__":
+    main()
+```
+
+---
+
+### How to use it
+
+* **Run it as-is** (default `BTCUSDT`, last **3 days** of 1-minute bars). You’ll get:
+
+  * `level42_vpin_buckets.csv` — per-bucket buy/sell/vol, `imb`, `vpin`, and a `toxic_flag`.
+  * `level42_vpin_metrics.json` — configs, bucket size, VPIN mean/quantiles, toxic share.
+* **Gate trades:** In your intraday strategies (e.g., Model #25 river, Model #44 execution sim), **skip or halve size** when `toxic_flag==1` (or when `vpin >= p90`).
+* **Tune knobs:**
+
+  * `BUCKET_MULT`: smaller ⇒ more buckets (faster updates), larger ⇒ slower but smoother.
+  * `M`: smoothing window (typ. 30–100 buckets).
+  * `TOXIC_Q`: 0.8–0.95 works well as a red-zone.
+
+### Caveats & upgrades
+
+* **Proxy signing:** The return-sign rule is a free approximation. If you have trade prints, replace `split_volume_signed` with a **Lee–Ready** or tick-rule classifier and aggregate true buy/sell volume.
+* **Stability:** For thin symbols, increase `DAYS` or lower `BUCKET_MULT`.
+* **Live mode:** Wrap the bucket logic to **append** as new bars arrive (websocket stream), keeping the deque for (O(1)) VPIN updates.
+
+If you want, I can wire this into your **Model #100** scaffold with a CLI (`--symbol --days --bucket-mult --m --toxic-q`), plus optional **websocket** streaming for real-time dashboards.

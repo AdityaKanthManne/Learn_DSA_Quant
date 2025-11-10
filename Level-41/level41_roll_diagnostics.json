@@ -1,0 +1,13 @@
+{
+  "config": {
+    "ticker": "SPY",
+    "start": "2005-01-01",
+    "end": null,
+    "auto_adjust": true,
+    "window": 60,
+    "min_obs": 40,
+    "clip_bps": 200.0
+  },
+  "ticker": "SPY",
+  "avg_spread_bps_report_capped": 41.917841819175486
+}
