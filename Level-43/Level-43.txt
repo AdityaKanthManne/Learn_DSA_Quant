@@ -1,0 +1,281 @@
+## Level 43 — Order-Book Imbalance from Public L2 (Crypto)
+
+*Description:* Pull **public L2 depth** (no key) at a fixed cadence, aggregate **top-L** levels, and compute order-flow **imbalance**
+[
+\text{OBI}*t=\frac{\sum*{i=1}^{L} q^\text{bid}*{i,t}-\sum*{i=1}^{L} q^\text{ask}*{i,t}}
+{\sum*{i=1}^{L} q^\text{bid}*{i,t}+\sum*{i=1}^{L} q^\text{ask}_{i,t}}
+]
+plus price-weighted variants and short-horizon **mid-price drift**. Export clean CSV/JSON so you can gate trades or train short-horizon predictors (e.g., Level-25/42/44).
+*Objective:* Short-horizon predictor & **toxicity filter** (large, persistent ask>bid → bearish, and vice-versa).
+*DSA Concept:* **Fixed-interval polling** + **heap-free top-L aggregation** (slicing), **EWMA** smoothing (O(1)), **rolling metrics** with deques (O(1)).
+*Free Data/APIs:* **Binance** `/api/v3/depth` (spot), no auth.
+*Deliverables:* `level43_orderbook_imbalance.csv`, `level43_orderbook_imbalance_metrics.json` (means/quantiles, lead/lag corr with returns).
+*Difficulty:* Advanced • *Build:* 5h
+
+---
+
+### Complete, single-file script (robust retries, CLI, exports)
+
+```python
+# level43_orderbook_imbalance.py
+# Public L2 order-book imbalance (Binance spot). No API key required.
+# Polls depth snapshots at a fixed cadence, computes imbalance metrics, and saves CSV/JSON.
+#
+# Usage examples:
+#   python level43_orderbook_imbalance.py --symbol BTCUSDT --levels 20 --interval 1.0 --minutes 10
+#   python level43_orderbook_imbalance.py --symbol ETHUSDT --levels 50 --interval 0.5 --minutes 5 --ema 20
+#
+# Outputs:
+#   - CSV : level43_orderbook_imbalance.csv  (timestamp, bestbid/ask, mid, bid_vol, ask_vol, obi, obi_pw, ema_obi, ret_fwd, ...)
+#   - JSON: level43_orderbook_imbalance_metrics.json (summary stats, correlations, config)
+
+import os
+import time
+import json
+import math
+import argparse
+from dataclasses import dataclass, asdict
+from typing import Optional, Dict, Tuple, List
+
+import numpy as np
+import pandas as pd
+import requests
+from requests.adapters import HTTPAdapter, Retry
+
+# ----------------------------- Config -----------------------------
+@dataclass
+class Config:
+    symbol: str = "BTCUSDT"
+    base_url: str = "https://api.binance.com"
+    levels: int = 20              # aggregate this many top levels on each side
+    interval: float = 1.0         # seconds between polls (respect API rate limits!)
+    minutes: float = 10.0         # total duration to run
+    depth_limit: int = 500        # raw levels requested from API (max 500)
+    ema: int = 30                 # EWMA span for smoothed OBI
+    out_csv: str = "level43_orderbook_imbalance.csv"
+    out_json: str = "level43_orderbook_imbalance_metrics.json"
+    timeout: float = 8.0
+    verify_ssl: bool = True
+
+# ----------------------------- HTTP (retry/backoff) -----------------------------
+def build_session(cfg: Config) -> requests.Session:
+    sess = requests.Session()
+    retries = Retry(
+        total=5,
+        backoff_factor=0.4,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=("GET",),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retries)
+    sess.mount("https://", adapter)
+    sess.mount("http://", adapter)
+    sess.verify = cfg.verify_ssl
+    return sess
+
+# ----------------------------- Binance depth loader -----------------------------
+def fetch_depth(sess: requests.Session, cfg: Config) -> Dict:
+    """
+    GET /api/v3/depth?symbol=BTCUSDT&limit=500
+    Returns JSON with "lastUpdateId", "bids":[[price, qty],...], "asks":[[price, qty],...]
+    """
+    url = f"{cfg.base_url}/api/v3/depth"
+    params = {"symbol": cfg.symbol, "limit": min(max(cfg.levels, 5), cfg.depth_limit)}
+    r = sess.get(url, params=params, timeout=cfg.timeout)
+    r.raise_for_status()
+    return r.json()
+
+# ----------------------------- Math helpers -----------------------------
+def topL_vol_and_pw(bids: List[List[str]], asks: List[List[str]], L: int) -> Tuple[float, float, float, float, float]:
+    """
+    Sum top-L bid/ask volumes and price-weighted volumes.
+    Returns: bid_vol, ask_vol, bid_pw, ask_pw, mid
+    """
+    # bids/asks are strings; convert to float
+    # bids sorted desc by price, asks asc
+    B = [(float(p), float(q)) for p, q in bids[:L]]
+    A = [(float(p), float(q)) for p, q in asks[:L]]
+    bid_vol = sum(q for _, q in B)
+    ask_vol = sum(q for _, q in A)
+    bid_pw  = sum(p*q for p, q in B)
+    ask_pw  = sum(p*q for p, q in A)
+    best_bid = B[0][0] if B else np.nan
+    best_ask = A[0][0] if A else np.nan
+    mid = (best_bid + best_ask)/2.0 if np.isfinite(best_bid) and np.isfinite(best_ask) else np.nan
+    return bid_vol, ask_vol, bid_pw, ask_pw, mid
+
+def safe_obi(bid_vol: float, ask_vol: float) -> float:
+    denom = bid_vol + ask_vol
+    if denom <= 0 or not np.isfinite(denom):
+        return np.nan
+    return (bid_vol - ask_vol) / denom  # in [-1, 1]
+
+def safe_obi_pw(bid_pw: float, ask_pw: float) -> float:
+    denom = bid_pw + ask_pw
+    if denom <= 0 or not np.isfinite(denom):
+        return np.nan
+    return (bid_pw - ask_pw) / denom
+
+# ----------------------------- Collector loop -----------------------------
+def collect_orderbook(cfg: Config) -> pd.DataFrame:
+    sess = build_session(cfg)
+    rows = []
+    L = cfg.levels
+    end_time = time.time() + 60.0 * cfg.minutes
+    last_ts = None
+
+    while time.time() < end_time:
+        t0 = time.time()
+        try:
+            d = fetch_depth(sess, cfg)
+            bids = d.get("bids", [])
+            asks = d.get("asks", [])
+            if not bids or not asks:
+                raise ValueError("Empty depth arrays")
+
+            bid_vol, ask_vol, bid_pw, ask_pw, mid = topL_vol_and_pw(bids, asks, L)
+            obi = safe_obi(bid_vol, ask_vol)
+            obi_pw = safe_obi_pw(bid_pw, ask_pw)
+            ts = pd.Timestamp.utcnow().tz_localize("UTC")
+
+            rows.append({
+                "timestamp": ts,
+                "lastUpdateId": d.get("lastUpdateId", None),
+                "best_bid": float(bids[0][0]),
+                "best_ask": float(asks[0][0]),
+                "mid": float(mid) if np.isfinite(mid) else np.nan,
+                "bid_vol_L": float(bid_vol),
+                "ask_vol_L": float(ask_vol),
+                "obi": float(obi) if np.isfinite(obi) else np.nan,
+                "obi_pw": float(obi_pw) if np.isfinite(obi_pw) else np.nan
+            })
+        except Exception as e:
+            # Insert a NaN row to preserve cadence (optional)
+            ts = pd.Timestamp.utcnow().tz_localize("UTC")
+            rows.append({
+                "timestamp": ts, "lastUpdateId": None,
+                "best_bid": np.nan, "best_ask": np.nan, "mid": np.nan,
+                "bid_vol_L": np.nan, "ask_vol_L": np.nan, "obi": np.nan, "obi_pw": np.nan
+            })
+
+        # sleep to maintain approximate cadence
+        elapsed = time.time() - t0
+        sleep_for = max(0.0, cfg.interval - elapsed)
+        time.sleep(sleep_for)
+
+    df = pd.DataFrame(rows).set_index("timestamp").sort_index()
+    # forward-fill mid/bid/ask (optional), but keep NaNs for strictness
+    return df
+
+# ----------------------------- Feature engineering -----------------------------
+def add_features(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+    out = df.copy()
+    # EWMA of OBI / OBI_PW (O(1) updater, equivalent to span=cfg.ema)
+    out["obi_ema"] = out["obi"].ewm(span=cfg.ema, adjust=False, min_periods=5).mean()
+    out["obi_pw_ema"] = out["obi_pw"].ewm(span=cfg.ema, adjust=False, min_periods=5).mean()
+
+    # Mid-price return to next sample (lead-1) and previous sample (lag-1)
+    out["mid_ret"] = np.log(out["mid"]).diff()
+    out["mid_ret_fwd"] = out["mid"].shift(-1).pipe(lambda s: np.log(s) - np.log(out["mid"]))
+    # Z-scores for OBI (rolling)
+    roll = max(60, int(60/cfg.interval))  # ~1 minute @ 1Hz → keep at least 60 points
+    m = out["obi"].rolling(roll, min_periods=roll//3).mean()
+    s = out["obi"].rolling(roll, min_periods=roll//3).std()
+    out["obi_z"] = (out["obi"] - m) / (s + 1e-12)
+
+    # Simple gating flag (top decile by OBI absolute value over the run)
+    thr = out["obi"].abs().quantile(0.90)
+    out["obi_extreme_flag"] = (out["obi"].abs() >= thr).astype(int)
+
+    return out
+
+# ----------------------------- Metrics -----------------------------
+def summarize(df: pd.DataFrame, cfg: Config) -> Dict:
+    valid = df["obi"].dropna()
+    stats = {
+        "samples": int(df.shape[0]),
+        "obi_mean": float(valid.mean()) if not valid.empty else np.nan,
+        "obi_p90_abs": float(df["obi"].abs().quantile(0.90)) if "obi" in df else np.nan,
+        "obi_pw_mean": float(df["obi_pw"].dropna().mean()) if "obi_pw" in df else np.nan,
+        "ema_span": cfg.ema,
+        "levels": cfg.levels,
+        "interval_sec": cfg.interval,
+        "duration_min": cfg.minutes,
+    }
+    # Contemporaneous & lead correlations with returns
+    try:
+        corr_now = float(df["obi"].corr(df["mid_ret"]))
+    except Exception:
+        corr_now = np.nan
+    try:
+        corr_lead = float(df["obi"].corr(df["mid_ret_fwd"]))
+    except Exception:
+        corr_lead = np.nan
+
+    stats.update({
+        "corr_obi_midret": corr_now,
+        "corr_obi_lead_midret": corr_lead
+    })
+    return stats
+
+# ----------------------------- I/O -----------------------------
+def save_outputs(df: pd.DataFrame, metrics: Dict, cfg: Config):
+    os.makedirs(os.path.dirname(cfg.out_csv) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(cfg.out_json) or ".", exist_ok=True)
+    df.to_csv(cfg.out_csv, index=True, date_format="%Y-%m-%dT%H:%M:%S.%fZ")
+    with open(cfg.out_json, "w") as f:
+        json.dump({"config": asdict(cfg), "metrics": metrics}, f, indent=2)
+    print(f"[OK] Saved CSV  → {cfg.out_csv}")
+    print(f"[OK] Saved JSON → {cfg.out_json}")
+    print("Metrics:", {k: (round(v, 6) if isinstance(v, float) else v) for k, v in metrics.items()})
+
+# ----------------------------- CLI -----------------------------
+def parse_args() -> Config:
+    p = argparse.ArgumentParser(description="Level-43: Order-Book Imbalance from public L2 (Binance)")
+    p.add_argument("--symbol", type=str, default="BTCUSDT", help="e.g., BTCUSDT")
+    p.add_argument("--levels", type=int, default=20, help="Top L levels to aggregate per side")
+    p.add_argument("--interval", type=float, default=1.0, help="Polling cadence in seconds")
+    p.add_argument("--minutes", type=float, default=10.0, help="Total duration to run (minutes)")
+    p.add_argument("--depth-limit", type=int, default=500, help="Raw levels requested from API (<=500)")
+    p.add_argument("--ema", type=int, default=30, help="EWMA span for smoothed OBI")
+    p.add_argument("--csv", type=str, default="level43_orderbook_imbalance.csv", help="Output CSV path")
+    p.add_argument("--json", type=str, default="level43_orderbook_imbalance_metrics.json", help="Output JSON path")
+    p.add_argument("--base-url", type=str, default="https://api.binance.com", help="REST base URL")
+    p.add_argument("--timeout", type=float, default=8.0, help="HTTP timeout")
+    p.add_argument("--no-verify-ssl", action="store_true", help="Disable SSL verification (not recommended)")
+    a = p.parse_args()
+    return Config(
+        symbol=a.symbol,
+        base_url=a.base_url,
+        levels=a.levels,
+        interval=a.interval,
+        minutes=a.minutes,
+        depth_limit=a.depth_limit,
+        ema=a.ema,
+        out_csv=a.csv,
+        out_json=a.json,
+        timeout=a.timeout,
+        verify_ssl=not a.no_verify_ssl
+    )
+
+# ----------------------------- Main -----------------------------
+def main():
+    cfg = parse_args()
+    df = collect_orderbook(cfg)
+    df = add_features(df, cfg)
+    metrics = summarize(df, cfg)
+    save_outputs(df, metrics, cfg)
+
+if __name__ == "__main__":
+    main()
+```
+
+---
+
+### Notes & practical use
+
+* **Cadence:** Binance public depth is rate-limited; stay ≥ 5–10 requests/sec overall. The defaults (1 Hz) are polite.
+* **Predictive use:** Train a simple logistic/regressor on `obi`, `obi_ema`, `obi_z` to predict `sign(mid_ret_fwd)` over a few seconds. Combine with **VPIN** (Level-42) to skip toxic windows.
+* **Variants:** Use **price-weighted OBI** (`obi_pw`) or depth-slope: fit linear regression of log-qty vs level index on each side and difference the slopes.
+* **Going realtime:** swap the poller for Binance **websocket depth**; the stateful book is more accurate. Ready to rewrite if you want the websocket version next.
+

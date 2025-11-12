@@ -1,0 +1,27 @@
+{
+  "config": {
+    "symbol": "BTCUSDT",
+    "levels": 20,
+    "interval": 1.0,
+    "minutes": 2.0,
+    "ema": 30,
+    "out_csv": "level43_orderbook_imbalance.csv",
+    "out_json": "level43_orderbook_imbalance_metrics.json",
+    "timeout": 8.0,
+    "verify_ssl": true,
+    "binance_base": "https://api.binance.com",
+    "coinbase_base": "https://api.exchange.coinbase.com"
+  },
+  "metrics": {
+    "samples": 120,
+    "levels": 20,
+    "interval_sec": 1.0,
+    "duration_min": 2.0,
+    "ema_span": 30,
+    "obi_mean": -0.11800352950722376,
+    "obi_pw_mean": -0.11807556529313867,
+    "obi_abs_p90": 0.28250766180819237,
+    "corr_obi_midret": -0.12126432812794244,
+    "corr_obi_lead_midret": -0.018337899678725872
+  }
+}
