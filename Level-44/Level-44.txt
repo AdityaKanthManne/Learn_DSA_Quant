@@ -1,0 +1,367 @@
+## Level 44 — Execution Simulator (TWAP / VWAP)
+
+*Description:* A single-file simulator that slices a parent order into **child orders** using **TWAP** (equal time slices) or **VWAP** (proportional to expected bar volume), enforces **participation caps**, and prices fills with **spread + temporary impact + permanent impact + drift**—all using **free intraday bars**.
+*Objective:* Compare execution cost vs alternatives; tune knobs (participation, impact elasticities, spread assumptions) and export slice-level logs.
+*DSA Concept:*
+
+* **Slicing:** build a **time grid**; TWAP = uniform allocation; VWAP = weight by **forecast volume curve** (rolling medians).
+* **Capacity/participation:** per-bar cap via **min(child_qty, cap * bar_vol)**; O(1) updates as we step bars.
+* **Pricing:** child **fill price** = mid ± half-spread ± **impact_k · (child/bar_vol)^α · σ_bar · mid** (temporary) ± **k_perm · (cum_exec/ADV)** (permanent).
+* **Rolling stats:** **EWMA** for volatility, **rolling median** for volume curve; everything vectorized where it matters; loop per-slice for realism.
+  *Real-Time Scope:* Intraday sim over the last 1–7 days (free `yfinance` **1m** bars ≤ 7d; else **5m**).
+  *Free Data/APIs:* `yfinance` OHLCV.
+  *Deliverables:*
+* `level44_exec_slices.csv` — per-slice schedule, fills, slippage (bps & $).
+* `level44_exec_summary.json` — totals, implementation shortfall, average price, completion % and all params.
+  *Difficulty:* Intermediate • *Build:* 3–4h
+
+---
+
+### Complete, single-file script (TWAP/VWAP, participation caps, impact, CSV/JSON, Jupyter-safe)
+
+> Save as `level44_execution_sim.py` and run from terminal. Works on Windows/macOS/Linux. No paid data.
+
+```python
+# level44_execution_sim.py
+# Free-data Execution Simulator: TWAP/VWAP with participation caps & impact model.
+# Data: yfinance intraday (1m ≤ 7d; else 5m). Outputs CSV + JSON.
+#
+# Usage (examples):
+#   python level44_execution_sim.py --symbol SPY --side buy --qty 50000 --minutes 120 --strategy twap
+#   python level44_execution_sim.py --symbol AAPL --side sell --qty 25000 --minutes 90 --strategy vwap --participation 0.12
+#   python level44_execution_sim.py --symbol BTC-USD --side buy --qty 5 --minutes 60 --interval 1m --spread-bps 1.5
+#
+# Notes:
+#   - For crypto, use symbols like "BTC-USD" (yfinance supports them).
+#   - 1-minute data is available up to 7 days. For longer runs, pick interval 5m.
+#   - All prices in the downloaded timeframe's timezone (use UTC index for consistency).
+
+import os
+import json
+import math
+import argparse
+from dataclasses import dataclass, asdict
+from typing import Optional, Dict
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+
+
+# ----------------------------- Config -----------------------------
+@dataclass
+class Config:
+    symbol: str = "SPY"
+    side: str = "buy"                 # buy or sell
+    qty: float = 50000                # parent quantity (shares/units)
+    minutes: int = 120                # total schedule horizon (minutes)
+    strategy: str = "twap"            # twap or vwap
+    interval: str = "1m"              # 1m or 5m
+    lookback_days: int = 5            # how many recent days to pull
+    start_offset_min: int = 0         # start after N mins from first bar
+    participation: float = 0.10       # max participation per bar (0..1)
+    spread_bps: float = 2.0           # assumed quoted spread (round-trip bps of mid); half-spread applied per fill
+    k_temp: float = 0.30              # temp impact coefficient
+    alpha: float = 0.60               # temp impact elasticity on (child/bar_vol)
+    k_perm: float = 0.02              # permanent impact coefficient vs cum_exec/ADV
+    vol_span: int = 20                # EWMA span for volatility estimate
+    vol_floor_bps: float = 5.0        # minimum σ per bar in bps to avoid zero impact
+    out_csv: str = "level44_exec_slices.csv"
+    out_json: str = "level44_exec_summary.json"
+    seed: int = 42                    # for any stochastic extensions (kept deterministic here)
+
+# ----------------------------- Data Loader -----------------------------
+def load_intraday(cfg: Config) -> pd.DataFrame:
+    # Enforce 1m only when lookback ≤ 7 days (yfinance limit). Else switch to 5m.
+    interval = cfg.interval
+    if interval == "1m" and cfg.lookback_days > 7:
+        interval = "5m"
+    period = f"{cfg.lookback_days}d"
+    df = yf.download(cfg.symbol, period=period, interval=interval, auto_adjust=True, progress=False)
+    if df.empty:
+        raise RuntimeError("No intraday data returned (symbol/period/interval mismatch?).")
+    # Keep essential columns; ensure datetime index tz-naive (we'll treat as UTC-like for math)
+    # yfinance returns a tz-aware index sometimes; unify to UTC naive string for CSV consistency.
+    if isinstance(df.index, pd.DatetimeIndex):
+        try:
+            df = df.tz_convert("UTC")
+        except Exception:
+            pass
+        try:
+            df = df.tz_localize(None)
+        except Exception:
+            pass
+    df = df.rename(columns=str.title)
+    need = ["Open", "High", "Low", "Close", "Volume"]
+    for c in need:
+        if c not in df.columns:
+            raise RuntimeError(f"Missing column in data: {c}")
+    df = df[need].dropna()
+    return df
+
+# ----------------------------- Volume Curve (VWAP) -----------------------------
+def volume_curve_weights(bars: pd.DataFrame) -> pd.Series:
+    """
+    Estimate an intraday volume curve using a rolling median by minute-of-day.
+    Fallback to simple proportional to bar volume if little history.
+    """
+    if "Volume" not in bars:
+        raise ValueError("bars need Volume")
+    i = bars.index
+    if not isinstance(i, pd.DatetimeIndex):
+        raise ValueError("bars index must be DatetimeIndex")
+    # minute-of-day key
+    mod = i.hour * 60 + i.minute
+    df = bars.copy()
+    df["mod"] = mod
+    # Rolling median per minute-of-day (requires multiple days to stabilize)
+    curve = df.groupby("mod")["Volume"].median()
+    curve = curve.reindex(mod, method="nearest")  # map back
+    curve = curve.fillna(curve.median())
+    w = curve / curve.sum()
+    w.index = bars.index
+    return w
+
+# ----------------------------- Volatility per bar -----------------------------
+def bar_volatility_ewma(bars: pd.DataFrame, span: int, floor_bps: float) -> pd.Series:
+    mid = (bars["High"] + bars["Low"]) / 2.0
+    r = np.log(mid).diff().fillna(0.0)
+    ew = r.ewm(span=span, adjust=False).std().fillna(0.0)
+    # convert to bps per bar; floor
+    sigma_bps = (ew * 1e4).clip(lower=floor_bps)
+    return sigma_bps
+
+# ----------------------------- Schedule Builder -----------------------------
+def build_schedule(cfg: Config, bars: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build per-bar target quantities for TWAP/VWAP over a horizon of cfg.minutes.
+    """
+    # Choose the starting index
+    bars = bars.copy()
+    start_idx = cfg.start_offset_min
+    # Determine how many rows correspond to horizon, given actual interval
+    dt = (bars.index[1] - bars.index[0])
+    bar_minutes = int(round(dt.total_seconds() / 60.0))
+    if bar_minutes <= 0:
+        bar_minutes = 1
+    n_slices = max(1, cfg.minutes // bar_minutes)
+
+    window = bars.iloc[start_idx:start_idx + n_slices].copy()
+    if window.empty or len(window) < 1:
+        raise RuntimeError("Chosen minutes/start_offset exceed available intraday window.")
+
+    # weights
+    if cfg.strategy.lower() == "twap":
+        w = pd.Series(1.0, index=window.index)
+        w = w / w.sum()
+    elif cfg.strategy.lower() == "vwap":
+        w = volume_curve_weights(window)
+    else:
+        raise ValueError("strategy must be 'twap' or 'vwap'")
+
+    window["target_qty"] = cfg.qty * w
+
+    # auxiliary features
+    window["Mid"] = (window["High"] + window["Low"]) / 2.0
+    window["HalfSpread"] = window["Mid"] * (cfg.spread_bps * 0.0001) / 2.0
+    window["Sigma_bps"] = bar_volatility_ewma(window, cfg.vol_span, cfg.vol_floor_bps)  # bps per bar
+    return window
+
+# ----------------------------- ADV estimate -----------------------------
+def estimate_ADV(bars: pd.DataFrame, n_days: int = 20) -> float:
+    """
+    Simple ADV estimate from last n_days of daily volume using intraday bars.
+    """
+    # Resample to daily sum of volume
+    daily = bars["Volume"].resample("1D").sum()
+    adv = float(daily.tail(n_days).mean()) if daily.shape[0] else float(bars["Volume"].mean() * 390)
+    return max(adv, 1.0)
+
+# ----------------------------- Execution Engine -----------------------------
+def simulate_exec(cfg: Config, window: pd.DataFrame, adv_est: float) -> pd.DataFrame:
+    """
+    Step through each bar. Enforce participation cap, price each child with spread + impact.
+    Impact model:
+       temp = k_temp * (child / max(1, bar_vol))^alpha * (sigma_bps/1e4) * Mid
+       perm = k_perm * (cum_exec / ADV) * Mid
+       fill = Mid ± HalfSpread ± temp ± perm   (± based on side)
+    """
+    side = cfg.side.lower()
+    sgn = 1.0 if side == "buy" else -1.0
+    if side not in ("buy", "sell"):
+        raise ValueError("side must be 'buy' or 'sell'")
+
+    remaining = cfg.qty
+    rows = []
+    cum_exec = 0.0
+    arrival_mid = float(window["Mid"].iloc[0])
+
+    for ts, row in window.iterrows():
+        if remaining <= 0:
+            # after completion, we still log zero slices to keep shape if desired
+            rows.append({
+                "time": ts, "bar_vol": float(row["Volume"]), "target": 0.0, "child": 0.0,
+                "mid": float(row["Mid"]), "half_spread": float(row["HalfSpread"]),
+                "sigma_bps": float(row["Sigma_bps"]), "fill_px": np.nan, "cum_exec": cum_exec
+            })
+            continue
+
+        bar_vol = float(row["Volume"])
+        target = float(row["target_qty"])
+
+        # Participation cap
+        cap_qty = cfg.participation * bar_vol
+        child = min(target, cap_qty, remaining)
+        if child <= 0 or bar_vol <= 0:
+            rows.append({
+                "time": ts, "bar_vol": bar_vol, "target": target, "child": 0.0,
+                "mid": float(row["Mid"]), "half_spread": float(row["HalfSpread"]),
+                "sigma_bps": float(row["Sigma_bps"]), "fill_px": np.nan, "cum_exec": cum_exec
+            })
+            continue
+
+        # Impact pieces
+        ratio = min(1.0, child / max(1.0, bar_vol))
+        temp = cfg.k_temp * (ratio ** cfg.alpha) * (row["Sigma_bps"] * 1e-4) * row["Mid"]
+        perm = cfg.k_perm * (cum_exec / max(1.0, adv_est)) * row["Mid"]
+
+        # Fill price (buy => pay +; sell => receive -)
+        fill_px = row["Mid"] + sgn * (row["HalfSpread"] + temp + perm)
+
+        # Update execution state
+        cum_exec += child
+        remaining -= child
+
+        rows.append({
+            "time": ts,
+            "bar_vol": bar_vol,
+            "target": target,
+            "child": child,
+            "mid": float(row["Mid"]),
+            "half_spread": float(row["HalfSpread"]),
+            "sigma_bps": float(row["Sigma_bps"]),
+            "temp_impact": float(temp),
+            "perm_impact": float(perm),
+            "fill_px": float(fill_px),
+            "cum_exec": float(cum_exec),
+            "remaining": float(remaining)
+        })
+
+    out = pd.DataFrame(rows).set_index("time")
+
+    # KPIs
+    # Implementation shortfall vs arrival mid:
+    if side == "buy":
+        exec_avg = float(np.average(out["fill_px"].dropna(), weights=out["child"].replace(0, np.nan)))
+        shortfall = (exec_avg - arrival_mid) / arrival_mid * 1e4  # bps
+    else:
+        exec_avg = float(np.average(out["fill_px"].dropna(), weights=out["child"].replace(0, np.nan)))
+        shortfall = (arrival_mid - exec_avg) / arrival_mid * 1e4  # bps
+
+    out.attrs["arrival_mid"] = arrival_mid
+    out.attrs["exec_avg"] = exec_avg
+    out.attrs["shortfall_bps"] = shortfall
+    out.attrs["completed_qty"] = float(out["child"].sum())
+    out.attrs["completion_pct"] = 100.0 * out.attrs["completed_qty"] / cfg.qty
+    return out
+
+# ----------------------------- I/O -----------------------------
+def save_outputs(slices: pd.DataFrame, cfg: Config):
+    os.makedirs(os.path.dirname(cfg.out_csv) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(cfg.out_json) or ".", exist_ok=True)
+
+    # CSV
+    slices.to_csv(cfg.out_csv, index=True, date_format="%Y-%m-%d %H:%M:%S")
+
+    # JSON summary
+    summary = {
+        "config": asdict(cfg),
+        "arrival_mid": slices.attrs.get("arrival_mid"),
+        "exec_avg": slices.attrs.get("exec_avg"),
+        "shortfall_bps": slices.attrs.get("shortfall_bps"),
+        "completed_qty": slices.attrs.get("completed_qty"),
+        "completion_pct": slices.attrs.get("completion_pct"),
+        "slices": int(slices.shape[0])
+    }
+    with open(cfg.out_json, "w") as f:
+        json.dump(summary, f, indent=2)
+
+    print(f"[OK] Saved slices → {cfg.out_csv}")
+    print(f"[OK] Saved summary → {cfg.out_json}")
+    print(f"Arrival mid: {summary['arrival_mid']:.6f} | Exec avg: {summary['exec_avg']:.6f} | Shortfall: {summary['shortfall_bps']:.2f} bps")
+    print(f"Completed: {summary['completed_qty']:.2f} ({summary['completion_pct']:.1f}%) across {summary['slices']} slices")
+
+# ----------------------------- CLI -----------------------------
+def parse_args() -> Config:
+    p = argparse.ArgumentParser(description="Level-44: Execution Simulator (TWAP/VWAP)")
+    p.add_argument("--symbol", type=str, default="SPY")
+    p.add_argument("--side", type=str, default="buy", choices=["buy", "sell"])
+    p.add_argument("--qty", type=float, default=50000)
+    p.add_argument("--minutes", type=int, default=120)
+    p.add_argument("--strategy", type=str, default="twap", choices=["twap", "vwap"])
+    p.add_argument("--interval", type=str, default="1m", choices=["1m", "5m"])
+    p.add_argument("--lookback-days", type=int, default=5)
+    p.add_argument("--start-offset-min", type=int, default=0)
+    p.add_argument("--participation", type=float, default=0.10)
+    p.add_argument("--spread-bps", type=float, default=2.0)
+    p.add_argument("--k-temp", type=float, default=0.30)
+    p.add_argument("--alpha", type=float, default=0.60)
+    p.add_argument("--k-perm", type=float, default=0.02)
+    p.add_argument("--vol-span", type=int, default=20)
+    p.add_argument("--vol-floor-bps", type=float, default=5.0)
+    p.add_argument("--csv", type=str, default="level44_exec_slices.csv")
+    p.add_argument("--json", type=str, default="level44_exec_summary.json")
+    p.add_argument("--seed", type=int, default=42)
+    a = p.parse_args()
+    return Config(
+        symbol=a.symbol, side=a.side, qty=a.qty, minutes=a.minutes, strategy=a.strategy,
+        interval=a.interval, lookback_days=a.lookback_days, start_offset_min=a.start_offset_min,
+        participation=a.participation, spread_bps=a.spread_bps, k_temp=a.k_temp, alpha=a.alpha,
+        k_perm=a.k_perm, vol_span=a.vol_span, vol_floor_bps=a.vol_floor_bps,
+        out_csv=a.csv, out_json=a.json, seed=a.seed
+    )
+
+# ----------------------------- Main -----------------------------
+def main():
+    cfg = parse_args()
+    np.random.seed(cfg.seed)
+
+    bars = load_intraday(cfg)
+    adv = estimate_ADV(bars, n_days=20)
+
+    window = build_schedule(cfg, bars)
+    slices = simulate_exec(cfg, window, adv_est=adv)
+    save_outputs(slices, cfg)
+
+if __name__ == "__main__":
+    # Jupyter/PyCharm cell shim: strip "-f kernel.json" etc.
+    import sys
+    sys.argv = [sys.argv[0]] + [arg for arg in sys.argv[1:]
+                                if arg != "-f" and not (arg.endswith(".json") and "kernel" in arg)]
+    main()
+```
+
+---
+
+### How to run quickly
+
+```bash
+# Activate your env, then:
+python level44_execution_sim.py --symbol SPY --side buy --qty 30000 --minutes 60 --strategy twap --participation 0.08
+```
+
+You’ll get:
+
+* `level44_exec_slices.csv` — each slice with target/child, bar volume, mid, spread/vol, temp/perm impact, fill_px, remaining, etc.
+* `level44_exec_summary.json` — arrival mid, average execution price, **implementation shortfall (bps)**, completion %.
+
+---
+
+### Practical tuning tips
+
+* **Participation**: 5–15% is common for liquid tickers; raise it only if you must finish faster.
+* **Spread**: set `--spread-bps` to your venue’s typical spread; ETFs often 1–3 bps; single names wider.
+* **Impact**: `k_temp, alpha` govern **temporary** impact convexity; `k_perm` for drift after you trade (use smaller).
+* **VWAP realism**: with only a few days of intraday, the minute-of-day median works well; pass **5m** for longer history.
+
+Want me to wire in **VPIN (Level-42)** or **Order-Book Imbalance (Level-43)** as **gating signals** (skip or halve child size on toxic bars) – or add a **VWAP-over-Multiple-Days** forecast model?
