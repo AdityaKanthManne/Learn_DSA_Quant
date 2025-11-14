@@ -1,0 +1,462 @@
+Here’s **Level-45** in the same “Level” style we’ve been using, with a **full, clean Python script** at the end.
+
+---
+
+# LEVEL-45 — Adaptive Lookback via Information Ratio Maximization
+
+### Description
+
+This level wraps a basic **time-series momentum rule** (long if recent return > 0, short if < 0) inside a **parameter optimizer** that automatically chooses the lookback window which maximizes the **Information Ratio (IR)** on a training period. It then reports out-of-sample performance on the remaining data, and exports both the **grid search table** and **final signal series**.
+
+### Objective
+
+Turn an arbitrary “pick a lookback by gut feel” SMA/momentum rule into a **data-driven, IR-maximizing** engine, while keeping the procedure transparent and simple enough to extend later (e.g., walk-forward or CPCV).
+
+---
+
+## DSA Concept (Detailed) — Grid Search + Time-Aware Cross-Validation
+
+The underlying DSA idea here is:
+
+1. **Parameter Grid Search**
+
+   * You define a grid of candidate lookback windows, e.g. `[10, 20, 60, 120, 252]`.
+   * For each lookback `L`, you:
+
+     * Build a simple momentum strategy:
+       `signal_t(L) = sign(Price_t / Price_{t-L} - 1)`.
+     * Run a **transaction-cost-aware** backtest on a **training slice** of data.
+     * Compute an **Information Ratio**:
+       [
+       IR(L) = \frac{\mu_L}{\sigma_L} \sqrt{252}
+       ]
+       where (\mu_L) and (\sigma_L) are the daily mean and standard deviation of strategy returns.
+
+   Data structure wise, this is just:
+
+   ```text
+   for L in lookback_grid:
+       returns_L = strategy(L)
+       ir_L = IR(returns_L[train_slice])
+   ```
+
+   Complexity is roughly (O(N \times |G|)) where (N) is number of days and (|G|) is grid size.
+
+2. **Time-Aware Cross-Validation (Folded IR)**
+   Standard K-fold CV assumes IID data, which is obviously wrong in finance and causes look-ahead leakage. Lopez-de-Prado addresses this with **purged cross-validation and embargo** for time series. ([Medium][1])
+
+   Here we implement a **simpler time-aware CV**:
+
+   * Split the **training portion** into `K` contiguous folds.
+   * For each fold, compute a local IR.
+   * Average those fold IRs → **CV-IR** score.
+
+   Pseudocode:
+
+   ```python
+   def cv_ir(returns, k):
+       n = len(returns)
+       fold_len = n // k
+       scores = []
+       for i in range(k):
+           start = i * fold_len
+           end = n if i == k-1 else (i+1) * fold_len
+           seg = returns.iloc[start:end]
+           scores.append(IR(seg))
+       return np.mean(scores)
+   ```
+
+   This is still (O(N \times |G| \times K)), but for small grids it’s trivial. Compared to full **walk-forward optimization**, this is a light-weight, research-friendly approximation. (For deeper walk-forward ideas see QuantConnect’s docs or AlgoTrading101’s explanation. ([QuantConnect][2]))
+
+3. **Model Selection and Overfitting Intuition**
+
+   * We pick the lookback (L^*) that maximizes **CV-IR** on training data.
+   * Then **freeze (L^*)** and evaluate performance on the out-of-sample test slice.
+   * This closely mirrors walk-forward parameter selection used in commercial platforms like TradeStation WFO or IBKR’s walk-forward analysis tools. ([TradeStation Help][3])
+   * In practice, you’d combine this with more robust techniques like **Purged / Combinatorial Purged CV** if you wrap this into a larger ML pipeline. ([Agorism][4])
+
+This level is basically a **hyperparameter tuner** specialized to **lookback length** for momentum rules.
+
+---
+
+## Quant / ML Model
+
+* Base strategy: **time-series momentum** on a single asset:
+
+  * Compute `L`-day momentum as simple percentage change.
+  * If momentum > 0 → **long**; if < 0 → **short**; else flat.
+* Execution rule:
+
+  * Daily rebalance using yesterday’s signal (no look-ahead).
+* Objective:
+
+  * Maximize **Information Ratio** on training data, using a time-aware fold split.
+* Extras:
+
+  * **Transaction costs** in bps per signal flip.
+  * **Buy-&-hold baseline** for comparison.
+
+---
+
+## Real-Time Implementation Scope
+
+* Daily bar model (EOD) for a single symbol (default `SPY`).
+* Typical flow:
+
+  1. Run tuner each month / quarter on a trailing window (e.g., last 5–10 years).
+  2. Export best lookback + signals CSV.
+  3. Use best lookback going forward until next retune.
+* Extension: you can embed this inside a more advanced walk-forward scheme or CPCV engine later.
+
+---
+
+## Free Data / APIs
+
+* **yfinance** – daily OHLCV for SPY, QQQ, etc.
+* Can be easily swapped for:
+
+  * **Stooq** CSVs,
+  * **Kaggle** static datasets.
+
+---
+
+## External Links (for learning)
+
+These show **lookback sensitivity** and **walk-forward tuning** in the wild:
+
+* Walk-Forward Optimization explainer — AlgoTrading101 ([Algo Trading 101][5])
+* Walk-Forward Optimization docs — QuantConnect ([QuantConnect][2])
+* Walk-Forward Analysis deep dive — IBKR Quant News ([Interactive Brokers][6])
+* Pitfalls of standard CV in finance + purging & embargo (Lopez-de-Prado) ([Medium][1])
+* Optimal lookback for momentum (examples, sensitivity) ([Seeking Alpha][7])
+
+---
+
+## Deliverables
+
+* `level45_adaptive_lookback_signals.csv`
+  Full time series: close, returns, signal, strategy returns, equity curve, buy-&-hold equity.
+* `level45_adaptive_lookback_grid.csv`
+  Grid search table: lookback, train IR, CV-IR, test IR, train/test CAGR & Sharpe, MaxDD.
+* `level45_adaptive_lookback_summary.json`
+  Config, selected lookback, and key KPIs.
+
+Difficulty: **Intermediate**
+Build time: **~3h** including tuning / experiments.
+
+---
+
+# FULL PYTHON CODE — Level-45 Adaptive Lookback Engine
+
+```python
+# level45_adaptive_lookback_ir.py
+# Level-45: Adaptive lookback via Information Ratio maximization.
+# - Single-asset time-series momentum
+# - Grid search over lookback windows
+# - Time-aware K-fold IR on train, plus test IR
+# - TC-aware backtest
+#
+# Example:
+#   python level45_adaptive_lookback_ir.py --symbol SPY --lookbacks 10 20 60 120 252
+#   python level45_adaptive_lookback_ir.py --symbol QQQ --tc-bps 5 --train-frac 0.8
+
+import os
+import json
+import argparse
+from dataclasses import dataclass, asdict
+from typing import List, Dict, Tuple
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+import matplotlib.pyplot as plt
+
+
+# ----------------------------- Config -----------------------------
+@dataclass
+class Config:
+    symbol: str = "SPY"
+    start: str = "2010-01-01"
+    lookbacks: List[int] = None
+    tc_bps: float = 10.0
+    train_frac: float = 0.7
+    n_folds: int = 4
+    out_signals_csv: str = "level45_adaptive_lookback_signals.csv"
+    out_grid_csv: str = "level45_adaptive_lookback_grid.csv"
+    out_json: str = "level45_adaptive_lookback_summary.json"
+
+
+# ----------------------------- Data Loader -----------------------------
+def load_data(cfg: Config) -> pd.DataFrame:
+    df = yf.download(cfg.symbol, start=cfg.start, auto_adjust=True, progress=False)
+    if df.empty:
+        raise RuntimeError("No data downloaded. Check symbol/start date/internet.")
+    df = df[["Close"]].rename(columns={"Close": "close"})
+    df["ret"] = df["close"].pct_change().fillna(0.0)
+    return df.dropna()
+
+
+# ----------------------------- Helpers -----------------------------
+def information_ratio(returns: pd.Series, ann_factor: int = 252) -> float:
+    """Annualized IR (Sharpe) for a stream of daily returns."""
+    if returns is None or len(returns) < 2:
+        return 0.0
+    mu = returns.mean()
+    sigma = returns.std()
+    if sigma <= 0:
+        return 0.0
+    return float(mu / sigma * np.sqrt(ann_factor))
+
+
+def kpi_summary(returns: pd.Series, ann_factor: int = 252) -> Dict[str, float]:
+    """Return CAGR, Sharpe, Max Drawdown for a daily return series."""
+    if returns is None or len(returns) < 2:
+        return {"cagr": 0.0, "sharpe": 0.0, "maxdd": 0.0}
+    equity = (1.0 + returns).cumprod()
+    n = len(equity)
+    if n <= 1:
+        cagr = 0.0
+    else:
+        cagr = float(equity.iloc[-1] ** (ann_factor / n) - 1.0)
+    sharpe = information_ratio(returns, ann_factor=ann_factor)
+    dd = equity / equity.cummax() - 1.0
+    maxdd = float(dd.min()) if len(dd) else 0.0
+    return {"cagr": cagr, "sharpe": sharpe, "maxdd": maxdd}
+
+
+def time_fold_ir(returns: pd.Series, n_folds: int = 4, ann_factor: int = 252) -> float:
+    """
+    Simple time-aware K-fold IR:
+    - Split returns into contiguous folds in time
+    - Compute IR per fold
+    - Return average IR
+    """
+    returns = returns.dropna()
+    n = len(returns)
+    if n < n_folds * 20:  # too short; just use global IR
+        return information_ratio(returns, ann_factor=ann_factor)
+
+    fold_len = n // n_folds
+    irs = []
+    for k in range(n_folds):
+        start = k * fold_len
+        end = n if k == n_folds - 1 else (k + 1) * fold_len
+        seg = returns.iloc[start:end]
+        if len(seg) < 5:
+            continue
+        ir_k = information_ratio(seg, ann_factor=ann_factor)
+        irs.append(ir_k)
+    if not irs:
+        return information_ratio(returns, ann_factor=ann_factor)
+    return float(np.mean(irs))
+
+
+# ----------------------------- Strategy Engine -----------------------------
+def build_strategy_returns(df: pd.DataFrame, lookback: int, cfg: Config) -> Tuple[pd.Series, pd.Series]:
+    """
+    Time-series momentum:
+      - Compute L-day momentum
+      - signal_t = sign(momentum_t)
+      - strategy_ret_t = signal_{t-1} * ret_t - TC_t
+    """
+    mom = df["close"].pct_change(lookback)
+    signal = np.sign(mom)
+    # Treat zeros and NaNs as flat
+    signal = signal.replace(0, 0).fillna(0.0)
+    signal = signal.ffill().fillna(0.0)
+
+    flip = signal.diff().abs().fillna(0.0)
+    tc = flip * (cfg.tc_bps * 1e-4)
+
+    strat_ret = signal.shift(1).fillna(0.0) * df["ret"] - tc
+    strat_ret.name = f"strat_L{lookback}"
+    return strat_ret, signal
+
+
+# ----------------------------- Tuning Engine -----------------------------
+def tune_lookback(df: pd.DataFrame, cfg: Config) -> Tuple[int, pd.DataFrame]:
+    """
+    For each lookback in cfg.lookbacks:
+      - Build strategy returns
+      - Compute train IR, CV-IR, test IR + KPIs
+    Returns best lookback (by CV-IR) and the full grid DataFrame.
+    """
+    n = len(df)
+    split_idx = int(n * cfg.train_frac)
+    if split_idx <= 0 or split_idx >= n:
+        raise ValueError("train_frac leads to empty train/test split.")
+
+    grid_rows = []
+
+    for L in cfg.lookbacks:
+        strat_ret, _ = build_strategy_returns(df, L, cfg)
+
+        train_ret = strat_ret.iloc[:split_idx]
+        test_ret = strat_ret.iloc[split_idx:]
+
+        ir_train = information_ratio(train_ret)
+        ir_cv = time_fold_ir(train_ret, n_folds=cfg.n_folds)
+        ir_test = information_ratio(test_ret) if len(test_ret) > 10 else np.nan
+
+        train_kpi = kpi_summary(train_ret)
+        test_kpi = kpi_summary(test_ret) if len(test_ret) > 10 else {
+            "cagr": np.nan, "sharpe": np.nan, "maxdd": np.nan
+        }
+
+        grid_rows.append({
+            "lookback": L,
+            "ir_train": ir_train,
+            "ir_cv": ir_cv,
+            "ir_test": ir_test,
+            "cagr_train": train_kpi["cagr"],
+            "sharpe_train": train_kpi["sharpe"],
+            "maxdd_train": train_kpi["maxdd"],
+            "cagr_test": test_kpi["cagr"],
+            "sharpe_test": test_kpi["sharpe"],
+            "maxdd_test": test_kpi["maxdd"]
+        })
+
+    grid = pd.DataFrame(grid_rows).set_index("lookback").sort_index()
+    best_L = int(grid["ir_cv"].idxmax())
+    return best_L, grid
+
+
+# ----------------------------- Outputs -----------------------------
+def save_outputs(
+    df_signals: pd.DataFrame,
+    grid: pd.DataFrame,
+    cfg: Config,
+    best_L: int,
+    strat_ret: pd.Series,
+    bh_ret: pd.Series
+):
+    # Ensure output directories exist
+    os.makedirs(os.path.dirname(cfg.out_signals_csv) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(cfg.out_grid_csv) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(cfg.out_json) or ".", exist_ok=True)
+
+    df_signals.to_csv(cfg.out_signals_csv, index=True, date_format="%Y-%m-%d")
+    grid.to_csv(cfg.out_grid_csv, index=True)
+
+    # Global KPIs
+    strat_kpi = kpi_summary(strat_ret)
+    bh_kpi = kpi_summary(bh_ret)
+
+    summary = {
+        "config": asdict(cfg),
+        "best_lookback": best_L,
+        "grid_top": grid.sort_values("ir_cv", ascending=False).head(5).to_dict(orient="index"),
+        "strategy_kpi": strat_kpi,
+        "buyhold_kpi": bh_kpi
+    }
+
+    with open(cfg.out_json, "w") as f:
+        json.dump(summary, f, indent=2)
+
+    print(f"[OK] Saved signals → {cfg.out_signals_csv}")
+    print(f"[OK] Saved grid    → {cfg.out_grid_csv}")
+    print(f"[OK] Saved summary → {cfg.out_json}")
+    print(f"Selected lookback L* = {best_L}")
+    print(f"Strategy CAGR: {strat_kpi['cagr']:.2%}, Sharpe: {strat_kpi['sharpe']:.2f}")
+    print(f"Buy&Hold  CAGR: {bh_kpi['cagr']:.2%}, Sharpe: {bh_kpi['sharpe']:.2f}")
+
+
+# ----------------------------- CLI -----------------------------
+def parse_args() -> Config:
+    p = argparse.ArgumentParser(
+        description="Level-45: Adaptive lookback selection via Information Ratio maximization."
+    )
+    p.add_argument("--symbol", type=str, default="SPY")
+    p.add_argument("--start", type=str, default="2010-01-01")
+    p.add_argument(
+        "--lookbacks", type=int, nargs="+",
+        default=[10, 20, 60, 120, 252],
+        help="List of candidate lookback windows (in trading days)."
+    )
+    p.add_argument("--tc-bps", type=float, default=10.0,
+                   help="Round-trip transaction cost in basis points.")
+    p.add_argument("--train-frac", type=float, default=0.7,
+                   help="Fraction of data used for training / tuning.")
+    p.add_argument("--n-folds", type=int, default=4,
+                   help="Number of contiguous folds for time-aware CV on train set.")
+    p.add_argument("--signals-csv", type=str,
+                   default="level45_adaptive_lookback_signals.csv")
+    p.add_argument("--grid-csv", type=str,
+                   default="level45_adaptive_lookback_grid.csv")
+    p.add_argument("--json", type=str,
+                   default="level45_adaptive_lookback_summary.json")
+
+    a = p.parse_args()
+    return Config(
+        symbol=a.symbol,
+        start=a.start,
+        lookbacks=a.lookbacks,
+        tc_bps=a.tc_bps,
+        train_frac=a.train_frac,
+        n_folds=a.n_folds,
+        out_signals_csv=a.signals_csv,
+        out_grid_csv=a.grid_csv,
+        out_json=a.json
+    )
+
+
+# ----------------------------- Main -----------------------------
+def main():
+    cfg = parse_args()
+    df = load_data(cfg)
+
+    # Tune lookback
+    best_L, grid = tune_lookback(df, cfg)
+
+    # Build final strategy using best lookback
+    strat_ret, signal = build_strategy_returns(df, best_L, cfg)
+    equity_strat = (1.0 + strat_ret).cumprod()
+
+    bh_ret = df["ret"]
+    equity_bh = (1.0 + bh_ret).cumprod()
+
+    # Build output DF
+    out = pd.DataFrame({
+        "close": df["close"],
+        "ret": df["ret"],
+        f"signal_L{best_L}": signal,
+        f"strat_ret_L{best_L}": strat_ret,
+        "equity_strat": equity_strat,
+        "equity_buyhold": equity_bh,
+    })
+
+    save_outputs(out, grid, cfg, best_L, strat_ret, bh_ret)
+
+    # Plot equity curves
+    equity_strat.plot(label="Strategy", linewidth=1.2)
+    equity_bh.plot(label="Buy & Hold", linewidth=1.0)
+    plt.title(f"Level-45: Adaptive Lookback IR | {cfg.symbol} (L*={best_L})")
+    plt.legend()
+    plt.xlabel("Date")
+    plt.ylabel("Equity (Starting at 1.0)")
+    plt.tight_layout()
+    plt.show()
+
+
+if __name__ == "__main__":
+    # Jupyter / IPython shim: strip kernel args like "-f kernel-xxxx.json"
+    import sys
+    sys.argv = [sys.argv[0]] + [
+        arg for arg in sys.argv[1:]
+        if arg != "-f" and not (arg.endswith(".json") and "kernel" in arg)
+    ]
+    main()
+```
+
+If you want, next we can:
+
+* Wrap this into a **walk-forward retuning** loop (re-optimize every X months), or
+* Turn Level-45 into a **generic tuner** that any of the earlier momentum/mean-reversion rules can plug into.
+
+[1]: https://bhakta-works.medium.com/the-pitfalls-of-standard-cross-validation-in-financial-machine-learning-aec03f672179?utm_source=chatgpt.com "The Pitfalls of Standard Cross-Validation in Financial Machine ..."
+[2]: https://www.quantconnect.com/docs/v2/writing-algorithms/optimization/walk-forward-optimization?utm_source=chatgpt.com "Walk Forward Optimization"
+[3]: https://help.tradestation.com/09_01/tswfo/topics/about_wfo.htm?utm_source=chatgpt.com "About the TradeStation Walk-Forward Optimizer"
+[4]: https://agorism.dev/book/finance/ml/Marcos%20Lopez%20de%20Prado%20-%20Advances%20in%20Financial%20Machine%20Learning-Wiley%20%282018%29.pdf?utm_source=chatgpt.com "Advances in Financial Machine Learning"
+[5]: https://algotrading101.com/learn/walk-forward-optimization/?utm_source=chatgpt.com "What is a Walk-Forward Optimization and How to Run It?"
+[6]: https://www.interactivebrokers.com/campus/ibkr-quant-news/the-future-of-backtesting-a-deep-dive-into-walk-forward-analysis/?utm_source=chatgpt.com "The Future of Backtesting: A Deep Dive into Walk Forward ..."
+[7]: https://seekingalpha.com/article/4240540-optimal-lookback-period-for-momentum-strategies?utm_source=chatgpt.com "Optimal Lookback Period For Momentum Strategies"
