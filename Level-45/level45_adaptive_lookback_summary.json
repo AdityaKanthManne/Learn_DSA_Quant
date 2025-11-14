@@ -1,0 +1,87 @@
+{
+  "config": {
+    "symbol": "SPY",
+    "start": "2010-01-01",
+    "lookbacks": [
+      10,
+      20,
+      60,
+      120,
+      252
+    ],
+    "tc_bps": 10.0,
+    "train_frac": 0.7,
+    "n_folds": 4,
+    "out_signals_csv": "level45_adaptive_lookback_signals.csv",
+    "out_grid_csv": "level45_adaptive_lookback_grid.csv",
+    "out_json": "level45_adaptive_lookback_summary.json"
+  },
+  "best_lookback": 10,
+  "grid_top": {
+    "10": {
+      "ir_train": 0.0,
+      "ir_cv": 0.0,
+      "ir_test": 0.0,
+      "cagr_train": 0.0,
+      "sharpe_train": 0.0,
+      "maxdd_train": 0.0,
+      "cagr_test": 0.0,
+      "sharpe_test": 0.0,
+      "maxdd_test": 0.0
+    },
+    "20": {
+      "ir_train": 0.0,
+      "ir_cv": 0.0,
+      "ir_test": 0.0,
+      "cagr_train": 0.0,
+      "sharpe_train": 0.0,
+      "maxdd_train": 0.0,
+      "cagr_test": 0.0,
+      "sharpe_test": 0.0,
+      "maxdd_test": 0.0
+    },
+    "60": {
+      "ir_train": 0.0,
+      "ir_cv": 0.0,
+      "ir_test": 0.0,
+      "cagr_train": 0.0,
+      "sharpe_train": 0.0,
+      "maxdd_train": 0.0,
+      "cagr_test": 0.0,
+      "sharpe_test": 0.0,
+      "maxdd_test": 0.0
+    },
+    "120": {
+      "ir_train": 0.0,
+      "ir_cv": 0.0,
+      "ir_test": 0.0,
+      "cagr_train": 0.0,
+      "sharpe_train": 0.0,
+      "maxdd_train": 0.0,
+      "cagr_test": 0.0,
+      "sharpe_test": 0.0,
+      "maxdd_test": 0.0
+    },
+    "252": {
+      "ir_train": 0.0,
+      "ir_cv": 0.0,
+      "ir_test": 0.0,
+      "cagr_train": 0.0,
+      "sharpe_train": 0.0,
+      "maxdd_train": 0.0,
+      "cagr_test": 0.0,
+      "sharpe_test": 0.0,
+      "maxdd_test": 0.0
+    }
+  },
+  "strategy_kpi": {
+    "cagr": 0.0,
+    "sharpe": 0.0,
+    "maxdd": 0.0
+  },
+  "buyhold_kpi": {
+    "cagr": 0.13918946048505498,
+    "sharpe": 0.8421573596396303,
+    "maxdd": -0.33717292536803123
+  }
+}
