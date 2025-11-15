@@ -1,0 +1,442 @@
+Here’s **Level-46 — Feature Stationarity Checker & Demeaning Pipeline**, with the detailed DSA concept, external links, and a full, Jupyter-safe Python script.
+
+---
+
+## Model #46 — Feature Stationarity Checker & Demeaning Pipeline
+
+**Description:**
+Build a reusable module that **checks stationarity of features** (returns, spreads, technical indicators, macro factors) and **automatically applies simple transformations** (demean, log, differencing, z-score) so that downstream ML models see “health-checked” features.
+
+**Objective:**
+Before you feed anything into Models 21–24 (meta-labeling RF/GBM/stacks), you want to **know which features are non-stationary, how severe it is, and what transformation improves them**. This model produces both a **stationarity report** and a **transformed feature dataset** you can plug into any supervised pipeline.
+
+---
+
+### DSA Concept (in detail)
+
+**Core idea:**
+You have a matrix of features (X \in \mathbb{R}^{T \times N}) (T time steps, N features). For each column (feature) you:
+
+1. Run **two statistical tests**:
+
+   * **ADF (Augmented Dickey-Fuller)**: null hypothesis = *series has a unit root (non-stationary)*, so a **small p-value → we reject the null → more likely stationary**. ([Machine Learning Plus][1])
+   * **KPSS (Kwiatkowski–Phillips–Schmidt–Shin)**: null hypothesis = *series is stationary around a trend/level*, so a **small p-value → we reject the null → more likely non-stationary**. ([Machine Learning Plus][2])
+
+   Using both in combination (“ADF says stationary + KPSS says stationary”) gives a more robust classification than either alone. ([Python in Plain English][3])
+
+2. Decide a **stationarity label** per feature:
+
+   * ADF rejects & KPSS does *not* reject → **“stationary”**
+   * ADF does *not* reject & KPSS rejects → **“clearly non-stationary (trend/unit-root)”**
+   * Mixed/ambiguous → **“borderline”**
+
+3. Choose a **transformation**:
+
+   * For *price-like* or *level-like* series (e.g. close, macro level, index):
+
+     * 1st difference or log-return:
+       [
+       x'*t = \log(x_t) - \log(x*{t-1}) \quad \text{or} \quad x'*t = x_t - x*{t-1}
+       ]
+   * For already stationary-ish indicators (returns, spreads):
+
+     * **demean and z-score**:
+       [
+       z_t = \frac{x_t - \mu}{\sigma}
+       ]
+   * Optionally run ADF/KPSS again on transformed series to confirm improvement.
+
+4. **Z-score / demeaning pipeline:**
+
+   * For each column, compute rolling or full-sample mean and std, then transform to z-scores (this is a simple **linear transform + normalization**, O(T) per feature).
+   * This is conceptually a **map over columns** (each feature is processed independently, no cross-talk required).
+
+---
+
+### Data-Structures & Algorithms View
+
+* Your feature matrix is a **2D array / DataFrame**:
+
+  * Shape: `(T, N)` → T up to 10⁴–10⁵, N maybe 10–200.
+  * We treat each **column as a 1D time series**.
+
+* **Stationarity tests loop:**
+
+  * Pseudocode:
+
+    ```python
+    for col in features:
+        series = df[col].dropna()
+        adf_p = adfuller(series)[1]
+        kpss_p = kpss(series, regression="c")[1]
+        # classify and store
+    ```
+  * Complexity:
+
+    * ADF/KPSS each cost about **O(T)** (they’re regression-style tests).
+    * Over N features: **O(N · T)** time, **O(T)** memory per feature (we reuse objects).
+
+* **Vectorized transforms:**
+
+  * Demeaning, differencing, z-scoring use fast vectorized ops:
+
+    * `df.diff()`, `np.log(df)`, `(df - df.mean()) / df.std()`.
+  * These are also **O(N · T)** but use optimized C/NumPy routines.
+
+* **Data structures used:**
+
+  * `pandas.DataFrame` for features.
+  * A **list of dicts** to accumulate per-feature results, then turned into a report `DataFrame`.
+  * Everything is **column-oriented** and cache-friendly.
+
+This is exactly the kind of **preprocessing pipeline** used in real quant research stacks (e.g., Hudson & Thames’ work on stationarity and fractional differentiation; ML-for-trading books/courses). ([Hudson Thames][4])
+
+---
+
+### Real-Time Implementation Scope
+
+* Run this script:
+
+  * **Whenever you update features** (daily/weekly).
+  * **Before training** any supervised models (RF/GBM/LSTM, etc.).
+* Outputs:
+
+  * `level46_stationarity_report.csv` — summary of ADF/KPSS and recommended transforms.
+  * `level46_features_raw.csv` — raw feature matrix.
+  * `level46_features_transformed.csv` — transformed feature matrix (more stationary).
+
+---
+
+### External Links (to learn & see similar pipelines)
+
+Good articles & resources that use similar **stationarity-check + transform** pipelines in trading / time-series:
+
+1. **QuantInsti – “Stationarity in Time Series”** (quant trading focused explanation of stationarity & why it matters). ([QuantInsti Blog][5])
+2. **LuxAlgo – “Data Preprocessing for Algo Trading”** (talks about transformations and making data model-ready). ([LuxAlgo][6])
+3. **Statsmodels official example – Stationarity and detrending (ADF/KPSS)** (practical notebook). ([Statsmodels][7])
+4. **MachineLearningPlus – ADF & KPSS guides** (very clear explanation and Python examples). ([Machine Learning Plus][1])
+5. **Amberdata – Crypto Pairs Trading Part 2 (ADF for mean reversion)** (shows ADF in a trading context). ([Amberdata Blog][8])
+6. **InsiderFinance / Medium – Stationarity for traders & how to transform your data** (trader-friendly walk-through). ([InsiderFinance Wire][9])
+
+---
+
+## Level-46 Python Script
+
+**Feature Stationarity Checker & Demeaning Pipeline**
+
+* Uses `yfinance` by default to demo on a single symbol (SPY) and a few simple features.
+* You can **swap the data-loader** to point at your `features.csv` (commented in code).
+* Runs **ADF + KPSS** per feature, classifies them, applies transformations, and writes 3 CSVs.
+* Safe to run in **Jupyter** or as a **CLI** script (we strip `-f ...` kernel args).
+
+```python
+#!/usr/bin/env python
+"""
+Level-46 — Feature Stationarity Checker & Demeaning Pipeline
+
+- Loads time-series features (default: derived from SPY daily prices via yfinance)
+- Runs ADF + KPSS tests for each feature
+- Classifies features as stationary / non-stationary / borderline
+- Applies simple transformations (diff/logdiff + z-score) to improve stationarity
+- Saves:
+    * level46_features_raw.csv
+    * level46_features_transformed.csv
+    * level46_stationarity_report.csv
+"""
+
+import argparse
+import json
+import sys
+from dataclasses import dataclass, asdict
+from typing import Dict, Tuple, List
+
+import numpy as np
+import pandas as pd
+
+import yfinance as yf
+from statsmodels.tsa.stattools import adfuller, kpss
+
+
+# ---------------------- Config ---------------------- #
+
+@dataclass
+class Config:
+    symbol: str = "SPY"
+    start: str = "2010-01-01"
+    adf_alpha: float = 0.05
+    kpss_alpha: float = 0.05
+    out_raw_csv: str = "level46_features_raw.csv"
+    out_transformed_csv: str = "level46_features_transformed.csv"
+    out_report_csv: str = "level46_stationarity_report.csv"
+    out_report_json: str = "level46_stationarity_report.json"
+    max_diff_order: int = 1  # we keep it simple: at most 1 difference
+    dropna_after_transform: bool = True
+
+
+# ---------------------- Helpers ---------------------- #
+
+def load_price_data(cfg: Config) -> pd.DataFrame:
+    """
+    Load daily OHLCV data for cfg.symbol from yfinance and build a basic feature matrix.
+
+    You can replace this with your own feature CSV, e.g.:
+
+        df = pd.read_csv("features.csv", parse_dates=["timestamp"], index_col="timestamp")
+
+    expected: DateTimeIndex, numeric feature columns
+    """
+    df = yf.download(cfg.symbol, start=cfg.start, auto_adjust=True, progress=False)
+    if df.empty:
+        raise RuntimeError(f"Failed to load data for symbol={cfg.symbol}")
+    df = df[["Close", "Volume"]].rename(columns={"Close": "close", "Volume": "volume"})
+    df = df.dropna()
+
+    # Build simple features:
+    #   - log returns
+    #   - rolling volatility
+    #   - moving averages / spreads
+    df["ret_1"] = np.log(df["close"]).diff()
+    df["ret_5"] = np.log(df["close"]).diff(5)
+    df["sma_20"] = df["close"].rolling(20).mean()
+    df["sma_50"] = df["close"].rolling(50).mean()
+    df["sma_spread"] = df["sma_20"] - df["sma_50"]
+    df["rv_20"] = df["ret_1"].rolling(20).std()
+    df["log_vol"] = np.log(df["volume"])
+
+    return df.dropna()
+
+
+def safe_adf(series: pd.Series) -> Tuple[float, float]:
+    """Run ADF and return (statistic, p-value), handling short series gracefully."""
+    s = series.dropna()
+    if len(s) < 20:
+        return np.nan, np.nan
+    stat, pval, *_ = adfuller(s, autolag="AIC")
+    return float(stat), float(pval)
+
+
+def safe_kpss(series: pd.Series, regression: str = "c") -> Tuple[float, float]:
+    """
+    Run KPSS and return (statistic, p-value). Handle failures (e.g., constant series)
+    by returning NaNs.
+    """
+    s = series.dropna()
+    if len(s) < 20:
+        return np.nan, np.nan
+    try:
+        stat, pval, *_ = kpss(s, regression=regression, nlags="auto")
+        return float(stat), float(pval)
+    except Exception:
+        return np.nan, np.nan
+
+
+def classify_stationarity(
+    adf_p: float,
+    kpss_p: float,
+    adf_alpha: float,
+    kpss_alpha: float,
+) -> str:
+    """
+    Modeled on “ADF + KPSS combo” logic:
+
+    - ADF rejects (p < alpha) & KPSS does NOT reject (p >= alpha) → Stationary
+    - ADF does NOT reject & KPSS rejects → Clearly non-stationary
+    - Else → Borderline / Inconclusive
+    """
+    adf_reject = (not np.isnan(adf_p)) and (adf_p < adf_alpha)
+    kpss_reject = (not np.isnan(kpss_p)) and (kpss_p < kpss_alpha)
+
+    if adf_reject and not kpss_reject:
+        return "stationary"
+    elif (not adf_reject) and kpss_reject:
+        return "non_stationary"
+    elif adf_reject and kpss_reject:
+        return "mixed"
+    else:
+        return "borderline"
+
+
+def recommend_transform(col_name: str, label: str) -> str:
+    """
+    Very simple rule-based mapping:
+    - If looks like a price/level and non-stationary → log-diff
+    - If non-stationary and NOT clearly a price → 1st diff
+    - If stationary or borderline → zscore (demean/std)
+    """
+    name = col_name.lower()
+
+    # Basic heuristics for "price-like" series
+    price_like = any(
+        kw in name for kw in ["close", "price", "level", "index"]
+    )
+
+    if label == "non_stationary":
+        if price_like:
+            return "logdiff"
+        else:
+            return "diff"
+    elif label == "mixed":
+        # play it safe
+        return "diff"
+    else:
+        # stationary or borderline: standardize
+        return "zscore"
+
+
+def apply_transform(series: pd.Series, rule: str) -> pd.Series:
+    """Apply transformation rule to a single series."""
+    s = series.astype(float)
+
+    if rule == "logdiff":
+        s = np.log(s.replace(0, np.nan)).diff()
+    elif rule == "diff":
+        s = s.diff()
+    elif rule == "zscore":
+        # global (in-sample) z-score; for live use, prefer rolling or expanding
+        mu = s.mean()
+        sigma = s.std()
+        if sigma == 0 or np.isnan(sigma):
+            return s * 0.0
+        s = (s - mu) / sigma
+    elif rule == "none":
+        return s
+    else:
+        # unknown rule, fall back to identity
+        return s
+
+    return s
+
+
+def run_stationarity_pipeline(cfg: Config, df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Main logic:
+    - takes a DataFrame df with DateTimeIndex and numeric columns
+    - runs ADF & KPSS per column
+    - recommends & applies a transform
+    - returns (raw_df, transformed_df, report_df)
+    """
+    df = df.copy()
+    df = df.select_dtypes(include=[np.number])  # keep numeric columns only
+    df = df.sort_index()
+
+    report_rows: List[Dict] = {}
+    transformed = pd.DataFrame(index=df.index)
+
+    rows = []
+    for col in df.columns:
+        s = df[col]
+
+        adf_stat, adf_p = safe_adf(s)
+        kpss_stat, kpss_p = safe_kpss(s, regression="c")
+
+        label = classify_stationarity(adf_p, kpss_p, cfg.adf_alpha, cfg.kpss_alpha)
+        rule = recommend_transform(col, label)
+
+        t_series = apply_transform(s, rule)
+
+        rows.append({
+            "feature": col,
+            "adf_stat": adf_stat,
+            "adf_p": adf_p,
+            "kpss_stat": kpss_stat,
+            "kpss_p": kpss_p,
+            "stationarity_label": label,
+            "recommended_transform": rule,
+        })
+
+        transformed[col] = t_series
+
+    report_df = pd.DataFrame(rows).set_index("feature")
+
+    if cfg.dropna_after_transform:
+        transformed = transformed.dropna()
+
+    return df, transformed, report_df
+
+
+def save_outputs(
+    raw_df: pd.DataFrame,
+    transformed_df: pd.DataFrame,
+    report_df: pd.DataFrame,
+    cfg: Config,
+) -> None:
+    raw_df.to_csv(cfg.out_raw_csv)
+    transformed_df.to_csv(cfg.out_transformed_csv)
+    report_df.to_csv(cfg.out_report_csv)
+    with open(cfg.out_report_json, "w", encoding="utf-8") as f:
+        json.dump(report_df.reset_index().to_dict(orient="records"), f, indent=2)
+    print(f"[OK] Saved raw features      → {cfg.out_raw_csv}")
+    print(f"[OK] Saved transformed feats → {cfg.out_transformed_csv}")
+    print(f"[OK] Saved stationarity rpt  → {cfg.out_report_csv}")
+    print(f"[OK] Saved JSON report       → {cfg.out_report_json}")
+
+
+# ---------------------- CLI ---------------------- #
+
+def parse_args() -> Config:
+    p = argparse.ArgumentParser(
+        description="Level-46 Stationarity Checker & Demeaning Pipeline"
+    )
+    p.add_argument("--symbol", type=str, default="SPY", help="Ticker for demo (yfinance)")
+    p.add_argument("--start", type=str, default="2010-01-01", help="Start date for data")
+    p.add_argument("--adf-alpha", type=float, default=0.05, help="ADF significance level")
+    p.add_argument("--kpss-alpha", type=float, default=0.05, help="KPSS significance level")
+    p.add_argument("--raw-csv", type=str, default="level46_features_raw.csv")
+    p.add_argument("--transformed-csv", type=str, default="level46_features_transformed.csv")
+    p.add_argument("--report-csv", type=str, default="level46_stationarity_report.csv")
+    p.add_argument("--report-json", type=str, default="level46_stationarity_report.json")
+    p.add_argument("--dropna", action="store_true", help="Drop NaNs after transforms")
+
+    args = p.parse_args()
+
+    cfg = Config(
+        symbol=args.symbol,
+        start=args.start,
+        adf_alpha=args.adf_alpha,
+        kpss_alpha=args.kpss_alpha,
+        out_raw_csv=args.raw_csv,
+        out_transformed_csv=args.transformed_csv,
+        out_report_csv=args.report_csv,
+        out_report_json=args.report_json,
+        max_diff_order=1,
+        dropna_after_transform=args.dropna,
+    )
+    return cfg
+
+
+def main() -> None:
+    cfg = parse_args()
+    print(f"[INFO] Loading data for {cfg.symbol} from {cfg.start}...")
+    df = load_price_data(cfg)
+
+    print(f"[INFO] Running stationarity pipeline on {df.shape[1]} features...")
+    raw_df, transformed_df, report_df = run_stationarity_pipeline(cfg, df)
+
+    save_outputs(raw_df, transformed_df, report_df, cfg)
+
+    # Simple console summary
+    print("\n[SUMMARY] Stationarity report:")
+    print(report_df[["stationarity_label", "recommended_transform"]])
+
+
+if __name__ == "__main__":
+    # Make it Jupyter-friendly by stripping unwanted kernel args like "-f kernel-xxxx.json"
+    if len(sys.argv) > 1:
+        sys.argv = [sys.argv[0]] + [
+            arg for arg in sys.argv[1:]
+            if arg != "-f" and not (arg.endswith(".json") and "kernel" in arg)
+        ]
+    main()
+```
+
+You can now drop this in as `level46_stationarity_pipeline.py`, run it once, inspect the three CSVs, and then swap `load_price_data` for your **meta-label feature matrix** so every future model (21–24, 38, 45, etc.) starts from a clean, stationarity-checked feature set.
+
+[1]: https://www.machinelearningplus.com/time-series/augmented-dickey-fuller-test/?utm_source=chatgpt.com "Augmented Dickey Fuller Test (ADF Test) – Must Read Guide"
+[2]: https://www.machinelearningplus.com/time-series/kpss-test-for-stationarity/?utm_source=chatgpt.com "KPSS Test for Stationarity"
+[3]: https://python.plainenglish.io/testing-time-series-stationarity-with-kpss-and-dickey-fuller-42fbee097d37?utm_source=chatgpt.com "Testing Time Series Stationarity with KPSS and Dickey-Fuller"
+[4]: https://hudsonthames.org/machine-learning-trading-essentials-part-2-fractionally-differentiated-features-filtering-and-labelling/?utm_source=chatgpt.com "Fractionally differentiated features, Filtering, and Labelling"
+[5]: https://blog.quantinsti.com/stationarity/?utm_source=chatgpt.com "Stationarity in Time Series: Definition, Types, and Analysis ..."
+[6]: https://www.luxalgo.com/blog/data-preprocessing-for-algo-trading/?utm_source=chatgpt.com "Data Preprocessing for Algo Trading"
+[7]: https://www.statsmodels.org/dev/examples/notebooks/generated/stationarity_detrending_adf_kpss.html?utm_source=chatgpt.com "Stationarity and detrending (ADF/KPSS)"
+[8]: https://blog.amberdata.io/crypto-pairs-trading-part-2-verifying-mean-reversion-with-adf-and-hurst-tests?utm_source=chatgpt.com "Crypto Pairs Trading: Part 2 — Verifying Mean Reversion ..."
+[9]: https://wire.insiderfinance.io/stationarity-in-time-series-how-to-test-and-transform-your-data-41fa92992903?utm_source=chatgpt.com "Stationarity in Time Series: How to test and transform your ..."
