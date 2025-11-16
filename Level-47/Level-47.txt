@@ -1,0 +1,426 @@
+Here’s **Level-47 — Label Leakage Guard (Purged K-Fold + Embargo)** with a detailed DSA explanation, external links, and a single, ready-to-run Python script.
+
+---
+
+## Model #47 — Label Leakage Guard (Purged K-Fold + Embargo)
+
+**Description:**
+Custom cross-validation splitter that *purges* overlapping events and adds a time *embargo* to prevent look-ahead/label leakage in financial ML.
+
+**Objective:**
+Give you a reusable CV object that you can plug into any sklearn model (Logit, RF, GBM, etc.) so your performance estimates are realistic and not inflated by hidden leakage.
+
+**DSA Concept (Interval Arithmetic + Time-Aware Splitting – in detail):**
+
+In event-driven financial ML, each labeled sample is not just “at time *t*” — it occupies a **time interval**:
+
+* For a label built with horizon *H* (e.g., forward 20-bar return),
+  sample *i* has:
+
+  * `start` = timestamp at index *i* (call it (t_{0,i}))
+  * `end`   = timestamp at index *i + H* (call it (t_{1,i}))
+
+So each sample is an **interval** ([t_{0,i}, t_{1,i}]), not a point. If train and test intervals overlap, information leaks.
+
+The DSA side is basically **interval arithmetic + set operations on indices**:
+
+1. **Represent intervals**
+
+   * Store:
+
+     * `idx[i]`: the time index of row *i*
+     * `t1[i]` : the end time of label/event for row *i*
+   * This is a classic *interval representation* problem.
+
+2. **Build contiguous time folds**
+
+   * Split the sorted indices into `n_splits` consecutive blocks. Each block is your test set for that fold.
+   * For fold `k`, you get:
+
+     * `test_idx` = a contiguous range of indices
+     * `test_start_time`  = first time in that test block
+     * `test_end_time`    = max `t1` over all test samples (latest event end)
+
+3. **Purging (interval overlap test)**
+
+   * A train sample *j* with interval ([t_{0,j}, t_{1,j}]) is **invalid** if it overlaps the test interval ([test_start_time, test_end_time]).
+
+   * Overlap condition (closed intervals):
+
+     [
+     (t_{0,j} \le test_end_time) \ \land \ (t_{1,j} \ge test_start_time)
+     ]
+
+   * DSA view: for each fold, we:
+
+     * Start from full index set.
+     * Remove `test_idx`.
+     * Compute a boolean mask on remaining indices using the vectorized overlap condition above.
+     * That’s just **set difference + vectorized interval filtering**.
+
+4. **Embargo (temporal buffer after test block)**
+
+   * Even without direct overlap, samples *right after* the test block might still be influenced by events in the test set (lagged market impact).
+   * We impose an **embargo length** `embargo_pct * n_samples`:
+
+     * Let `test_stop` be the last index position of the test fold in the full sequence.
+     * Embargo range in index positions: `[test_stop, test_stop + n_embargo)`
+     * These indices are **removed from train** (set subtraction).
+
+5. **Resulting algorithmic pattern**
+
+   * Data structures:
+
+     * `idx` — numpy array of integer positions or timestamps.
+     * `t1`  — aligned array/Series of event end times.
+   * Operations:
+
+     * Contiguous splitting by position (time-ordered K-fold).
+     * **Set arithmetic**: union, difference of index sets for train/test/embargo.
+     * **Vectorized interval comparisons**: `<=`, `>=` to build boolean masks.
+
+   This is pure DSA: working with **indexed sequences + intervals + masks** to enforce temporal constraints.
+
+**Quant/ML Model:**
+*Not a predictive model itself* — this is a **CV framework** to be used with any supervised learner (LogReg, RF, GBM, etc.).
+
+**Real-Time Scope:**
+Use this splitter whenever you train/retrain or hyper-tune any supervised model on overlapping labels (triple-barrier, forward-H returns, etc.). It becomes your default CV in the pipeline.
+
+**Free Data/APIs:**
+
+* `yfinance` for demo (e.g., SPY daily prices).
+
+**Deliverables:**
+
+* `PurgedKFold` class (sklearn-compatible CV splitter).
+* Example pipeline:
+
+  * Build forward-H labels.
+  * Run LogisticRegression with purged + embargoed CV.
+  * Save:
+
+    * CV fold metrics to CSV.
+    * Final labeled dataset with intervals to CSV.
+* Optional equity plot for sanity.
+
+**Difficulty:** Advanced
+**Build Time:** ~3h (first time); much faster once templated.
+
+**Where this concept is used (good reading / external links):**
+
+* Marcos López de Prado, *Advances in Financial Machine Learning* — defines Purged K-Fold and Combinatorial Purged Cross-Validation (CPCV).
+* Wikipedia: **Purged cross-validation** overview and motivation.
+* Towards AI: “The Combinatorial Purged Cross-Validation method” — Python-level walkthrough.
+* QuantInsti blog: “Cross Validation in Finance: Purging, Embargoing, Combination”.
+* Medium: “KFold cross-validation with purging and embargo” — long-form explanation + code.
+* Quantoisseur: “Combinatorial Purged Cross-Validation Explained” (blog + code).
+* RiskLab / Hudson & Thames pieces on cross-validation in finance (and mlfinlab implements these ideas).
+
+Those are perfect to cross-check the math and see large-scale uses.
+
+---
+
+## Level-47 Code — `level47_purged_kfold.py`
+
+This is a **single, self-contained script** with:
+
+* Data download (SPY daily).
+* Event labeling with forward horizon `H`.
+* `PurgedKFold` implementation (with embargo).
+* LogisticRegression example with `cross_val_score`.
+* CSV exports for:
+
+  * labeled dataset (`level47_events.csv`)
+  * CV results (`level47_cv_results.csv`)
+
+Paste this into a `.py` file or a Jupyter cell and run.
+It’s Jupyter-safe (no argparse; no `-f kernel` issues).
+
+```python
+# level47_purged_kfold.py
+# Purged K-Fold with Embargo for Financial ML (Label Leakage Guard)
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+from dataclasses import dataclass
+from typing import Iterator, Tuple
+
+from sklearn.base import BaseEstimator
+from sklearn.model_selection import BaseCrossValidator, cross_val_score
+from sklearn.linear_model import LogisticRegression
+import matplotlib.pyplot as plt
+
+
+# -------------------- Config -------------------- #
+
+@dataclass
+class Config:
+    symbol: str = "SPY"
+    start: str = "2010-01-01"
+    horizon: int = 20        # label horizon in bars
+    n_splits: int = 5        # K in K-fold
+    embargo_pct: float = 0.01  # 1% of samples as embargo
+    tc_bps: float = 10.0     # demo TC in basis points for sanity checks
+    out_events_csv: str = "level47_events.csv"
+    out_cv_csv: str = "level47_cv_results.csv"
+    random_state: int = 42
+
+
+# -------------------- Data & Labels -------------------- #
+
+def load_price_series(cfg: Config) -> pd.DataFrame:
+    """
+    Download daily adjusted close prices for cfg.symbol using yfinance.
+    Returns DataFrame with columns: ['close', 'ret'] and DatetimeIndex.
+    """
+    px = yf.download(cfg.symbol, start=cfg.start, auto_adjust=True, progress=False)
+    if px.empty:
+        raise RuntimeError("No data downloaded. Check symbol or internet connection.")
+    close = px["Close"].rename("close")
+    ret = np.log(close).diff().rename("ret")
+    df = pd.concat([close, ret], axis=1).dropna()
+    return df
+
+
+def build_forward_labels(df: pd.DataFrame, horizon: int) -> pd.DataFrame:
+    """
+    Build event-based labels using a fixed forward horizon:
+      - event start t0 = current index
+      - event end   t1 = index shifted by +horizon
+      - label y = sign of cumulative forward return over horizon
+    """
+    # Forward cumulative log return over horizon
+    fwd_ret = df["ret"].rolling(window=horizon).sum().shift(-horizon + 1)
+    fwd_ret = fwd_ret.rename("fwd_ret")
+
+    # event end timestamp t1: horizon-1 steps ahead
+    t1 = df.index.to_series().shift(-horizon + 1)
+    t1.name = "t1"
+
+    events = pd.concat([df["close"], df["ret"], fwd_ret, t1], axis=1)
+    events = events.dropna(subset=["fwd_ret", "t1"])
+
+    # Binary label: 1 if fwd_ret > 0, else 0
+    y = (events["fwd_ret"] > 0).astype(int).rename("label")
+    events = events.join(y)
+
+    return events
+
+
+# -------------------- Purged K-Fold CV -------------------- #
+
+class PurgedKFold(BaseCrossValidator):
+    """
+    K-Fold cross-validator for time series with:
+      - contiguous test folds (in time order)
+      - purging of overlapping events in training folds
+      - optional embargo (time buffer) after each test fold
+
+    Parameters
+    ----------
+    n_splits : int
+        Number of folds. Must be at least 2.
+    embargo_pct : float
+        Fraction of total samples to embargo after each test fold (0.0 -> no embargo).
+    t1 : pd.Series
+        Series of event end times indexed the same as X (timestamps or positions).
+        For each row i, t1[i] defines the end of the information interval [index[i], t1[i]].
+    """
+
+    def __init__(self, n_splits: int = 5, embargo_pct: float = 0.0, t1: pd.Series = None):
+        if n_splits < 2:
+            raise ValueError("n_splits must be at least 2.")
+        self.n_splits = n_splits
+        self.embargo_pct = float(embargo_pct)
+        self.t1 = t1
+
+    def get_n_splits(self, X=None, y=None, groups=None) -> int:
+        return self.n_splits
+
+    def split(
+        self,
+        X: pd.DataFrame,
+        y: pd.Series = None,
+        groups=None
+    ) -> Iterator[Tuple[np.ndarray, np.ndarray]]:
+        """
+        Generate indices for train and test sets for each fold.
+
+        Assumes that X.index is already sorted in time order and that
+        self.t1 is aligned to X.index (same index).
+        """
+        if self.t1 is None:
+            raise ValueError("PurgedKFold requires t1 (event end times) to be set.")
+        if not isinstance(X, (pd.DataFrame, pd.Series)):
+            raise TypeError("X must be a pandas DataFrame or Series with a DatetimeIndex or Index.")
+
+        idx = np.array(X.index)
+        t1 = self.t1.reindex(idx)
+        if t1.isna().any():
+            raise ValueError("t1 must have non-null values for all indices in X.")
+
+        n_samples = len(idx)
+        indices = np.arange(n_samples)
+
+        # Determine contiguous fold sizes
+        fold_sizes = np.full(self.n_splits, n_samples // self.n_splits, dtype=int)
+        fold_sizes[: n_samples % self.n_splits] += 1
+        current = 0
+
+        n_embargo = int(np.ceil(self.embargo_pct * n_samples))
+
+        for fold, fold_size in enumerate(fold_sizes):
+            start = current
+            stop = current + fold_size
+            current = stop
+
+            test_mask = np.zeros(n_samples, dtype=bool)
+            test_mask[start:stop] = True
+            test_indices = indices[test_mask]
+
+            # Embargo: positions right after the test set
+            embargo_mask = np.zeros(n_samples, dtype=bool)
+            if n_embargo > 0:
+                embargo_start = stop
+                embargo_end = min(n_samples, stop + n_embargo)
+                embargo_mask[embargo_start:embargo_end] = True
+
+            # Initial train candidates: everything not in test or embargo
+            train_mask = ~(test_mask | embargo_mask)
+            train_candidates = indices[train_mask]
+
+            # Purging: remove train samples whose info interval [idx[j], t1[j]]
+            # overlaps the test interval [test_start_time, test_end_time]
+            test_start_time = idx[start]
+            # test_end_time: max t1 over test indices
+            test_end_time = t1.iloc[test_indices].max()
+
+            train_idx_times = idx[train_candidates]
+            train_t1 = t1.iloc[train_candidates].values
+
+            # Overlap condition:
+            # (train_start <= test_end_time) & (train_end >= test_start_time)
+            overlap = (train_idx_times <= test_end_time) & (train_t1 >= test_start_time)
+            # Keep only those that do NOT overlap
+            final_train = train_candidates[~overlap]
+
+            yield final_train, test_indices
+
+
+# -------------------- Utility Metrics -------------------- #
+
+def sharpe_ratio(returns: pd.Series, ann_factor: int = 252) -> float:
+    if returns is None or len(returns) < 2:
+        return 0.0
+    mu = returns.mean()
+    sigma = returns.std()
+    if sigma <= 0:
+        return 0.0
+    return float(mu / sigma * np.sqrt(ann_factor))
+
+
+# -------------------- Demo Pipeline -------------------- #
+
+def run_demo(cfg: Config) -> None:
+    # 1) Load price data
+    df = load_price_series(cfg)
+
+    # 2) Build event-based labels with forward horizon
+    events = build_forward_labels(df, cfg.horizon)
+
+    # 3) Features: simple lagged returns (can be expanded)
+    #    X[t] = [ret_{t-1}, ret_{t-2}, ..., ret_{t-5}]
+    max_lag = 5
+    feature_cols = []
+    for lag in range(1, max_lag + 1):
+        col = events["ret"].shift(lag).rename(f"ret_lag{lag}")
+        feature_cols.append(col)
+
+    X = pd.concat(feature_cols, axis=1).dropna()
+    y = events.loc[X.index, "label"]
+    t1 = events.loc[X.index, "t1"]
+
+    # 4) Define PurgedKFold splitter
+    cv = PurgedKFold(
+        n_splits=cfg.n_splits,
+        embargo_pct=cfg.embargo_pct,
+        t1=t1
+    )
+
+    # 5) Model: simple Logistic Regression
+    model: BaseEstimator = LogisticRegression(
+        penalty="l2",
+        C=1.0,
+        solver="lbfgs",
+        max_iter=200,
+        random_state=cfg.random_state
+    )
+
+    # 6) Cross-validated scores (using purged CV)
+    #    We use daily returns as "samples", so cv=PurgedKFold ensures no leakage.
+    scores = cross_val_score(
+        model,
+        X.values,
+        y.values,
+        cv=cv,
+        scoring="roc_auc"
+    )
+
+    cv_df = pd.DataFrame({
+        "fold": np.arange(1, cfg.n_splits + 1),
+        "roc_auc": scores
+    })
+    cv_df["roc_auc_mean"] = scores.mean()
+    cv_df["roc_auc_std"] = scores.std()
+
+    # 7) Fit on full data for a quick in-sample equity sanity check
+    model.fit(X.values, y.values)
+
+    # Simple "strategy return": sign = model prob > 0.5 on future bar
+    proba = model.predict_proba(X.values)[:, 1]
+    signal = np.where(proba > 0.5, 1.0, -1.0)  # 1 = long, -1 = short
+    strat_ret = signal * events.loc[X.index, "ret"]
+    equity = (1.0 + strat_ret).cumprod()
+
+    # 8) Save outputs
+    events_out = events.copy()
+    events_out.to_csv(cfg.out_events_csv, index_label="timestamp")
+    cv_df.to_csv(cfg.out_cv_csv, index=False)
+
+    print(f"[OK] Saved events → {cfg.out_events_csv}")
+    print(f"[OK] Saved CV results → {cfg.out_cv_csv}")
+    print("Purged K-Fold ROC-AUC scores per fold:")
+    print(cv_df[["fold", "roc_auc"]])
+    print(f"Mean ROC-AUC: {scores.mean():.4f} | Std: {scores.std():.4f}")
+    print(f"Sharpe (naive, in-sample): {sharpe_ratio(strat_ret):.2f}")
+
+    # 9) Plot quick equity curve
+    plt.figure(figsize=(10, 4))
+    plt.plot(equity.index, equity.values, label="Strategy (LogReg + PurgedKFold)", linewidth=1.5)
+    plt.title(f"Level-47: Equity Curve ({cfg.symbol}, horizon={cfg.horizon})")
+    plt.xlabel("Date")
+    plt.ylabel("Equity (normalized)")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+
+# -------------------- Main -------------------- #
+
+def main():
+    cfg = Config()
+    run_demo(cfg)
+
+
+if __name__ == "__main__":
+    # Make it safe inside Jupyter / IPython: ignore extra args like "-f kernel-xxxx.json"
+    import sys
+
+    sys.argv = [sys.argv[0]]
+    main()
+```
+
+If you run this and hit any error (e.g., missing `sklearn` or `yfinance`), send me the traceback and I’ll refactor the **entire file** around your environment like we’ve been doing for the other levels.
