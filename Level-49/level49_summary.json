@@ -1,0 +1,17 @@
+{
+  "cv_metrics": {
+    "roc_auc_mean": 0.4458609760232906,
+    "roc_auc_std": 0.0088430268540427,
+    "pr_auc_mean": 0.6084326649886169,
+    "pr_auc_std": 0.03324321884373056
+  },
+  "base_value": 0.0,
+  "symbol": "SPY",
+  "start": "2010-01-01",
+  "horizon": 20,
+  "pos_threshold": 0.005,
+  "max_lag": 5,
+  "roll_vol_window": 20,
+  "n_splits": 5,
+  "embargo_pct": 0.01
+}
