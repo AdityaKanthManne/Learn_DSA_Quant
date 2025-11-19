@@ -1,0 +1,609 @@
+Here’s **Level-49 — SHAP Explainability for Signals** as a **single, ready-to-run script**, with:
+
+* Purged K-Fold + embargo (same style as Levels 47–48)
+* Imbalanced forward-return labels
+* Tree model (`GradientBoostingClassifier`)
+* SHAP explainability (with **graceful fallback** if `shap` is not installed)
+* Offline-safe: if `yfinance` fails, it uses a **synthetic GBM series**
+
+```python
+# level49_shap_explainability.py
+#
+# Level-49 — SHAP Explainability for Signals
+#
+# Pipeline:
+#   1) Load daily prices (yfinance → fallback synthetic GBM).
+#   2) Build forward-horizon labels (imbalanced).
+#   3) Create lagged-return and rolling-vol features.
+#   4) Use Purged K-Fold + embargo to evaluate a tree classifier.
+#   5) Fit final GradientBoosting model on full sample.
+#   6) Compute SHAP attributions (if 'shap' is installed) on a sample of rows.
+#   7) Save:
+#        - events/labels CSV
+#        - feature matrix CSV
+#        - SHAP attributions CSV (if available)
+#        - feature importance CSV
+#
+# DSA Concept (SHAP + top-k attributions):
+#   - Features matrix X is an n×d array (n samples, d features).
+#   - A tree model partitions feature space; SHAP assigns a contribution
+#     φ_{i,j} for each (sample i, feature j) so that:
+#         f(x_i) ≈ φ_{i,0} + φ_{i,1} + ... + φ_{i,d}
+#     where φ_{i,0} is a "base value" (average prediction).
+#   - Internally, TreeSHAP walks each tree and uses dynamic programming to
+#     accumulate contributions from splits touching feature j, in O(T*L^2)
+#     where T is number of trees and L tree depth.
+#   - We then:
+#       * Aggregate |φ_{i,j}| across i to get global importance scores:
+#           I_j = (1/n) * Σ_i |φ_{i,j}|
+#       * For each row, sort features by |φ_{i,j}| and keep top-k drivers.
+#     These are basically top-k operations (arg-sort, slicing) on columns,
+#     which are vectorized on NumPy arrays and run in O(d log d) per row.
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from typing import Iterator, Tuple, Dict, Any, List
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from sklearn.base import BaseEstimator, clone
+from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.metrics import roc_auc_score, average_precision_score
+from sklearn.model_selection import BaseCrossValidator
+
+# Optional dependencies
+try:
+    import yfinance as yf
+except ImportError:
+    yf = None
+
+try:
+    import shap
+except ImportError:
+    shap = None
+
+
+# -------------------- Config -------------------- #
+
+@dataclass
+class Config:
+    symbol: str = "SPY"
+    start: str = "2010-01-01"
+
+    # Labeling
+    horizon: int = 20              # forward horizon in daily bars
+    pos_threshold: float = 0.005   # label 1 if fwd_ret > this
+
+    # Features
+    max_lag: int = 5
+    roll_vol_window: int = 20
+
+    # CV / leakage guard
+    n_splits: int = 5
+    embargo_pct: float = 0.01
+
+    # Synthetic fallback
+    synthetic_len: int = 252 * 10
+    random_state: int = 42
+
+    # SHAP sampling (for speed)
+    shap_sample_size: int = 500
+    top_k_per_row: int = 3
+
+    # Outputs
+    out_events_csv: str = "level49_events.csv"
+    out_features_csv: str = "level49_features.csv"
+    out_cv_csv: str = "level49_cv_results.csv"
+    out_shap_csv: str = "level49_shap_values.csv"
+    out_importance_csv: str = "level49_feature_importance.csv"
+    out_summary_json: str = "level49_summary.json"
+
+
+# -------------------- Data & Labels -------------------- #
+
+def generate_synthetic_series(cfg: Config) -> pd.DataFrame:
+    """
+    Synthetic GBM-like daily series: offline fallback.
+
+    DSA:
+    - Vectorized generation of log-returns and cumulative sum.
+    """
+    np.random.seed(cfg.random_state)
+    n = cfg.synthetic_len
+    idx = pd.date_range(start=cfg.start, periods=n, freq="B")
+
+    mu = 0.08 / 252.0
+    sigma = 0.20 / np.sqrt(252.0)
+    ret = np.random.normal(mu, sigma, size=n)
+
+    price0 = 100.0
+    price = price0 * np.exp(np.cumsum(ret))
+
+    df = pd.DataFrame({"close": price, "ret": ret}, index=idx)
+    print("[WARN] Using synthetic GBM-like series instead of real market data.")
+    return df
+
+
+def load_price_series(cfg: Config) -> pd.DataFrame:
+    """
+    Try yfinance; if it fails, fall back to synthetic series.
+
+    Returns DataFrame with ['close', 'ret'].
+    """
+    if yf is None:
+        print("[WARN] yfinance not installed. Falling back to synthetic time series.")
+        return generate_synthetic_series(cfg)
+
+    try:
+        px = yf.download(cfg.symbol, start=cfg.start, auto_adjust=True, progress=False)
+    except Exception as e:
+        print(f"[WARN] yfinance download failed ({e}). Falling back to synthetic series.")
+        return generate_synthetic_series(cfg)
+
+    if px is None or px.empty:
+        print("[WARN] yfinance returned empty DataFrame. Falling back to synthetic series.")
+        return generate_synthetic_series(cfg)
+
+    # Try 'Close'; fall back to 'Adj Close' if needed
+    if "Close" in px.columns:
+        close_obj = px["Close"]
+    elif "Adj Close" in px.columns:
+        close_obj = px["Adj Close"]
+    else:
+        print("[WARN] No 'Close'/'Adj Close' column. Falling back to synthetic series.")
+        return generate_synthetic_series(cfg)
+
+    if isinstance(close_obj, pd.DataFrame):
+        close_series = close_obj.iloc[:, 0].astype(float)
+    else:
+        close_series = close_obj.astype(float)
+
+    close_series = close_series.rename("close")
+    ret = np.log(close_series).diff().rename("ret")
+
+    df = pd.concat([close_series, ret], axis=1).dropna()
+    return df
+
+
+def build_forward_labels(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+    """
+    Forward horizon labels with explicit threshold.
+
+    y = 1 if fwd_ret > cfg.pos_threshold else 0
+
+    DSA:
+    - rolling(window=h).sum() is effectively a sliding window / prefix-sum.
+    - shift(-h + 1) aligns the end of the forward window with current time.
+    """
+    h = cfg.horizon
+
+    fwd_ret = df["ret"].rolling(window=h).sum().shift(-h + 1)
+    fwd_ret = fwd_ret.rename("fwd_ret")
+
+    t1 = df.index.to_series().shift(-h + 1)
+    t1.name = "t1"
+
+    events = pd.concat([df["close"], df["ret"], fwd_ret, t1], axis=1)
+    events = events.dropna(subset=["fwd_ret", "t1"])
+
+    y = (events["fwd_ret"] > cfg.pos_threshold).astype(int).rename("label")
+    events = events.join(y)
+
+    return events
+
+
+def build_features(events: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+    """
+    Build basic price-based features:
+      - Lagged returns: ret_lag1 .. ret_lag{max_lag}
+      - Rolling volatility: roll_vol{window}
+
+    DSA:
+    - Each lag is a shift (O(n)).
+    - Rolling std uses an online formula internally (O(n)), conceptually
+      equivalent to a sliding window with prefix sums of x and x^2.
+    """
+    cols: List[pd.Series] = []
+
+    for lag in range(1, cfg.max_lag + 1):
+        col = events["ret"].shift(lag).rename(f"ret_lag{lag}")
+        cols.append(col)
+
+    roll_vol = events["ret"].rolling(window=cfg.roll_vol_window).std().rename(
+        f"roll_vol{cfg.roll_vol_window}"
+    )
+    cols.append(roll_vol)
+
+    X = pd.concat(cols, axis=1).dropna()
+    return X
+
+
+# -------------------- Purged K-Fold -------------------- #
+
+class PurgedKFold(BaseCrossValidator):
+    """
+    Purged K-Fold with embargo for event-based time-series data.
+
+    DSA:
+      - We have n samples (nodes) with intervals [index[i], t1[i]].
+      - For each fold:
+          * Mark a contiguous block as test.
+          * Apply embargo (mask future indices after test).
+          * For candidate train indices, check interval overlap:
+              start_train <= max_end_test AND end_train >= start_test
+            done with vectorized boolean ops on arrays (O(n)).
+    """
+
+    def __init__(self, n_splits: int = 5, embargo_pct: float = 0.0, t1: pd.Series | None = None):
+        if n_splits < 2:
+            raise ValueError("n_splits must be at least 2.")
+        self.n_splits = n_splits
+        self.embargo_pct = float(embargo_pct)
+        self.t1 = t1
+
+    def get_n_splits(self, X=None, y=None, groups=None) -> int:
+        return self.n_splits
+
+    def split(self, X, y=None, groups=None) -> Iterator[Tuple[np.ndarray, np.ndarray]]:
+        if self.t1 is None:
+            raise ValueError("PurgedKFold requires t1 to be set.")
+        if not isinstance(X, (pd.DataFrame, pd.Series)):
+            raise TypeError("X must be a pandas DataFrame/Series with an Index.")
+
+        idx = np.array(X.index)
+        t1 = self.t1.reindex(idx)
+        if t1.isna().any():
+            raise ValueError("t1 must have non-null values for all X indices.")
+
+        n = len(idx)
+        indices = np.arange(n)
+
+        fold_sizes = np.full(self.n_splits, n // self.n_splits, dtype=int)
+        fold_sizes[: n % self.n_splits] += 1
+
+        current = 0
+        n_embargo = int(np.ceil(self.embargo_pct * n))
+
+        for fold_size in fold_sizes:
+            start = current
+            stop = current + fold_size
+            current = stop
+
+            test_mask = np.zeros(n, dtype=bool)
+            test_mask[start:stop] = True
+            test_idx = indices[test_mask]
+
+            embargo_mask = np.zeros(n, dtype=bool)
+            if n_embargo > 0:
+                emb_start = stop
+                emb_end = min(n, stop + n_embargo)
+                embargo_mask[emb_start:emb_end] = True
+
+            train_mask = ~(test_mask | embargo_mask)
+            train_candidates = indices[train_mask]
+
+            test_start_time = idx[start]
+            test_end_time = t1.iloc[test_idx].max()
+
+            train_starts = idx[train_candidates]
+            train_ends = t1.iloc[train_candidates].values
+
+            overlap = (train_starts <= test_end_time) & (train_ends >= test_start_time)
+            final_train = train_candidates[~overlap]
+
+            yield final_train, test_idx
+
+
+# -------------------- Metrics -------------------- #
+
+def sharpe_ratio(returns: pd.Series, ann_factor: int = 252) -> float:
+    if returns is None or len(returns) < 2:
+        return 0.0
+    mu = float(returns.mean())
+    sigma = float(returns.std())
+    if sigma <= 0:
+        return 0.0
+    return mu / sigma * np.sqrt(ann_factor)
+
+
+def evaluate_model_cv(
+    model: BaseEstimator,
+    X: pd.DataFrame,
+    y: np.ndarray,
+    cv: BaseCrossValidator,
+    label: str = ""
+) -> Dict[str, Any]:
+    """
+    Purged K-Fold evaluation:
+      - ROC-AUC, PR-AUC.
+    """
+    metrics = []
+    fold_id = 1
+
+    for train_idx, test_idx in cv.split(X, y):
+        clf = clone(model)
+
+        X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
+        y_train, y_test = y[train_idx], y[test_idx]
+
+        clf.fit(X_train, y_train)
+        prob = clf.predict_proba(X_test)[:, 1]
+        roc = roc_auc_score(y_test, prob)
+        pr = average_precision_score(y_test, prob)
+
+        metrics.append({"fold": fold_id, "roc_auc": roc, "pr_auc": pr})
+        fold_id += 1
+
+    df = pd.DataFrame(metrics)
+    df["roc_auc_mean"] = df["roc_auc"].mean()
+    df["roc_auc_std"] = df["roc_auc"].std()
+    df["pr_auc_mean"] = df["pr_auc"].mean()
+    df["pr_auc_std"] = df["pr_auc"].std()
+    df["model"] = label
+
+    return {
+        "df": df,
+        "metrics": {
+            "roc_auc_mean": float(df['roc_auc_mean'].iloc[0]),
+            "roc_auc_std": float(df['roc_auc_std'].iloc[0]),
+            "pr_auc_mean": float(df['pr_auc_mean'].iloc[0]),
+            "pr_auc_std": float(df['pr_auc_std'].iloc[0]),
+        },
+    }
+
+
+# -------------------- SHAP Helpers -------------------- #
+
+def compute_tree_shap(
+    model: GradientBoostingClassifier,
+    X: pd.DataFrame,
+    cfg: Config
+) -> Tuple[pd.DataFrame, Dict[str, float], float]:
+    """
+    Compute SHAP attributions on a sampled subset of X.
+
+    Returns:
+      shap_df: per-row per-feature SHAP values (+ base_value, pred_proba)
+      global_importance: feature → mean(|phi_j|)
+      base_value: scalar base value used by TreeExplainer
+
+    DSA:
+      - shap.TreeExplainer(model).shap_values(X_sample) yields an n×d matrix
+        (for binary classification, we use the positive class).
+      - global_importance[j] = mean over i of |phi_{i,j}|.
+      - All operations are vectorized across samples/features.
+    """
+    if shap is None:
+        print("[WARN] 'shap' library not installed. Skipping SHAP computation.")
+        return pd.DataFrame(index=X.index), {}, 0.0
+
+    # Sample (for speed) if needed
+    if len(X) > cfg.shap_sample_size:
+        X_sample = X.sample(cfg.shap_sample_size, random_state=cfg.random_state)
+    else:
+        X_sample = X.copy()
+
+    explainer = shap.TreeExplainer(model)
+    shap_vals_raw = explainer.shap_values(X_sample)
+
+    # For binary classifier, shap_values may be:
+    #   - array (n, d) for positive class
+    #   - or list [neg_class, pos_class]; we pick pos_class
+    if isinstance(shap_vals_raw, list):
+        shap_vals = np.array(shap_vals_raw[1])
+    else:
+        shap_vals = np.array(shap_vals_raw)
+
+    if shap_vals.ndim == 1:
+        shap_vals = shap_vals.reshape(-1, 1)
+
+    base_value = explainer.expected_value
+    if isinstance(base_value, (list, np.ndarray)):
+        base_value = float(base_value[1]) if len(np.atleast_1d(base_value)) > 1 else float(base_value[0])
+    else:
+        base_value = float(base_value)
+
+    feature_names = list(X_sample.columns)
+    shap_df = pd.DataFrame(shap_vals, index=X_sample.index, columns=feature_names)
+
+    # Global importance: mean absolute SHAP per feature
+    mean_abs = np.abs(shap_vals).mean(axis=0)
+    global_importance = {
+        name: float(val) for name, val in zip(feature_names, mean_abs)
+    }
+
+    # Add metadata columns for convenience
+    with np.errstate(over="ignore", invalid="ignore"):
+        pred_proba = model.predict_proba(X_sample)[:, 1]
+
+    shap_df["base_value"] = base_value
+    shap_df["pred_proba"] = pred_proba
+
+    return shap_df, global_importance, base_value
+
+
+def build_top_k_driver_table(
+    shap_df: pd.DataFrame,
+    cfg: Config
+) -> pd.DataFrame:
+    """
+    Build a compact table of top-k drivers per sample.
+
+    For each index:
+       - Take the row's SHAP values (features cols only),
+       - Sort by |phi_{i,j}| descending,
+       - Keep top-k features and their SHAP values.
+
+    DSA:
+      - For each row, this is an arg-sort + slicing (O(d log d)).
+      - Implemented via vectorized operations over columns and
+        a row-wise apply (fine at d ~ 6–20).
+
+    Returns:
+      DataFrame with columns:
+        ['timestamp', 'pred_proba', 'feature_1', 'shap_1', 'feature_2', 'shap_2', ...]
+    """
+    if shap_df.empty:
+        return shap_df
+
+    feature_cols = [c for c in shap_df.columns if c not in ("base_value", "pred_proba")]
+    out_rows = []
+
+    for idx, row in shap_df[feature_cols + ["pred_proba"]].iterrows():
+        vals = row[feature_cols].values.astype(float)
+        order = np.argsort(-np.abs(vals))  # descending by |SHAP|
+        top_idx = order[: cfg.top_k_per_row]
+
+        record: Dict[str, Any] = {
+            "timestamp": idx,
+            "pred_proba": float(row["pred_proba"]),
+        }
+
+        for rank, j in enumerate(top_idx, start=1):
+            fname = feature_cols[j]
+            sval = float(vals[j])
+            record[f"feature_{rank}"] = fname
+            record[f"shap_{rank}"] = sval
+
+        out_rows.append(record)
+
+    topk_df = pd.DataFrame(out_rows).set_index("timestamp")
+    return topk_df
+
+
+# -------------------- Main Pipeline -------------------- #
+
+def run_demo(cfg: Config) -> None:
+    # 1) Load data
+    df = load_price_series(cfg)
+
+    # 2) Build labels/events
+    events = build_forward_labels(df, cfg)
+    print("[INFO] Label distribution:")
+    print(events["label"].value_counts(dropna=False))
+
+    # 3) Features
+    X_full = build_features(events, cfg)
+    y = events.loc[X_full.index, "label"].values
+    t1 = events.loc[X_full.index, "t1"]
+
+    # 4) CV splitter
+    cv = PurgedKFold(
+        n_splits=cfg.n_splits,
+        embargo_pct=cfg.embargo_pct,
+        t1=t1
+    )
+
+    # 5) Tree model (Gradient Boosting)
+    model = GradientBoostingClassifier(
+        n_estimators=200,
+        learning_rate=0.05,
+        max_depth=3,
+        subsample=0.8,
+        random_state=cfg.random_state
+    )
+
+    # 6) Purged K-Fold evaluation
+    res_cv = evaluate_model_cv(
+        model=model,
+        X=X_full,
+        y=y,
+        cv=cv,
+        label="gbm_for_shap"
+    )
+
+    df_cv = res_cv["df"]
+    df_cv.to_csv(cfg.out_cv_csv, index=False)
+    print(f"[OK] Saved CV results → {cfg.out_cv_csv}")
+
+    # 7) Fit final model on full data
+    model_full = clone(model)
+    model_full.fit(X_full, y)
+
+    # 8) SHAP explainability
+    shap_df, global_importance, base_value = compute_tree_shap(
+        model=model_full,
+        X=X_full,
+        cfg=cfg
+    )
+
+    # 9) Save raw artifacts: events & features & SHAP
+    events.to_csv(cfg.out_events_csv, index_label="timestamp")
+    X_full.to_csv(cfg.out_features_csv, index_label="timestamp")
+    print(f"[OK] Saved events → {cfg.out_events_csv}")
+    print(f"[OK] Saved features → {cfg.out_features_csv}")
+
+    if not shap_df.empty:
+        shap_df.to_csv(cfg.out_shap_csv, index_label="timestamp")
+        print(f"[OK] Saved SHAP values → {cfg.out_shap_csv}")
+
+        # Global importance as DataFrame
+        imp_df = pd.DataFrame(
+            {"feature": list(global_importance.keys()),
+             "mean_abs_shap": list(global_importance.values())}
+        ).sort_values("mean_abs_shap", ascending=False)
+        imp_df.to_csv(cfg.out_importance_csv, index=False)
+        print(f"[OK] Saved feature importance → {cfg.out_importance_csv}")
+
+        # Top-k driver table (compact)
+        topk_df = build_top_k_driver_table(shap_df, cfg)
+        # Save this as a convenience CSV
+        topk_path = cfg.out_shap_csv.replace(".csv", "_topk.csv")
+        topk_df.to_csv(topk_path, index_label="timestamp")
+        print(f"[OK] Saved top-{cfg.top_k_per_row} driver table → {topk_path}")
+
+        # Quick importance bar plot
+        plt.figure(figsize=(6, 4))
+        imp_df.head(10).set_index("feature")["mean_abs_shap"].plot(kind="bar")
+        plt.title("Level-49: Top Features by mean(|SHAP|)")
+        plt.ylabel("mean(|SHAP|)")
+        plt.grid(axis="y", alpha=0.3)
+        plt.tight_layout()
+        plt.show()
+    else:
+        print("[INFO] SHAP results are empty (likely no 'shap' installed).")
+
+    # 10) Save JSON summary (metrics + config + base_value)
+    summary = {
+        "cv_metrics": res_cv["metrics"],
+        "base_value": base_value,
+        "symbol": cfg.symbol,
+        "start": cfg.start,
+        "horizon": cfg.horizon,
+        "pos_threshold": cfg.pos_threshold,
+        "max_lag": cfg.max_lag,
+        "roll_vol_window": cfg.roll_vol_window,
+        "n_splits": cfg.n_splits,
+        "embargo_pct": cfg.embargo_pct,
+    }
+    with open(cfg.out_summary_json, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+    print(f"[OK] Saved summary → {cfg.out_summary_json}")
+
+    print("\n=== CV Summary ===")
+    m = res_cv["metrics"]
+    print(
+        f"GBM | ROC-AUC: {m['roc_auc_mean']:.3f}±{m['roc_auc_std']:.3f} "
+        f"| PR-AUC: {m['pr_auc_mean']:.3f}±{m['pr_auc_std']:.3f}"
+    )
+
+
+# -------------------- Main -------------------- #
+
+def main():
+    cfg = Config()
+    run_demo(cfg)
+
+
+if __name__ == "__main__":
+    # Jupyter / PyCharm-safe: strip any '-f kernel-xxxx.json' args
+    import sys
+    sys.argv = [sys.argv[0]]
+    main()
+```
+
+If you hit **any** traceback when running this (yfinance, shap, pandas quirks, etc.), paste the full error and I’ll refactor the *entire* file around it, just like we did for the earlier levels.
