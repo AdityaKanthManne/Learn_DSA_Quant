@@ -1,0 +1,13 @@
+{
+  "psi_threshold": 0.25,
+  "ks_alpha": 0.05,
+  "max_feature_psi": 4.469740054768424,
+  "n_features_psi_over_threshold": 4,
+  "label_share_ref": 0.6312101910828025,
+  "label_share_cur": 0.6539196940726577,
+  "label_ks_stat": 0.022709502989855197,
+  "label_ks_pvalue": 0.9839574977505539,
+  "auc": 0.539484827828386,
+  "acc": 0.6221374045801527,
+  "RETRAIN_REQUIRED": true
+}
