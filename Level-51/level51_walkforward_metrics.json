@@ -1,0 +1,11 @@
+{
+  "auc": 0.4908561928512053,
+  "accuracy": 0.5520110957004161,
+  "hit_ratio_long": 0.5556612749762131,
+  "terminal_equity_strategy": 2.8933752986299863,
+  "terminal_equity_buyhold": 2.8895260315621183,
+  "excess_equity": 0.003849267067868034,
+  "strategy_ann_return": 0.14143517627169222,
+  "strategy_ann_vol": 0.18731266814097378,
+  "strategy_sharpe": 0.7550753383388165
+}
