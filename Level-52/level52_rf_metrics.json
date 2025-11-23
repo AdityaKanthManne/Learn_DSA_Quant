@@ -1,0 +1,9 @@
+{
+  "auc": 0.5055646452791573,
+  "accuracy": 0.48433530906011857,
+  "sharpe_strat": -2.573382467607431,
+  "hit_rate_strat_vs_ret": 0.3353090601185436,
+  "n_train": 2755,
+  "n_test": 1181,
+  "proba_threshold": 0.55
+}
