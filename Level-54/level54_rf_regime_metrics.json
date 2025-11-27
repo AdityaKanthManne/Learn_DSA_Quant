@@ -1,0 +1,117 @@
+{
+  "best_config": {
+    "n_estimators": 200,
+    "max_depth": 3.0,
+    "min_samples_leaf": 1,
+    "val_auc": 0.6907899467268034,
+    "val_acc": 0.6448362720403022
+  },
+  "test_metrics": {
+    "auc_test": 0.6590235737738559,
+    "acc_test": 0.6113207547169811,
+    "regime_hit_rate": 0.6113207547169811,
+    "sharpe_strat": 1.1849167522177286,
+    "sharpe_buyhold": 1.11037106756508,
+    "n_test": 795,
+    "position_high_turb": 0.5,
+    "position_low_turb": 1.0
+  },
+  "grid_metrics": [
+    {
+      "key": "n200_d3_leaf1",
+      "n_estimators": 200,
+      "max_depth": 3.0,
+      "min_samples_leaf": 1,
+      "auc_val": 0.6907899467268034,
+      "acc_val": 0.6448362720403022
+    },
+    {
+      "key": "n200_d3_leaf5",
+      "n_estimators": 200,
+      "max_depth": 3.0,
+      "min_samples_leaf": 5,
+      "auc_val": 0.6907834101382488,
+      "acc_val": 0.646095717884131
+    },
+    {
+      "key": "n100_d3_leaf1",
+      "n_estimators": 100,
+      "max_depth": 3.0,
+      "min_samples_leaf": 1,
+      "auc_val": 0.6905644344216753,
+      "acc_val": 0.6423173803526449
+    },
+    {
+      "key": "n100_d3_leaf5",
+      "n_estimators": 100,
+      "max_depth": 3.0,
+      "min_samples_leaf": 5,
+      "auc_val": 0.6904794587704677,
+      "acc_val": 0.646095717884131
+    },
+    {
+      "key": "n200_d5_leaf5",
+      "n_estimators": 200,
+      "max_depth": 5.0,
+      "min_samples_leaf": 5,
+      "auc_val": 0.6670457888028238,
+      "acc_val": 0.6448362720403022
+    },
+    {
+      "key": "n100_d5_leaf5",
+      "n_estimators": 100,
+      "max_depth": 5.0,
+      "min_samples_leaf": 5,
+      "auc_val": 0.662208713272543,
+      "acc_val": 0.6435768261964736
+    },
+    {
+      "key": "n200_d5_leaf1",
+      "n_estimators": 200,
+      "max_depth": 5.0,
+      "min_samples_leaf": 1,
+      "auc_val": 0.6598424682158381,
+      "acc_val": 0.6448362720403022
+    },
+    {
+      "key": "n100_d5_leaf1",
+      "n_estimators": 100,
+      "max_depth": 5.0,
+      "min_samples_leaf": 1,
+      "auc_val": 0.6581266137202993,
+      "acc_val": 0.646095717884131
+    },
+    {
+      "key": "n100_dNone_leaf5",
+      "n_estimators": 100,
+      "max_depth": NaN,
+      "min_samples_leaf": 5,
+      "auc_val": 0.635408700199366,
+      "acc_val": 0.6309823677581864
+    },
+    {
+      "key": "n200_dNone_leaf5",
+      "n_estimators": 200,
+      "max_depth": NaN,
+      "min_samples_leaf": 5,
+      "auc_val": 0.6327940647775925,
+      "acc_val": 0.6322418136020151
+    },
+    {
+      "key": "n100_dNone_leaf1",
+      "n_estimators": 100,
+      "max_depth": NaN,
+      "min_samples_leaf": 1,
+      "auc_val": 0.6221002059025396,
+      "acc_val": 0.6221662468513854
+    },
+    {
+      "key": "n200_dNone_leaf1",
+      "n_estimators": 200,
+      "max_depth": NaN,
+      "min_samples_leaf": 1,
+      "auc_val": 0.6201555708075955,
+      "acc_val": 0.6133501259445844
+    }
+  ]
+}
