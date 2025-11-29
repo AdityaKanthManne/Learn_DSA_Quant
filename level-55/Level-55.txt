@@ -1,0 +1,642 @@
+Nice, let’s keep the momentum going. Here’s a full Level-55 script, end-to-end, ready to drop into PyCharm or a Jupyter cell.
+
+---
+
+```python
+"""
+Level-55 — Gradient-Boosted Directional Signal with Confidence-Filtered Position Sizing
+---------------------------------------------------------------------------------------
+
+DSA concept (what you are practicing here)
+------------------------------------------
+This level is all about combining three data-structure / algorithmic patterns that
+show up constantly in real quant work:
+
+1) Sliding windows on arrays for feature engineering.
+   We build features like rolling returns, volatility, and momentum with different
+   horizons (1, 5, 20 days). Conceptually these are classic fixed-size sliding windows
+   over a time-indexed array of returns or prices, implemented using pandas' rolling()
+   but mapping directly to the underlying two-pointer / prefix-sum style logic.
+
+2) Gradient boosting over shallow trees.
+   GradientBoostingClassifier is an ensemble of decision trees built sequentially.
+   Each tree is a recursive structure (nodes and leaves) that lives in an array of
+   trees. You’re effectively working with:
+      - a list/array of trees,
+      - each tree being a hierarchical data structure.
+   The algorithm itself is an iterative refinement (boosting) over residuals, which
+   is a practical example of using arrays of models and iterating with updates.
+
+3) Grid search over hyperparameters with dictionaries and tabular aggregation.
+   We loop over (n_estimators, learning_rate, max_depth), store validation metrics
+   in dictionaries keyed by configuration, then convert to a DataFrame and sort
+   by AUC to pick the best model. This is essentially:
+      - iterating over a Cartesian product grid,
+      - aggregating results in a list of dicts,
+      - then using sort/argmax on the resulting table.
+
+Quant idea (what this model does financially)
+---------------------------------------------
+We build a **directional classifier** for a single asset (default: SPY) using daily
+data. The label is simply:
+
+    y_t = 1 if next-day return r_{t+1} > 0
+          0 otherwise
+
+So we are trying to estimate the probability that tomorrow’s log-return is positive.
+We engineer features from past returns, volatility, momentum, a Bollinger-band
+position, and an RSI-like oscillator.
+
+Once we have predicted probabilities p_up on an out-of-sample test set, we define
+a very simple confidence-filtered strategy:
+
+    - If p_up >= p_entry (e.g., 0.55), we go long with full exposure (position = 1.0).
+    - Otherwise we stay flat (position = 0.0).
+
+This is a basic “only trade when the model is confident” overlay on buy-and-hold,
+and we compare its Sharpe ratio and hit-rate (fraction of days where the sign of
+the return is correctly predicted when we have a non-zero position) versus a
+constant long-only benchmark.
+
+External resources to explore similar ideas
+-------------------------------------------
+For the boosting algorithm and implementation details, the scikit-learn documentation
+for GradientBoostingClassifier is the canonical reference. If you search for phrases
+like "gradient boosting stock prediction sklearn", "tree-based classification for
+direction of returns" or "boosted trees financial time series" you’ll find a lot
+of practical notebooks that mirror this setup: engineered time-series features,
+an ML classifier, and a confidence-filtered trading rule on top.
+"""
+
+from dataclasses import dataclass
+from typing import Dict, List
+
+import json
+import math
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+import matplotlib.pyplot as plt
+
+from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.metrics import roc_auc_score, accuracy_score
+
+
+# ---------------------------- Config ---------------------------- #
+
+
+@dataclass
+class Config:
+    symbol: str = "SPY"
+    start: str = "2010-01-01"
+
+    # train/val/test splits (chronological)
+    train_frac: float = 0.6
+    val_frac: float = 0.2  # test_frac = 1 - train_frac - val_frac
+
+    # Gradient boosting hyperparameter grid
+    n_estimators_grid: List[int] = None
+    learning_rate_grid: List[float] = None
+    max_depth_grid: List[int] = None
+
+    random_state: int = 55
+
+    # trading rule: only go long when confidence is high enough
+    prob_entry_long: float = 0.55
+
+    # output paths
+    out_preds_csv: str = "level55_gb_direction_predictions.csv"
+    out_grid_csv: str = "level55_gb_grid_results.csv"
+    out_metrics_json: str = "level55_gb_direction_metrics.json"
+
+    def __post_init__(self):
+        if self.n_estimators_grid is None:
+            self.n_estimators_grid = [100, 200]
+        if self.learning_rate_grid is None:
+            self.learning_rate_grid = [0.05, 0.1]
+        if self.max_depth_grid is None:
+            self.max_depth_grid = [2, 3]
+
+
+# ------------------------ Utility functions --------------------- #
+
+
+def synthetic_price_series(
+    n: int = 2500,
+    start_price: float = 100.0,
+) -> pd.Series:
+    """Fallback geometric random walk if yfinance fails."""
+    rng = np.random.default_rng(55)
+    mu_daily = 0.06 / 252.0
+    sigma_daily = 0.2 / math.sqrt(252.0)
+    rets = rng.normal(mu_daily, sigma_daily, size=n)
+    prices = start_price * np.exp(np.cumsum(rets))
+    idx = pd.date_range("2010-01-01", periods=n, freq="B")
+    return pd.Series(prices, index=idx, name="close")
+
+
+def load_price_series(cfg: Config) -> pd.DataFrame:
+    """
+    Robust loader around yfinance.
+
+    Handles:
+        - Series
+        - DataFrame with OHLCV
+        - MultiIndex columns
+
+    Falls back to synthetic data if download fails or returns empty.
+    """
+    try:
+        px = yf.download(
+            cfg.symbol,
+            start=cfg.start,
+            auto_adjust=True,
+            progress=False,
+        )
+    except Exception:
+        px = pd.DataFrame()
+
+    if px is None or len(px) == 0:
+        print("[WARN] yfinance download failed. Using synthetic price path.")
+        close = synthetic_price_series()
+    else:
+        if isinstance(px, pd.Series):
+            close_obj = px
+        elif isinstance(px, pd.DataFrame):
+            if "Close" in px.columns:
+                close_obj = px["Close"]
+            else:
+                if isinstance(px.columns, pd.MultiIndex):
+                    candidates = [
+                        c
+                        for c in px.columns
+                        if str(c[0]).lower() == "close"
+                        or str(c[-1]).lower() == "close"
+                    ]
+                    if len(candidates) > 0:
+                        close_obj = px[candidates[0]]
+                    else:
+                        close_obj = px.iloc[:, 0]
+                else:
+                    num_cols = px.select_dtypes(include=[np.number])
+                    if num_cols.shape[1] > 0:
+                        close_obj = num_cols.iloc[:, 0]
+                    else:
+                        close_obj = px.iloc[:, 0]
+        else:
+            raise RuntimeError("Unexpected type from yfinance download.")
+
+        close_arr = np.asarray(close_obj, dtype=float).reshape(-1)
+        close = pd.Series(close_arr, index=close_obj.index, name="close")
+
+    df = pd.DataFrame({"close": close.astype(float)})
+    df["ret"] = np.log(df["close"]).diff()
+    df = df.dropna().copy()
+    return df
+
+
+def sharpe_ratio(ret: pd.Series, ann_factor: float = 252.0) -> float:
+    """Simple Sharpe estimate with sample standard deviation (ddof=1)."""
+    if ret is None or len(ret) < 2:
+        return 0.0
+    mu = float(ret.mean())
+    sigma = float(ret.std(ddof=1))
+    if sigma <= 0:
+        return 0.0
+    return float(mu / sigma * math.sqrt(ann_factor))
+
+
+def sign_hit_rate(
+    pred_ret_sign: pd.Series,
+    realized_ret: pd.Series,
+    mask: pd.Series,
+) -> float:
+    """
+    Sign hit-rate restricted to the days where mask is True.
+    For example, mask could be (position != 0) to measure accuracy
+    only on days where the strategy actually takes risk.
+    """
+    aligned = pd.concat(
+        [pred_ret_sign, realized_ret, mask.astype(bool)], axis=1
+    ).dropna()
+    if aligned.shape[0] == 0:
+        return 0.0
+
+    aligned = aligned[aligned.iloc[:, 2]]  # filter by mask
+    if aligned.shape[0] == 0:
+        return 0.0
+
+    pred_sign = aligned.iloc[:, 0]
+    real_sign = np.sign(aligned.iloc[:, 1])
+    # consider zero returns as "no sign", they don't count as hits
+    non_zero = real_sign != 0.0
+    if non_zero.sum() == 0:
+        return 0.0
+    return float((pred_sign[non_zero] == real_sign[non_zero]).mean())
+
+
+# ----------------------- Feature engineering -------------------- #
+
+
+def build_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Feature set:
+
+        r1, r5, r20:
+            1-day, 5-day, 20-day past log returns.
+        vol_5, vol_20:
+            rolling std of returns.
+        mom_20:
+            20-day log momentum.
+        bb_pos_20:
+            normalized Bollinger-band position.
+        rsi_14:
+            RSI-like oscillator built from EWMA of up/down moves.
+    """
+    out = df.copy()
+
+    out["r1"] = out["ret"].shift(1)
+    out["r5"] = out["ret"].rolling(5).sum().shift(1)
+    out["r20"] = out["ret"].rolling(20).sum().shift(1)
+
+    out["vol_5"] = out["ret"].rolling(5).std().shift(1)
+    out["vol_20"] = out["ret"].rolling(20).std().shift(1)
+
+    out["mom_20"] = np.log(out["close"] / out["close"].shift(20))
+
+    rolling_mean = out["close"].rolling(20).mean()
+    rolling_std = out["close"].rolling(20).std()
+    out["bb_pos_20"] = (out["close"] - rolling_mean) / (rolling_std + 1e-12)
+
+    def rsi_like(ret: pd.Series, span: int = 14) -> pd.Series:
+        up = ret.clip(lower=0.0)
+        dn = -ret.clip(upper=0.0)
+        avg_up = up.ewm(alpha=1 / span, adjust=False).mean()
+        avg_dn = dn.ewm(alpha=1 / span, adjust=False).mean()
+        rs = avg_up / (avg_dn + 1e-12)
+        rsi = 100.0 - 100.0 / (1.0 + rs)
+        return rsi
+
+    out["rsi_14"] = rsi_like(out["ret"])
+
+    out = out.dropna().copy()
+    return out
+
+
+def build_direction_labels(feat_df: pd.DataFrame) -> pd.Series:
+    """
+    Direction label:
+
+        y_t = 1 if next-day return > 0
+              0 otherwise
+
+    We shift the return by -1 so that at time t we predict r_{t+1}.
+    """
+    next_ret = feat_df["ret"].shift(-1)
+    y = (next_ret > 0.0).astype(int)
+    y.name = "y"
+    return y
+
+
+# ------------------------- Time splits -------------------------- #
+
+
+def chrono_splits(
+    data: pd.DataFrame,
+    train_frac: float,
+    val_frac: float,
+) -> Dict[str, pd.DataFrame]:
+    """
+    Chronological splits: train, val, test.
+
+    n_train = floor(train_frac * n)
+    n_val   = floor(val_frac * n)
+    n_test  = n - n_train - n_val
+    """
+    n = len(data)
+    n_train = int(train_frac * n)
+    n_val = int(val_frac * n)
+    n_test = n - n_train - n_val
+    if n_test <= 0:
+        raise ValueError("Not enough data for test split; adjust fractions.")
+
+    train = data.iloc[:n_train].copy()
+    val = data.iloc[n_train : n_train + n_val].copy()
+    test = data.iloc[n_train + n_val :].copy()
+
+    return {"train": train, "val": val, "test": test}
+
+
+def gb_key(n_estimators: int, learning_rate: float, max_depth: int) -> str:
+    return f"n{n_estimators}_lr{learning_rate}_d{max_depth}"
+
+
+# --------------------- Model fitting / eval --------------------- #
+
+
+def fit_gb_for_config(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    X_val: pd.DataFrame,
+    y_val: pd.Series,
+    n_estimators: int,
+    learning_rate: float,
+    max_depth: int,
+    cfg: Config,
+) -> Dict[str, float]:
+    """
+    Fit a GradientBoostingClassifier with given hyperparameters,
+    and evaluate metrics on the validation set.
+    """
+    gb = GradientBoostingClassifier(
+        n_estimators=n_estimators,
+        learning_rate=learning_rate,
+        max_depth=max_depth,
+        random_state=cfg.random_state,
+    )
+    gb.fit(X_train.values, y_train.values)
+
+    proba_val = gb.predict_proba(X_val.values)[:, 1]
+    y_pred_val = (proba_val >= 0.5).astype(int)
+
+    try:
+        auc_val = roc_auc_score(y_val.values, proba_val)
+    except ValueError:
+        auc_val = float("nan")
+
+    acc_val = accuracy_score(y_val.values, y_pred_val)
+
+    return {
+        "auc_val": float(auc_val) if np.isfinite(auc_val) else float("nan"),
+        "acc_val": float(acc_val),
+        "gb": gb,
+    }
+
+
+def refit_best_gb(
+    splits: Dict[str, pd.DataFrame],
+    X_cols: List[str],
+    best_cfg: Dict[str, object],
+    cfg: Config,
+) -> GradientBoostingClassifier:
+    """
+    Refit GradientBoostingClassifier on train+val with best hyperparameters.
+    """
+    train = splits["train"]
+    val = splits["val"]
+    df_tv = pd.concat([train, val], axis=0)
+
+    X_tv = df_tv[X_cols]
+    y_tv = df_tv["y"].astype(int)
+
+    gb = GradientBoostingClassifier(
+        n_estimators=int(best_cfg["n_estimators"]),
+        learning_rate=float(best_cfg["learning_rate"]),
+        max_depth=int(best_cfg["max_depth"]),
+        random_state=cfg.random_state,
+    )
+    gb.fit(X_tv.values, y_tv.values)
+    return gb
+
+
+# ----------------------------- IO ------------------------------- #
+
+
+def save_predictions(
+    test_df: pd.DataFrame,
+    p_up: pd.Series,
+    position: pd.Series,
+    strat_ret: pd.Series,
+    cfg: Config,
+) -> None:
+    """
+    Save per-date test predictions and strategy returns.
+    """
+    out = pd.DataFrame(
+        {
+            "close": test_df["close"],
+            "ret": test_df["ret"],
+            "label_y": test_df["y"],
+            "p_up": p_up,
+            "position": position,
+            "strat_ret": strat_ret,
+        }
+    )
+    out.to_csv(cfg.out_preds_csv, index=True)
+    print(f"[OK] Saved test predictions → {cfg.out_preds_csv}")
+
+
+def save_grid_results(grid_df: pd.DataFrame, cfg: Config) -> None:
+    grid_df.to_csv(cfg.out_grid_csv, index=False)
+    print(f"[OK] Saved grid search results → {cfg.out_grid_csv}")
+
+
+def save_metrics(
+    best_row: Dict[str, object],
+    test_metrics: Dict[str, float],
+    cfg: Config,
+) -> None:
+    payload = {
+        "best_config": {
+            "n_estimators": int(best_row["n_estimators"]),
+            "learning_rate": float(best_row["learning_rate"]),
+            "max_depth": int(best_row["max_depth"]),
+            "val_auc": float(best_row["auc_val"]),
+            "val_acc": float(best_row["acc_val"]),
+        },
+        "test_metrics": test_metrics,
+    }
+    with open(cfg.out_metrics_json, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+    print(f"[OK] Saved metrics → {cfg.out_metrics_json}")
+
+
+def plot_equity_curves(
+    strat_ret: pd.Series,
+    bh_ret: pd.Series,
+) -> None:
+    """
+    Simple equity curve plot for strategy vs buy-and-hold.
+    """
+    equity_strat = (1.0 + strat_ret).cumprod()
+    equity_bh = (1.0 + bh_ret).cumprod()
+
+    plt.figure(figsize=(9, 5))
+    plt.plot(equity_strat.index, equity_strat.values, label="Strategy")
+    plt.plot(equity_bh.index, equity_bh.values, label="Buy & Hold", linestyle="--")
+    plt.legend()
+    plt.title("Equity Curves — Gradient-Boosted Directional Strategy vs Buy & Hold")
+    plt.xlabel("Date")
+    plt.ylabel("Equity (normalized)")
+    plt.tight_layout()
+    plt.show()
+
+
+# --------------------------- Pipeline --------------------------- #
+
+
+def run_pipeline(cfg: Config) -> None:
+    # 1) Load data
+    df = load_price_series(cfg)
+    print(
+        f"[INFO] Loaded {len(df)} rows from {df.index.min().date()} "
+        f"to {df.index.max().date()}"
+    )
+
+    # 2) Features and labels
+    feat = build_features(df)
+    y = build_direction_labels(feat)
+
+    data = pd.concat([feat, y], axis=1).dropna().copy()
+
+    # 3) Chronological splits
+    splits = chrono_splits(data, cfg.train_frac, cfg.val_frac)
+    train = splits["train"]
+    val = splits["val"]
+    test = splits["test"]
+
+    X_cols = [c for c in data.columns if c != "y"]
+
+    X_train = train[X_cols]
+    y_train = train["y"].astype(int)
+    X_val = val[X_cols]
+    y_val = val["y"].astype(int)
+    X_test = test[X_cols]
+    y_test = test["y"].astype(int)
+
+    print(
+        f"[INFO] Split sizes — "
+        f"train: {len(train)}, val: {len(val)}, test: {len(test)}"
+    )
+
+    # 4) Grid search over GradientBoosting hyperparameters
+    results = []
+    gb_map: Dict[str, GradientBoostingClassifier] = {}
+
+    for n_est in cfg.n_estimators_grid:
+        for lr in cfg.learning_rate_grid:
+            for d in cfg.max_depth_grid:
+                key = gb_key(n_est, lr, d)
+                print(f"[INFO] Fitting GB config {key} ...")
+                res = fit_gb_for_config(
+                    X_train,
+                    y_train,
+                    X_val,
+                    y_val,
+                    n_estimators=n_est,
+                    learning_rate=lr,
+                    max_depth=d,
+                    cfg=cfg,
+                )
+                results.append(
+                    {
+                        "key": key,
+                        "n_estimators": n_est,
+                        "learning_rate": lr,
+                        "max_depth": d,
+                        "auc_val": res["auc_val"],
+                        "acc_val": res["acc_val"],
+                    }
+                )
+                gb_map[key] = res["gb"]
+
+    grid_df = pd.DataFrame(results).sort_values("auc_val", ascending=False)
+    print("[INFO] Validation results (sorted by AUC):")
+    print(grid_df)
+
+    # 5) Choose best config
+    best_row = grid_df.iloc[0].to_dict()
+    best_key = best_row["key"]
+    print(
+        f"[INFO] Best GB config = {best_key} with val AUC="
+        f"{best_row['auc_val']:.4f}, acc={best_row['acc_val']:.4f}"
+    )
+
+    best_cfg = {
+        "n_estimators": best_row["n_estimators"],
+        "learning_rate": best_row["learning_rate"],
+        "max_depth": best_row["max_depth"],
+    }
+
+    # 6) Refit on train+val with best config
+    best_gb = refit_best_gb(splits, X_cols, best_cfg, cfg)
+
+    # 7) Evaluate on test
+    p_up_test = pd.Series(
+        best_gb.predict_proba(X_test.values)[:, 1],
+        index=X_test.index,
+        name="p_up",
+    )
+    y_pred_test = (p_up_test >= 0.5).astype(int)
+
+    try:
+        auc_test = roc_auc_score(y_test.values, p_up_test.values)
+    except ValueError:
+        auc_test = float("nan")
+
+    acc_test = accuracy_score(y_test.values, y_pred_test.values)
+
+    # Strategy: long only when p_up >= prob_entry_long
+    position = pd.Series(
+        0.0,
+        index=p_up_test.index,
+        name="position",
+    )
+    position[p_up_test >= cfg.prob_entry_long] = 1.0
+
+    # Strategy returns and benchmark
+    strat_ret = position * df["ret"].loc[position.index]
+    strat_ret.name = "strat_ret"
+
+    bh_ret = df["ret"].loc[strat_ret.index]
+
+    sharpe_strat = sharpe_ratio(strat_ret)
+    sharpe_bh = sharpe_ratio(bh_ret)
+
+    # Sign hit-rate on days we actually have a position
+    pred_sign = np.where(p_up_test >= 0.5, 1.0, -1.0)
+    pred_sign_series = pd.Series(pred_sign, index=p_up_test.index, name="pred_sign")
+    mask_trading = position != 0.0
+    sign_hr = sign_hit_rate(pred_sign_series, df["ret"].loc[p_up_test.index], mask_trading)
+
+    test_metrics = {
+        "auc_test": float(auc_test) if np.isfinite(auc_test) else float("nan"),
+        "acc_test": float(acc_test),
+        "sharpe_strat": float(sharpe_strat),
+        "sharpe_buyhold": float(sharpe_bh),
+        "sign_hit_rate_trading_days": float(sign_hr),
+        "prob_entry_long": float(cfg.prob_entry_long),
+        "n_test": int(len(test)),
+    }
+
+    print("[INFO] Test metrics:")
+    for k, v in test_metrics.items():
+        print(f"  {k}: {v}")
+
+    # 8) Save outputs
+    save_predictions(test, p_up_test, position, strat_ret, cfg)
+    save_grid_results(grid_df, cfg)
+    save_metrics(best_row, test_metrics, cfg)
+
+    # 9) Plot equity curves
+    try:
+        plot_equity_curves(strat_ret, bh_ret)
+    except Exception:
+        pass
+
+
+# ----------------------------- Main ----------------------------- #
+
+
+if __name__ == "__main__":
+    # Jupyter-safe: strip unexpected CLI args
+    import sys
+
+    sys.argv = [sys.argv[0]]
+    cfg = Config()
+    run_pipeline(cfg)
+```
+
+You can drop this into `level55_gb_directional.py` or a Jupyter cell.
+If you hit any traceback, paste it and I’ll send back a fully patched version of the entire script again.
