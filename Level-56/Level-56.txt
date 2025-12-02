@@ -1,0 +1,558 @@
+```python
+"""
+Level-56 — Regime-Aware Volatility-Targeted SPY/TLT/SHY Overlay
+
+What this script does
+---------------------
+- Downloads daily prices for SPY, TLT, SHY (or builds synthetic data if download fails).
+- Builds simple market regime labels (“risk_off” vs “normal”) from SPY drawdowns / vol.
+- Creates features from trailing returns, volatility, correlation, and drawdown.
+- Trains a RandomForest classifier to predict next-day risk_off probability.
+- Converts regime probabilities into dynamic SPY/TLT/SHY weights.
+- Applies volatility targeting (e.g., 10% annualized) with leverage cap.
+- Computes portfolio equity curve, drawdowns, and a static 60/40 SPY/TLT benchmark.
+- Saves:
+    - level56_regime_portfolio.csv  (daily data, weights, returns)
+    - level56_regime_summary.json   (CAGR, vol, Sharpe, max DD, etc.)
+
+Run it in PyCharm or a Jupyter cell as-is.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Dict, Tuple
+
+import json
+import math
+import numpy as np
+import pandas as pd
+import yfinance as yf
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import roc_auc_score, accuracy_score
+
+
+# ---------------------------- Config ---------------------------- #
+
+
+@dataclass
+class Config:
+    symbols: Tuple[str, str, str] = ("SPY", "TLT", "SHY")
+    start: str = "2010-01-01"
+
+    # Regime labelling thresholds (for SPY)
+    lookback_ret_days: int = 21      # ~1 month
+    lookback_dd_days: int = 63      # ~3 months
+    lookback_vol_days: int = 21
+
+    ret_thresh: float = -0.05       # -5% over 1 month
+    dd_thresh: float = -0.10        # -10% drawdown over 3 months
+    vol_thresh: float = 0.25        # 25% annualized realized vol
+
+    # ML model hyperparameters
+    rf_estimators: int = 200
+    rf_max_depth: int | None = 5
+    rf_min_samples_leaf: int = 5
+    rf_random_state: int = 56
+
+    # Train/val/test split (by time)
+    train_frac: float = 0.6
+    val_frac: float = 0.2  # test_frac implied as 1 - train_frac - val_frac
+
+    # Vol-targeting and allocation
+    target_vol: float = 0.10        # 10% annual vol
+    vol_lookback: int = 21
+    max_leverage: float = 1.5
+
+    # Regime-based base weights (before vol targeting)
+    # (p = predicted probability of risk_off)
+    p_low: float = 0.4
+    p_high: float = 0.7
+
+    # Output paths
+    out_csv: str = "level56_regime_portfolio.csv"
+    out_json: str = "level56_regime_summary.json"
+
+
+# ---------------------- Data utilities -------------------------- #
+
+
+def build_synthetic_prices(cfg: Config) -> pd.DataFrame:
+    """
+    If yfinance download fails, build synthetic correlated price series
+    for SPY, TLT, SHY using a simple multi-asset GBM.
+    """
+    print("[WARN] Falling back to synthetic prices.")
+    rng = np.random.default_rng(56)
+    n_days = 4000
+
+    dates = pd.bdate_range("2010-01-04", periods=n_days, freq="B")
+
+    # Correlation structure: SPY risk, TLT defensive, SHY ~ cash
+    corr = np.array(
+        [
+            [1.0, -0.3, 0.0],
+            [-0.3, 1.0, 0.1],
+            [0.0, 0.1, 1.0],
+        ]
+    )
+    chol = np.linalg.cholesky(corr)
+
+    # Annualized vol assumptions
+    vols = np.array([0.18, 0.12, 0.01])
+    mus = np.array([0.07, 0.04, 0.02])
+
+    dt = 1.0 / 252.0
+    z = rng.standard_normal((n_days, 3))
+    eps = z @ chol.T
+
+    rets = (mus - 0.5 * vols**2) * dt + vols * math.sqrt(dt) * eps
+    prices = 100.0 * np.exp(np.cumsum(rets, axis=0))
+
+    df = pd.DataFrame(prices, index=dates, columns=list(cfg.symbols))
+    return df
+
+
+def load_price_series(cfg: Config) -> pd.DataFrame:
+    """
+    Download daily adjusted close prices for the symbols from yfinance.
+    Handles MultiIndex columns and falls back to synthetic if needed.
+    """
+    try:
+        data = yf.download(
+            list(cfg.symbols),
+            start=cfg.start,
+            auto_adjust=True,
+            progress=False,
+        )
+    except Exception:
+        data = pd.DataFrame()
+
+    if data is None or data.empty:
+        return build_synthetic_prices(cfg)
+
+    # yfinance: if MultiIndex, pick "Close" (or "Adj Close" if using raw)
+    if isinstance(data.columns, pd.MultiIndex):
+        if ("Adj Close" in data.columns.get_level_values(0)) and (
+            "Close" not in data.columns.get_level_values(0)
+        ):
+            close = data["Adj Close"].copy()
+        else:
+            close = data["Close"].copy()
+    else:
+        # Single level columns: assume all are prices of different tickers
+        close = data.copy()
+
+    # Keep only requested symbols if present
+    cols = [c for c in close.columns if c in cfg.symbols]
+    if not cols:
+        return build_synthetic_prices(cfg)
+
+    close = close[cols].sort_index()
+    close = close.dropna(how="any").copy()
+
+    # If we are missing some symbol, create flat 1.0 series (placeholder)
+    for sym in cfg.symbols:
+        if sym not in close.columns:
+            close[sym] = 1.0
+
+    close = close[list(cfg.symbols)]
+    return close
+
+
+# ------------------- Label & feature engineering ---------------- #
+
+
+def compute_drawdown(series: pd.Series, window: int) -> pd.Series:
+    """
+    Rolling maximum drawdown over 'window' days:
+        dd_t = price_t / max(price_{t-window+1 ... t}) - 1
+    """
+    roll_max = series.rolling(window, min_periods=1).max()
+    dd = series / roll_max - 1.0
+    return dd
+
+
+def make_regime_labels(cfg: Config, prices: pd.DataFrame) -> pd.Series:
+    """
+    Build a "risk_off" boolean label from SPY time series using
+    trailing returns, drawdowns, and realized volatility.
+    """
+    spy = prices[cfg.symbols[0]].copy()
+
+    ret_21 = spy.pct_change(cfg.lookback_ret_days)
+    dd_63 = compute_drawdown(spy, cfg.lookback_dd_days)
+    vol_21 = spy.pct_change().rolling(cfg.lookback_vol_days).std() * math.sqrt(252.0)
+
+    risk_off_now = (
+        (ret_21 <= cfg.ret_thresh)
+        | (dd_63 <= cfg.dd_thresh)
+        | (vol_21 >= cfg.vol_thresh)
+    )
+
+    # Label for t+1: if tomorrow is risk_off, today's label is 1
+    y = risk_off_now.shift(-1).astype(float)
+    y = y.reindex(prices.index)
+    # Convert NaNs (due to last row shift) to 0
+    y = y.fillna(0.0)
+    return y
+
+
+def make_features(cfg: Config, prices: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build daily features from trailing returns, volatility, correlation, and drawdown.
+    Features use only information up to time t (no look-ahead).
+    """
+    sym_spy, sym_tlt, sym_shy = cfg.symbols
+    ret = prices.pct_change().fillna(0.0)
+
+    # Trailing returns
+    ret_spy_5 = ret[sym_spy].rolling(5, min_periods=3).sum()
+    ret_spy_21 = ret[sym_spy].rolling(21, min_periods=10).sum()
+    ret_tlt_5 = ret[sym_tlt].rolling(5, min_periods=3).sum()
+    ret_tlt_21 = ret[sym_tlt].rolling(21, min_periods=10).sum()
+
+    # Realized vol (annualized)
+    vol_spy_21 = ret[sym_spy].rolling(21, min_periods=10).std() * math.sqrt(252.0)
+    vol_tlt_21 = ret[sym_tlt].rolling(21, min_periods=10).std() * math.sqrt(252.0)
+
+    # Correlation between SPY & TLT
+    corr_21 = (
+        ret[[sym_spy, sym_tlt]]
+        .rolling(21, min_periods=10)
+        .corr()
+        .unstack()
+        .get((sym_spy, sym_tlt))
+    )
+    corr_21 = corr_21.reindex(prices.index)
+
+    # Drawdown
+    dd_spy_63 = compute_drawdown(prices[sym_spy], 63)
+    dd_tlt_63 = compute_drawdown(prices[sym_tlt], 63)
+
+    feats = pd.DataFrame(
+        {
+            "ret_spy_5": ret_spy_5,
+            "ret_spy_21": ret_spy_21,
+            "ret_tlt_5": ret_tlt_5,
+            "ret_tlt_21": ret_tlt_21,
+            "vol_spy_21": vol_spy_21,
+            "vol_tlt_21": vol_tlt_21,
+            "corr_spy_tlt_21": corr_21,
+            "dd_spy_63": dd_spy_63,
+            "dd_tlt_63": dd_tlt_63,
+        },
+        index=prices.index,
+    )
+
+    feats = feats.dropna().copy()
+    return feats
+
+
+# --------------------- Model training utils --------------------- #
+
+
+def split_train_val_test(
+    cfg: Config, X: pd.DataFrame, y: pd.Series
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Series, pd.Series, pd.Series]:
+    """
+    Split by time into train/val/test according to fractions in cfg.
+    """
+    df = X.copy()
+    df["y"] = y.reindex(X.index)
+
+    df = df.dropna().copy()
+
+    n = len(df)
+    n_train = int(cfg.train_frac * n)
+    n_val = int(cfg.val_frac * n)
+    n_test = n - n_train - n_val
+
+    train_df = df.iloc[:n_train].copy()
+    val_df = df.iloc[n_train : n_train + n_val].copy()
+    test_df = df.iloc[n_train + n_val :].copy()
+
+    X_train = train_df.drop(columns=["y"])
+    y_train = train_df["y"].astype(int)
+    X_val = val_df.drop(columns=["y"])
+    y_val = val_df["y"].astype(int)
+    X_test = test_df.drop(columns=["y"])
+    y_test = test_df["y"].astype(int)
+
+    return X_train, X_val, X_test, y_train, y_val, y_test
+
+
+def train_rf(
+    cfg: Config, X_train: pd.DataFrame, y_train: pd.Series
+) -> RandomForestClassifier:
+    """
+    Train a RandomForest classifier to predict risk_off probability.
+    """
+    rf = RandomForestClassifier(
+        n_estimators=cfg.rf_estimators,
+        max_depth=cfg.rf_max_depth,
+        min_samples_leaf=cfg.rf_min_samples_leaf,
+        random_state=cfg.rf_random_state,
+        n_jobs=-1,
+    )
+    rf.fit(X_train.values, y_train.values)
+    return rf
+
+
+# ------------------- Allocation & backtest ---------------------- #
+
+
+def annualized_stats(ret: pd.Series) -> Dict[str, float]:
+    """
+    Compute basic performance statistics from daily returns.
+    """
+    ret = ret.dropna()
+    if len(ret) == 0:
+        return {
+            "cagr": 0.0,
+            "vol": 0.0,
+            "sharpe": 0.0,
+            "max_drawdown": 0.0,
+        }
+
+    # CAGR
+    total_return = (1.0 + ret).prod()
+    years = len(ret) / 252.0
+    cagr = total_return ** (1.0 / years) - 1.0 if years > 0 else 0.0
+
+    # Vol & Sharpe
+    vol = ret.std() * math.sqrt(252.0)
+    sharpe = cagr / vol if vol > 0 else 0.0
+
+    # Max drawdown
+    equity = (1.0 + ret).cumprod()
+    roll_max = equity.cummax()
+    dd = equity / roll_max - 1.0
+    max_dd = dd.min()
+
+    return {
+        "cagr": float(cagr),
+        "vol": float(vol),
+        "sharpe": float(sharpe),
+        "max_drawdown": float(max_dd),
+    }
+
+
+def regime_weights(cfg: Config, p_risk_off: float) -> Tuple[float, float, float]:
+    """
+    Map risk_off probability to base SPY/TLT/SHY weights (before vol targeting).
+    - p < p_low: aggressive (risk-on).
+    - p_low <= p < p_high: neutral.
+    - p >= p_high: defensive (more TLT, some SHY).
+    """
+    if p_risk_off < cfg.p_low:
+        # Aggressive: 80% SPY, 20% TLT
+        return 0.80, 0.20, 0.0
+    elif p_risk_off < cfg.p_high:
+        # Neutral: 50% SPY, 50% TLT
+        return 0.50, 0.50, 0.0
+    else:
+        # Defensive: 20% SPY, 60% TLT, 20% SHY (cash-like)
+        return 0.20, 0.60, 0.20
+
+
+def apply_vol_targeting(
+    cfg: Config,
+    base_w: pd.DataFrame,
+    asset_ret: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Given base weights and asset returns, apply rolling vol targeting.
+    We:
+      - Compute realized vol of the base-weight portfolio.
+      - Set gross leverage = target_vol / realized_vol (clipped to max_leverage).
+      - Final weights = leverage * base weights.
+    """
+    # Portfolio daily returns using base weights (lag weights by 1 day)
+    base_ret = (base_w.shift(1) * asset_ret).sum(axis=1)
+    base_ret = base_ret.fillna(0.0)
+
+    # Rolling realized vol
+    roll_vol = base_ret.rolling(cfg.vol_lookback, min_periods=5).std() * math.sqrt(252.0)
+
+    # Leverage factor
+    lev = cfg.target_vol / (roll_vol + 1e-8)
+    lev = lev.clip(lower=0.0, upper=cfg.max_leverage)
+    lev = lev.reindex(base_ret.index).fillna(0.0)
+
+    # Apply leverage
+    w_final = base_w.mul(lev, axis=0)
+    return w_final
+
+
+def build_regime_portfolio(
+    cfg: Config,
+    prices: pd.DataFrame,
+    rf: RandomForestClassifier,
+    X_all: pd.DataFrame,
+) -> Tuple[pd.DataFrame, pd.Series, pd.Series]:
+    """
+    Build the regime-aware portfolio weights and returns using the trained RF model.
+    Also build a 60/40 SPY/TLT benchmark (with vol targeting).
+    """
+    sym_spy, sym_tlt, sym_shy = cfg.symbols
+
+    # Predict risk_off probability for all dates in X_all
+    p_risk_all = rf.predict_proba(X_all.values)[:, 1]
+    p_risk_series = pd.Series(p_risk_all, index=X_all.index, name="p_risk_off")
+
+    # Base regime weights
+    base_w = pd.DataFrame(0.0, index=X_all.index, columns=[sym_spy, sym_tlt, sym_shy])
+    for dt, p in p_risk_series.items():
+        w_spy, w_tlt, w_shy = regime_weights(cfg, float(p))
+        base_w.loc[dt, sym_spy] = w_spy
+        base_w.loc[dt, sym_tlt] = w_tlt
+        base_w.loc[dt, sym_shy] = w_shy
+
+    # Align asset returns
+    prices = prices.reindex(X_all.index).dropna()
+    asset_ret = prices.pct_change().fillna(0.0)
+
+    # Apply vol targeting
+    w_regime = apply_vol_targeting(cfg, base_w, asset_ret)
+
+    # Portfolio returns (use 1-day lag on weights)
+    port_ret = (w_regime.shift(1) * asset_ret).sum(axis=1)
+    port_ret.name = "ret_regime"
+
+    # Benchmark: static 60/40 SPY/TLT (no SHY), but vol-targeted
+    w_bench_base = pd.DataFrame(
+        {
+            sym_spy: np.full(len(X_all), 0.60),
+            sym_tlt: np.full(len(X_all), 0.40),
+            sym_shy: np.zeros(len(X_all)),
+        },
+        index=X_all.index,
+    )
+    w_bench = apply_vol_targeting(cfg, w_bench_base, asset_ret)
+    bench_ret = (w_bench.shift(1) * asset_ret).sum(axis=1)
+    bench_ret.name = "ret_benchmark"
+
+    # Combine into one DataFrame for export
+    out_df = pd.concat(
+        [
+            prices,
+            asset_ret.add_prefix("ret_"),
+            p_risk_series,
+            w_regime.add_prefix("w_regime_"),
+            w_bench.add_prefix("w_bench_"),
+            port_ret,
+            bench_ret,
+        ],
+        axis=1,
+    ).dropna()
+
+    return out_df, port_ret.reindex(out_df.index), bench_ret.reindex(out_df.index)
+
+
+# ----------------------------- Main ----------------------------- #
+
+
+def run_pipeline(cfg: Config) -> None:
+    # 1) Load prices
+    prices = load_price_series(cfg)
+    print(f"[INFO] Loaded prices for {cfg.symbols} from {prices.index.min().date()} "
+          f"to {prices.index.max().date()} (n={len(prices)})")
+
+    # 2) Labels and features
+    y_all = make_regime_labels(cfg, prices)
+    X_all = make_features(cfg, prices)
+
+    # Align X and y
+    y_all = y_all.reindex(X_all.index).fillna(0.0)
+
+    # 3) Time-based split
+    X_train, X_val, X_test, y_train, y_val, y_test = split_train_val_test(cfg, X_all, y_all)
+
+    print(f"[INFO] Split sizes — train: {len(X_train)}, val: {len(X_val)}, test: {len(X_test)}")
+
+    # 4) Train RF
+    rf = train_rf(cfg, X_train, y_train)
+
+    # 5) Evaluate classification performance
+    def eval_split(X: pd.DataFrame, y: pd.Series, name: str) -> Dict[str, float]:
+        if len(X) == 0:
+            return {"auc": float("nan"), "acc": float("nan")}
+        p = rf.predict_proba(X.values)[:, 1]
+        try:
+            auc = roc_auc_score(y, p)
+        except ValueError:
+            auc = float("nan")
+        acc = accuracy_score(y, (p >= 0.5).astype(int))
+        print(f"[INFO] {name} AUC={auc:.4f}, ACC={acc:.4f}")
+        return {"auc": float(auc), "acc": float(acc)}
+
+    perf_train = eval_split(X_train, y_train, "Train")
+    perf_val = eval_split(X_val, y_val, "Val")
+    perf_test = eval_split(X_test, y_test, "Test")
+
+    # 6) Build regime portfolio and benchmark
+    out_df, port_ret, bench_ret = build_regime_portfolio(cfg, prices, rf, X_all)
+
+    # 7) Performance stats (full sample and test-only)
+    stats_full = {
+        "regime": annualized_stats(port_ret),
+        "benchmark": annualized_stats(bench_ret),
+    }
+
+    # Restrict to test window for fair comparison
+    test_index = X_test.index
+    port_ret_test = port_ret.reindex(test_index)
+    bench_ret_test = bench_ret.reindex(test_index)
+
+    stats_test = {
+        "regime": annualized_stats(port_ret_test),
+        "benchmark": annualized_stats(bench_ret_test),
+    }
+
+    # 8) Save outputs
+    out_df.to_csv(cfg.out_csv)
+    print(f"[OK] Saved daily data → {cfg.out_csv}")
+
+    summary = {
+        "clf_train": perf_train,
+        "clf_val": perf_val,
+        "clf_test": perf_test,
+        "stats_full": stats_full,
+        "stats_test": stats_test,
+        "symbols": list(cfg.symbols),
+        "start": str(prices.index.min().date()),
+        "end": str(prices.index.max().date()),
+    }
+
+    with open(cfg.out_json, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+    print(f"[OK] Saved summary → {cfg.out_json}")
+
+    print("\n[SUMMARY — Full sample]")
+    for k, v in stats_full.items():
+        print(
+            f"  {k:10s}: CAGR={v['cagr']:.2%}, Vol={v['vol']:.2%}, "
+            f"Sharpe={v['sharpe']:.2f}, MaxDD={v['max_drawdown']:.2%}"
+        )
+
+    print("\n[SUMMARY — Test window]")
+    for k, v in stats_test.items():
+        print(
+            f"  {k:10s}: CAGR={v['cagr']:.2%}, Vol={v['vol']:.2%}, "
+            f"Sharpe={v['sharpe']:.2f}, MaxDD={v['max_drawdown']:.2%}"
+        )
+
+
+def main() -> None:
+    cfg = Config()
+    run_pipeline(cfg)
+
+
+if __name__ == "__main__":
+    # Jupyter-safe: strip out any '-f kernel.json' noise
+    import sys
+
+    sys.argv = [sys.argv[0]]
+    main()
+```
