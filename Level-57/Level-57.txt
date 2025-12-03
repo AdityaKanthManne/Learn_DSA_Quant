@@ -1,0 +1,442 @@
+"""
+Level-57 — Rolling Risk-Parity vs Min-Var vs Equal-Weight on SPY/QQQ/TLT/GLD
+
+What this script does
+---------------------
+- Downloads daily prices for a small ETF universe (default: SPY, QQQ, TLT, GLD),
+  with a synthetic fallback if yfinance fails.
+- Computes daily returns.
+- On a rolling basis:
+    - Estimates covariance over a lookback window (e.g., 60 days).
+    - Rebalances every N days (e.g., every 21 trading days).
+    - Builds three portfolios:
+        1) Equal weight (EW)
+        2) Minimum-variance (MinVar, approximate no-short version)
+        3) Risk-parity (RP) via simple iterative scheme
+- Tracks portfolio returns and equity curves for each strategy.
+- Computes performance stats (CAGR, vol, Sharpe, max drawdown).
+- Saves:
+    - level57_portfolios.csv  (prices, returns, weights, portfolio returns)
+    - level57_summary.json    (performance metrics)
+
+Drop this into PyCharm or a Jupyter cell and run.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+from dataclasses import dataclass
+from typing import Dict, Tuple
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+
+
+# ---------------------------- Config ---------------------------- #
+
+
+@dataclass
+class Config:
+    symbols: Tuple[str, ...] = ("SPY", "QQQ", "TLT", "GLD")
+    start: str = "2010-01-01"
+
+    # Covariance estimation / rebalancing
+    lookback: int = 60          # days of history for cov
+    rebalance_every: int = 21   # rebalance every N days
+
+    # Output
+    out_csv: str = "level57_portfolios.csv"
+    out_json: str = "level57_summary.json"
+
+
+# ---------------------- Data utilities -------------------------- #
+
+
+def build_synthetic_prices(cfg: Config) -> pd.DataFrame:
+    """
+    Synthetic multi-asset GBM with a simple correlation structure.
+    Used if yfinance download fails.
+    """
+    print("[WARN] Falling back to synthetic prices (Level-57).")
+    rng = np.random.default_rng(57)
+    n_assets = len(cfg.symbols)
+    n_days = 4000
+
+    dates = pd.bdate_range("2010-01-04", periods=n_days, freq="B")
+
+    # Simple correlation structure:
+    # First two (SPY, QQQ) highly correlated;
+    # Third (TLT) somewhat negatively correlated;
+    # Fourth (GLD) low correlation.
+    base_corr = np.array(
+        [
+            [1.0, 0.85, -0.2, 0.1],
+            [0.85, 1.0, -0.2, 0.1],
+            [-0.2, -0.2, 1.0, 0.0],
+            [0.1, 0.1, 0.0, 1.0],
+        ]
+    )
+    # If user changes the number of symbols, fall back to identity
+    if n_assets != base_corr.shape[0]:
+        corr = np.eye(n_assets)
+    else:
+        corr = base_corr
+
+    chol = np.linalg.cholesky(corr)
+
+    # Annualized vols and drifts
+    vols = np.array([0.18, 0.22, 0.12, 0.15])[:n_assets]
+    mus = np.array([0.07, 0.09, 0.04, 0.05])[:n_assets]
+
+    dt = 1.0 / 252.0
+    z = rng.standard_normal((n_days, n_assets))
+    eps = z @ chol.T
+
+    rets = (mus - 0.5 * vols**2) * dt + vols * math.sqrt(dt) * eps
+    prices = 100.0 * np.exp(np.cumsum(rets, axis=0))
+
+    df = pd.DataFrame(prices, index=dates, columns=list(cfg.symbols))
+    return df
+
+
+def load_price_series(cfg: Config) -> pd.DataFrame:
+    """
+    Download daily adjusted close prices for the symbols from yfinance.
+    Handles MultiIndex columns and falls back to synthetic if needed.
+    Returns:
+        DataFrame with columns = cfg.symbols, index = dates, dtype=float.
+    """
+    try:
+        raw = yf.download(
+            list(cfg.symbols),
+            start=cfg.start,
+            auto_adjust=True,
+            progress=False,
+        )
+    except Exception:
+        raw = pd.DataFrame()
+
+    if raw is None or raw.empty:
+        return build_synthetic_prices(cfg)
+
+    # yfinance returns MultiIndex if multiple tickers
+    if isinstance(raw.columns, pd.MultiIndex):
+        # Prefer "Adj Close" if present, otherwise "Close"
+        top = raw.columns.get_level_values(0)
+        if "Adj Close" in top and "Close" not in top:
+            px = raw["Adj Close"].copy()
+        else:
+            px = raw["Close"].copy()
+    else:
+        px = raw.copy()
+
+    # Keep only requested symbols that are present
+    cols = [c for c in px.columns if c in cfg.symbols]
+    if not cols:
+        return build_synthetic_prices(cfg)
+
+    px = px[cols].sort_index()
+    px = px.dropna(how="any").copy()
+
+    # Add missing symbols as flat lines if needed
+    for sym in cfg.symbols:
+        if sym not in px.columns:
+            px[sym] = 1.0
+
+    px = px[list(cfg.symbols)].astype(float)
+    return px
+
+
+# -------------------- Portfolio utilities ----------------------- #
+
+
+def annualized_stats(ret: pd.Series) -> Dict[str, float]:
+    """
+    Compute CAGR, vol, Sharpe (CAGR/vol), and max drawdown for daily returns.
+    """
+    ret = ret.dropna()
+    if len(ret) == 0:
+        return {
+            "cagr": 0.0,
+            "vol": 0.0,
+            "sharpe": 0.0,
+            "max_drawdown": 0.0,
+        }
+
+    total_return = float((1.0 + ret).prod())
+    years = len(ret) / 252.0
+    cagr = total_return ** (1.0 / years) - 1.0 if years > 0 else 0.0
+
+    vol = float(ret.std() * math.sqrt(252.0))
+    sharpe = cagr / vol if vol > 0 else 0.0
+
+    equity = (1.0 + ret).cumprod()
+    roll_max = equity.cummax()
+    dd = equity / roll_max - 1.0
+    max_dd = float(dd.min())
+
+    return {
+        "cagr": float(cagr),
+        "vol": float(vol),
+        "sharpe": float(sharpe),
+        "max_drawdown": max_dd,
+    }
+
+
+def risk_parity_weights(cov: np.ndarray, tol: float = 1e-8, max_iter: int = 10_000) -> np.ndarray:
+    """
+    Approximate risk-parity weights for a covariance matrix using
+    a simple iterative scheme.
+
+    Goal:
+        w_i * (Sigma w)_i are all equal across i.
+
+    Algorithm:
+        - Start from equal weights.
+        - In each iteration, compute marginal risk m_i = w_i * (Sigma w)_i.
+        - Target = average(m_i).
+        - Update w_i <- w_i * target / m_i.
+        - Normalize and iterate until convergence.
+
+    Returns:
+        1D numpy array of weights summing to 1, non-negative.
+    """
+    n = cov.shape[0]
+    w = np.full(n, 1.0 / n, dtype=float)
+
+    for _ in range(max_iter):
+        sigma_w = cov @ w
+        m = w * sigma_w
+        avg_m = float(m.mean())
+
+        # Avoid division by zero or negative values
+        m_safe = np.where(m <= 0.0, avg_m, m)
+        w_new = w * (avg_m / m_safe)
+
+        # Project to non-negative and renormalize
+        w_new = np.clip(w_new, 0.0, None)
+        s = float(w_new.sum())
+        if s <= 0.0:
+            w_new = np.full(n, 1.0 / n, dtype=float)
+        else:
+            w_new = w_new / s
+
+        if np.max(np.abs(w_new - w)) < tol:
+            w = w_new
+            break
+        w = w_new
+
+    return w
+
+
+def min_var_weights(cov: np.ndarray) -> np.ndarray:
+    """
+    (Approximate) minimum-variance portfolio:
+        w ∝ Sigma^{-1} 1, projected to non-negative and normalized.
+
+    If cov is singular, falls back to equal weights.
+    """
+    n = cov.shape[0]
+    ones = np.ones(n, dtype=float)
+
+    try:
+        inv = np.linalg.pinv(cov)
+        raw = inv @ ones
+    except Exception:
+        raw = ones.copy()
+
+    raw = np.clip(raw, 0.0, None)
+    s = float(raw.sum())
+    if s <= 0.0:
+        return np.full(n, 1.0 / n, dtype=float)
+    return raw / s
+
+
+def equal_weights(n_assets: int) -> np.ndarray:
+    return np.full(n_assets, 1.0 / n_assets, dtype=float)
+
+
+def rolling_weights(
+    cfg: Config,
+    prices: pd.DataFrame,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Compute rolling portfolio weights for:
+        - Equal-weight (EW)
+        - Min-variance (MinVar)
+        - Risk-parity (RP)
+
+    Using covariance estimated over 'cfg.lookback' days, rebalancing
+    every 'cfg.rebalance_every' days.
+
+    Returns:
+        weights_df: DataFrame with columns like:
+            w_ew_<sym>, w_minvar_<sym>, w_rp_<sym>
+        ret_assets: DataFrame of daily asset returns.
+    """
+    assets = list(cfg.symbols)
+    ret_assets = prices.pct_change().dropna()
+    n_assets = len(assets)
+
+    # Rebalance dates (we skip the first 'lookback' days for cov)
+    idx = ret_assets.index
+    rebalance_idx = []
+    for i in range(cfg.lookback, len(idx)):
+        if (i - cfg.lookback) % cfg.rebalance_every == 0:
+            rebalance_idx.append(idx[i])
+
+    # Initialize weight storage
+    weights_ew = pd.DataFrame(0.0, index=ret_assets.index, columns=assets)
+    weights_minvar = pd.DataFrame(0.0, index=ret_assets.index, columns=assets)
+    weights_rp = pd.DataFrame(0.0, index=ret_assets.index, columns=assets)
+
+    last_w_ew = equal_weights(n_assets)
+    last_w_minvar = equal_weights(n_assets)
+    last_w_rp = equal_weights(n_assets)
+
+    for t in ret_assets.index:
+        if t in rebalance_idx:
+            pos = ret_assets.index.get_loc(t)
+            start = pos - cfg.lookback
+            end = pos  # exclusive in iloc
+
+            if start < 0:
+                # Not enough history, keep previous weights
+                ew = last_w_ew
+                mv = last_w_minvar
+                rp = last_w_rp
+            else:
+                window_rets = ret_assets.iloc[start:end]
+                cov = np.cov(window_rets.values.T)
+
+                ew = equal_weights(n_assets)
+                mv = min_var_weights(cov)
+                rp = risk_parity_weights(cov)
+
+            last_w_ew = ew
+            last_w_minvar = mv
+            last_w_rp = rp
+
+        # Use last known weights for all days between rebalances
+        weights_ew.loc[t] = last_w_ew
+        weights_minvar.loc[t] = last_w_minvar
+        weights_rp.loc[t] = last_w_rp
+
+    # Combine into one DataFrame with prefixed columns
+    weights_df = pd.concat(
+        [
+            weights_ew.add_prefix("w_ew_"),
+            weights_minvar.add_prefix("w_minvar_"),
+            weights_rp.add_prefix("w_rp_"),
+        ],
+        axis=1,
+    )
+
+    return weights_df, ret_assets
+
+
+def compute_portfolio_returns(
+    weights_df: pd.DataFrame,
+    ret_assets: pd.DataFrame,
+    cfg: Config,
+) -> pd.DataFrame:
+    """
+    Given daily weights (for each strategy) and daily asset returns,
+    compute portfolio returns and equity curves.
+    """
+    assets = list(cfg.symbols)
+
+    # Align indexes
+    idx = ret_assets.index
+    weights_df = weights_df.reindex(idx).ffill().fillna(0.0)
+
+    # Strategy names
+    strategies = ["ew", "minvar", "rp"]
+
+    port_rets = {}
+    for strat in strategies:
+        w_cols = [f"w_{strat}_{sym}" for sym in assets]
+        w_strat = weights_df[w_cols]
+
+        # Use previous day's weights to avoid look-ahead bias
+        w_shift = w_strat.shift(1).fillna(0.0)
+        r = (w_shift.values * ret_assets.values).sum(axis=1)
+        port_rets[f"ret_{strat}"] = r
+
+    port_rets_df = pd.DataFrame(port_rets, index=idx)
+
+    return port_rets_df
+
+
+# ----------------------------- Main ----------------------------- #
+
+
+def run_pipeline(cfg: Config) -> None:
+    # 1) Load prices
+    prices = load_price_series(cfg)
+    print(
+        f"[INFO] Loaded prices for {cfg.symbols} from "
+        f"{prices.index.min().date()} to {prices.index.max().date()} "
+        f"(n={len(prices)})"
+    )
+
+    # 2) Rolling weights and asset returns
+    weights_df, ret_assets = rolling_weights(cfg, prices)
+
+    # 3) Portfolio returns
+    port_rets_df = compute_portfolio_returns(weights_df, ret_assets, cfg)
+
+    # 4) Performance stats
+    stats = {}
+    for col in port_rets_df.columns:
+        stats[col] = annualized_stats(port_rets_df[col])
+
+    # 5) Build export DataFrame
+    prices_aligned = prices.reindex(ret_assets.index)
+    out_df = pd.concat(
+        [
+            prices_aligned.add_prefix("px_"),
+            ret_assets.add_prefix("ret_"),
+            weights_df,
+            port_rets_df,
+        ],
+        axis=1,
+    )
+
+    out_df.to_csv(cfg.out_csv)
+    print(f"[OK] Saved daily portfolios → {cfg.out_csv}")
+
+    summary = {
+        "symbols": list(cfg.symbols),
+        "start": str(prices.index.min().date()),
+        "end": str(prices.index.max().date()),
+        "lookback": cfg.lookback,
+        "rebalance_every": cfg.rebalance_every,
+        "stats": stats,
+    }
+
+    with open(cfg.out_json, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+    print(f"[OK] Saved summary → {cfg.out_json}")
+
+    print("\n[SUMMARY]")
+    for strat, s in stats.items():
+        print(
+            f"  {strat:10s}: CAGR={s['cagr']:.2%}, Vol={s['vol']:.2%}, "
+            f"Sharpe={s['sharpe']:.2f}, MaxDD={s['max_drawdown']:.2%}"
+        )
+
+
+def main() -> None:
+    cfg = Config()
+    run_pipeline(cfg)
+
+
+if __name__ == "__main__":
+    # Jupyter-safe: strip any unwanted args like "-f kernel-xxxx.json"
+    import sys
+
+    sys.argv = [sys.argv[0]]
+    main()

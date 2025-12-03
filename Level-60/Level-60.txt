@@ -1,0 +1,518 @@
+"""
+Level-60 — Hierarchical Risk Parity (HRP) Multi-Asset Portfolio
+
+Concept focus
+-------------
+Quant model:
+    - Universe: multiple liquid ETFs (default:
+      SPY, QQQ, IWM, EFA, EEM, TLT, LQD, GLD).
+    - Use historical daily returns to estimate covariance and correlation.
+    - Build a correlation-based ordering of assets (a cheap stand-in for
+      full hierarchical clustering).
+    - Apply a Hierarchical Risk Parity style recursive bisection:
+        * At each split, divide the ordered asset list into two clusters.
+        * Compute inverse-variance weights inside each cluster.
+        * Allocate capital between clusters in inverse proportion to their
+          variances (low-vol cluster gets more weight).
+    - Rebalance monthly and hold weights between rebalances.
+    - Compare to a simple equal-weight (EW) long-only benchmark.
+
+DSA concept:
+    - Divide-and-conquer recursion on a list of assets:
+        * Recursively split a sorted list into halves.
+        * Combine results by adjusting weights top-down.
+    - Greedy nearest-neighbor ordering on a correlation matrix:
+        * Start from a "seed" asset, then repeatedly append the asset that
+          is most correlated with the current set, grouping similar assets.
+    - Matrix operations for covariance and portfolio variance calculations.
+
+Outputs
+-------
+CSV: level60_hrp_portfolio.csv
+    - px_<sym>         : prices
+    - ret_<sym>        : daily returns
+    - w_<sym>          : HRP weights
+    - port_ret_hrp     : HRP portfolio daily returns
+    - port_ret_ew      : equal-weight benchmark daily returns
+
+JSON: level60_hrp_summary.json
+    - universe, sample start/end
+    - rebalance frequency and lookback window
+    - latest HRP weights (by symbol)
+    - performance stats for HRP vs equal-weight:
+        * CAGR, volatility, Sharpe, max drawdown
+"""
+
+from __future__ import annotations
+
+import json
+import math
+from dataclasses import dataclass
+from typing import Dict, List, Tuple
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+
+
+# ---------------------------- Config ---------------------------- #
+
+
+@dataclass
+class Config:
+    # Multi-asset ETF universe
+    symbols: Tuple[str, ...] = (
+        "SPY",  # US large-cap
+        "QQQ",  # US tech-heavy
+        "IWM",  # US small-cap
+        "EFA",  # Developed ex-US
+        "EEM",  # Emerging markets
+        "TLT",  # Long UST
+        "LQD",  # Investment-grade credit
+        "GLD",  # Gold
+    )
+    start: str = "2010-01-01"
+
+    # HRP settings
+    lookback_days: int = 252     # covariance lookback for each rebalance
+    min_lookback_days: int = 150 # minimum required to compute weights
+    rebalance_freq: str = "M"    # monthly rebalance
+
+    # Output files
+    out_csv: str = "level60_hrp_portfolio.csv"
+    out_json: str = "level60_hrp_summary.json"
+
+
+# ---------------------- Data utilities -------------------------- #
+
+
+def build_synthetic_prices(cfg: Config) -> pd.DataFrame:
+    """
+    Synthetic multi-asset GBM with a simple correlation structure.
+    Used if yfinance download fails.
+    """
+    print("[WARN] Falling back to synthetic prices (Level-60).")
+    rng = np.random.default_rng(60)
+    n_assets = len(cfg.symbols)
+    n_days = 4000
+
+    dates = pd.bdate_range("2010-01-04", periods=n_days, freq="B")
+
+    base_corr = np.array(
+        [
+            [1.0, 0.85, 0.7, 0.5, 0.4, -0.2, -0.1, 0.1],
+            [0.85, 1.0, 0.7, 0.5, 0.4, -0.2, -0.1, 0.1],
+            [0.7, 0.7, 1.0, 0.4, 0.3, -0.1, -0.1, 0.0],
+            [0.5, 0.5, 0.4, 1.0, 0.6, -0.2, -0.1, 0.0],
+            [0.4, 0.4, 0.3, 0.6, 1.0, -0.3, -0.2, 0.0],
+            [-0.2, -0.2, -0.1, -0.2, -0.3, 1.0, 0.6, -0.1],
+            [-0.1, -0.1, -0.1, -0.1, -0.2, 0.6, 1.0, -0.1],
+            [0.1, 0.1, 0.0, 0.0, 0.0, -0.1, -0.1, 1.0],
+        ]
+    )
+    if n_assets != base_corr.shape[0]:
+        corr = np.eye(n_assets)
+    else:
+        corr = base_corr
+
+    chol = np.linalg.cholesky(corr)
+
+    vols = np.array([0.18, 0.22, 0.20, 0.17, 0.22, 0.12, 0.10, 0.15])[:n_assets]
+    mus = np.array([0.07, 0.09, 0.08, 0.06, 0.09, 0.04, 0.03, 0.05])[:n_assets]
+
+    dt = 1.0 / 252.0
+    z = rng.standard_normal((n_days, n_assets))
+    eps = z @ chol.T
+
+    rets = (mus - 0.5 * vols**2) * dt + vols * math.sqrt(dt) * eps
+    prices = 100.0 * np.exp(np.cumsum(rets, axis=0))
+
+    df = pd.DataFrame(prices, index=dates, columns=list(cfg.symbols))
+    return df
+
+
+def load_price_series(cfg: Config) -> pd.DataFrame:
+    """
+    Download daily adjusted close prices for the symbols from yfinance.
+    Handles MultiIndex columns and falls back to synthetic if needed.
+
+    Returns:
+        DataFrame with columns = cfg.symbols, index = dates, dtype=float.
+    """
+    try:
+        raw = yf.download(
+            list(cfg.symbols),
+            start=cfg.start,
+            auto_adjust=True,
+            progress=False,
+        )
+    except Exception:
+        raw = pd.DataFrame()
+
+    if raw is None or raw.empty:
+        return build_synthetic_prices(cfg)
+
+    if isinstance(raw.columns, pd.MultiIndex):
+        top = raw.columns.get_level_values(0)
+        if "Adj Close" in top and "Close" not in top:
+            px = raw["Adj Close"].copy()
+        else:
+            px = raw["Close"].copy()
+    else:
+        px = raw.copy()
+
+    cols = [c for c in px.columns if c in cfg.symbols]
+    if not cols:
+        return build_synthetic_prices(cfg)
+
+    px = px[cols].sort_index().dropna(how="any").copy()
+
+    # Ensure all symbols exist; if missing, plug trivial series
+    for sym in cfg.symbols:
+        if sym not in px.columns:
+            px[sym] = 1.0
+
+    px = px[list(cfg.symbols)].astype(float)
+    return px
+
+
+# -------------------- Performance utilities --------------------- #
+
+
+def annualized_stats(ret: pd.Series) -> Dict[str, float]:
+    """
+    Compute CAGR, vol, Sharpe, and max drawdown for daily returns.
+    """
+    ret = ret.dropna()
+    if len(ret) == 0:
+        return {
+            "cagr": 0.0,
+            "vol": 0.0,
+            "sharpe": 0.0,
+            "max_drawdown": 0.0,
+        }
+
+    total_return = float((1.0 + ret).prod())
+    years = len(ret) / 252.0
+    cagr = total_return ** (1.0 / years) - 1.0 if years > 0 else 0.0
+
+    vol = float(ret.std() * math.sqrt(252.0))
+    sharpe = cagr / vol if vol > 0 else 0.0
+
+    equity = (1.0 + ret).cumprod()
+    roll_max = equity.cummax()
+    dd = equity / roll_max - 1.0
+    max_dd = float(dd.min())
+
+    return {
+        "cagr": float(cagr),
+        "vol": float(vol),
+        "sharpe": float(sharpe),
+        "max_drawdown": max_dd,
+    }
+
+
+# ----------------- Greedy correlation ordering ------------------ #
+
+
+def greedy_correlation_sort(corr: pd.DataFrame) -> List[str]:
+    """
+    Build a correlation-based ordering of assets.
+
+    Idea:
+        - Compute each asset's average correlation to others.
+        - Start from the asset with highest average correlation.
+        - Repeatedly append the remaining asset that is most correlated
+          with the already ordered set.
+
+    This is a cheap approximation to full hierarchical clustering but
+    is good enough to illustrate HRP's recursive bisection on a
+    cluster-like ordering.
+    """
+    symbols = list(corr.columns)
+    if len(symbols) <= 1:
+        return symbols
+
+    # Replace self-correlation with NaN so it does not dominate the average
+    corr_no_diag = corr.copy()
+    np.fill_diagonal(corr_no_diag.values, np.nan)
+    avg_corr = corr_no_diag.mean(axis=1)
+    seed = avg_corr.idxmax()
+
+    ordered: List[str] = [seed]
+    remaining = set(symbols)
+    remaining.remove(seed)
+
+    while remaining:
+        best_sym = None
+        best_score = -np.inf
+        for sym in remaining:
+            # Correlation of candidate with current ordered set
+            vals = corr.loc[sym, ordered]
+            max_corr = float(vals.max())
+            if max_corr > best_score:
+                best_score = max_corr
+                best_sym = sym
+        ordered.append(best_sym)
+        remaining.remove(best_sym)
+
+    return ordered
+
+
+# ---------------------- HRP weighting --------------------------- #
+
+
+def inverse_variance_weights(cov: pd.DataFrame) -> np.ndarray:
+    """
+    Inverse-variance portfolio weights for a cluster covariance matrix.
+    """
+    diag = np.diag(cov.values)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        inv_var = 1.0 / diag
+    inv_var[~np.isfinite(inv_var)] = 0.0
+    s = inv_var.sum()
+    if s <= 0:
+        return np.ones_like(inv_var) / len(inv_var)
+    return inv_var / s
+
+
+def hrp_weights(cov: pd.DataFrame, order: List[str]) -> pd.Series:
+    """
+    Compute Hierarchical Risk Parity style weights given a covariance
+    matrix and a correlation-based asset ordering.
+
+    Steps:
+        - Reorder covariance matrix according to `order`.
+        - Initialize all weights to 1.
+        - Recursively split the ordered list into halves:
+            * compute cluster variances using inverse-variance weights
+            * allocate capital between clusters in inverse proportion
+              to their variances
+        - Normalize weights to sum to 1.
+    """
+    cov_ord = cov.loc[order, order]
+    weights = pd.Series(1.0, index=cov_ord.index)
+
+    def _split(cluster: List[str]) -> None:
+        n = len(cluster)
+        if n <= 1:
+            return
+
+        split = n // 2
+        left = cluster[:split]
+        right = cluster[split:]
+
+        cov_l = cov_ord.loc[left, left]
+        cov_r = cov_ord.loc[right, right]
+
+        w_l = inverse_variance_weights(cov_l)
+        w_r = inverse_variance_weights(cov_r)
+
+        var_l = float(w_l @ cov_l.values @ w_l)
+        var_r = float(w_r @ cov_r.values @ w_r)
+
+        if not np.isfinite(var_l):
+            var_l = 0.0
+        if not np.isfinite(var_r):
+            var_r = 0.0
+
+        if var_l + var_r > 0:
+            alpha_l = 1.0 - var_l / (var_l + var_r)
+            alpha_r = 1.0 - var_r / (var_l + var_r)
+        else:
+            alpha_l = alpha_r = 0.5
+
+        weights[left] *= alpha_l
+        weights[right] *= alpha_r
+
+        _split(left)
+        _split(right)
+
+    _split(order)
+    weights = weights / weights.sum()
+    return weights
+
+
+def compute_hrp_weight_path(
+    cfg: Config,
+    rets: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Compute a time series of HRP weights with a given rebalance frequency.
+
+    Args:
+        cfg  : config with lookback_days, min_lookback_days, rebalance_freq
+        rets : DataFrame of daily returns (index = dates, columns = symbols)
+
+    Returns:
+        DataFrame of weights, same index and columns as `rets`.
+    """
+    dates = rets.index
+    symbols = list(rets.columns)
+
+    periods = dates.to_period(cfg.rebalance_freq)
+    first_in_period = ~periods.duplicated()
+    rebalance_days = dates[first_in_period]
+
+    weight_records = []
+    weight_dates = []
+
+    for d in rebalance_days:
+        # Use data strictly before the rebalance date
+        hist = rets.loc[:d].iloc[:-1]
+        if len(hist) < cfg.min_lookback_days:
+            continue
+
+        # Use the last lookback_days history if available
+        hist_window = hist.tail(cfg.lookback_days)
+        if hist_window.isnull().all().all():
+            continue
+
+        cov = hist_window.cov()
+        corr = hist_window.corr()
+
+        order = greedy_correlation_sort(corr)
+        w = hrp_weights(cov, order)
+        # Ensure all symbols present
+        w_full = pd.Series(0.0, index=symbols)
+        for sym in w.index:
+            w_full[sym] = float(w[sym])
+        weight_records.append(w_full.values)
+        weight_dates.append(d)
+
+    if not weight_records:
+        # Fallback: equal-weight if HRP never computed
+        print("[WARN] No HRP rebalances computed; defaulting to equal-weight.")
+        w_eq = np.ones(len(symbols)) / len(symbols)
+        W = pd.DataFrame([w_eq], index=[dates[0]], columns=symbols)
+        W = W.reindex(dates).ffill()
+        return W
+
+    W_reb = pd.DataFrame(weight_records, index=weight_dates, columns=symbols)
+    # Forward-fill between rebalance dates
+    W = W_reb.reindex(dates).ffill()
+    return W
+
+
+# --------------------- Portfolio construction ------------------- #
+
+
+def build_portfolio(
+    cfg: Config,
+    prices: pd.DataFrame,
+) -> Tuple[pd.DataFrame, Dict]:
+    """
+    Build HRP portfolio and equal-weight benchmark.
+
+    Returns:
+        out_df : combined DataFrame with prices, returns, weights, portfolio returns
+        summary: dict with HRP weights and performance metrics
+    """
+    symbols = list(prices.columns)
+    rets = prices.pct_change().dropna()
+    aligned_prices = prices.reindex(rets.index)
+
+    # 1) HRP weights path
+    W_hrp = compute_hrp_weight_path(cfg, rets)
+
+    # 2) HRP portfolio returns
+    port_ret_hrp = (W_hrp * rets).sum(axis=1)
+    port_ret_hrp.name = "port_ret_hrp"
+
+    # 3) Equal-weight long-only benchmark (daily rebalanced)
+    ew_weights = np.full(len(symbols), 1.0 / len(symbols), dtype=float)
+    port_ret_ew = pd.Series(
+        rets.values @ ew_weights,
+        index=rets.index,
+        name="port_ret_ew",
+    )
+
+    # 4) Build wide outputs
+    prices_wide = aligned_prices.add_prefix("px_")
+    rets_wide = rets.add_prefix("ret_")
+    weights_wide = W_hrp.add_prefix("w_")
+
+    out_df = pd.concat(
+        [
+            prices_wide,
+            rets_wide,
+            weights_wide,
+            port_ret_hrp,
+            port_ret_ew,
+        ],
+        axis=1,
+    )
+
+    # 5) Performance stats
+    perf_hrp = annualized_stats(port_ret_hrp)
+    perf_ew = annualized_stats(port_ret_ew)
+
+    latest_weights = W_hrp.iloc[-1].to_dict()
+
+    summary = {
+        "universe": symbols,
+        "start": str(out_df.index.min().date()),
+        "end": str(out_df.index.max().date()),
+        "rebalance_freq": cfg.rebalance_freq,
+        "lookback_days": cfg.lookback_days,
+        "latest_hrp_weights": latest_weights,
+        "performance": {
+            "hrp": perf_hrp,
+            "equal_weight": perf_ew,
+        },
+    }
+
+    return out_df, summary
+
+
+# ----------------------------- Main ----------------------------- #
+
+
+def run_pipeline(cfg: Config) -> None:
+    # 1) Load prices
+    prices = load_price_series(cfg)
+    print(
+        f"[INFO] Loaded prices for {cfg.symbols} from "
+        f"{prices.index.min().date()} to {prices.index.max().date()} "
+        f"(n={len(prices)})"
+    )
+
+    # 2) Build portfolio
+    out_df, summary = build_portfolio(cfg, prices)
+
+    # 3) Save CSV
+    out_df.to_csv(cfg.out_csv)
+    print(f"[OK] Saved daily portfolio data -> {cfg.out_csv}")
+
+    # 4) Save JSON summary
+    with open(cfg.out_json, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+    print(f"[OK] Saved summary -> {cfg.out_json}")
+
+    # 5) Print quick stats
+    print("\n[SUMMARY — Annualized stats]")
+    hrp = summary["performance"]["hrp"]
+    ew = summary["performance"]["equal_weight"]
+    print(
+        "  HRP: "
+        f"CAGR={hrp['cagr']:.2%}, Vol={hrp['vol']:.2%}, "
+        f"Sharpe={hrp['sharpe']:.2f}, MaxDD={hrp['max_drawdown']:.2%}"
+    )
+    print(
+        "  EW : "
+        f"CAGR={ew['cagr']:.2%}, Vol={ew['vol']:.2%}, "
+        f"Sharpe={ew['sharpe']:.2f}, MaxDD={ew['max_drawdown']:.2%}"
+    )
+
+
+def main() -> None:
+    cfg = Config()
+    run_pipeline(cfg)
+
+
+if __name__ == "__main__":
+    # Jupyter-safe: strip any unwanted args like "-f kernel-xxxx.json"
+    import sys
+
+    sys.argv = [sys.argv[0]]
+    main()

@@ -1,0 +1,487 @@
+"""
+Level-59 — Cross-Sectional Long–Short Factor Portfolio (Top/Bottom K Ranking)
+
+Concept focus
+-------------
+Quant model:
+    - Universe: multiple liquid ETFs (default: SPY, QQQ, IWM, EFA, EEM, TLT, LQD, GLD).
+    - Build daily cross-sectional factor scores:
+        * 20-day momentum (1M)
+        * 60-day momentum (3M)
+        * 5-day reversal
+        * 20-day volatility
+        * Price vs 200-day moving average (value-ish trend)
+    - Convert each factor to a cross-sectional z-score per day.
+    - Composite score = weighted sum of factor z-scores.
+    - Each day:
+        * Go long the top K names by score (equal-weighted).
+        * Go short the bottom K names (equal-weighted).
+        * Target: net dollar-neutral (e.g. +0.5 total long, -0.5 total short).
+
+    - Compare to a simple equal-weight long-only benchmark.
+
+DSA concept:
+    - Cross-sectional ranking and sorting:
+        * We use argsort/nlargest/nsmallest on a small universe.
+        * This is essentially the "sort and pick top-K / bottom-K" pattern,
+          which is O(N log N) in the number of assets N per day.
+    - Data structures:
+        * MultiIndex (date, asset) panel-style representation.
+        * GroupBy over dates to do per-day ranking and weight assignment.
+        * This is a nice bridge between algorithmic thinking (ranking,
+          selection) and practical quant code using pandas.
+
+Outputs
+-------
+CSV:
+    level59_xs_longshort_portfolio.csv
+        - px_<sym>    : prices
+        - ret_<sym>   : daily asset returns
+        - w_<sym>     : daily portfolio weights (long/short)
+        - score_<sym> : composite factor score per asset per day
+        - port_ret    : long-short portfolio daily return
+        - port_ret_ew : equal-weight long-only daily return
+
+JSON:
+    level59_xs_longshort_summary.json
+        - universe, sample start/end
+        - factor weights, K (number of names long/short)
+        - performance stats for long-short and equal-weight
+"""
+
+from __future__ import annotations
+
+import json
+import math
+from dataclasses import dataclass
+from typing import Dict, Tuple, List
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+
+
+# ---------------------------- Config ---------------------------- #
+
+
+@dataclass
+class Config:
+    # Small ETF universe that gives some cross-section:
+    symbols: Tuple[str, ...] = (
+        "SPY",  # US large-cap
+        "QQQ",  # US tech-heavy
+        "IWM",  # US small-cap
+        "EFA",  # Developed markets ex-US
+        "EEM",  # Emerging markets
+        "TLT",  # Long UST
+        "LQD",  # Investment-grade credit
+        "GLD",  # Gold
+    )
+    start: str = "2010-01-01"
+
+    # Cross-sectional long-short design
+    top_k: int = 2      # number of long names
+    bottom_k: int = 2   # number of short names
+    long_gross: float = 0.5   # total long exposure
+    short_gross: float = 0.5  # total short exposure (absolute)
+
+    # Output files
+    out_csv: str = "level59_xs_longshort_portfolio.csv"
+    out_json: str = "level59_xs_longshort_summary.json"
+
+
+# ---------------------- Data utilities -------------------------- #
+
+
+def build_synthetic_prices(cfg: Config) -> pd.DataFrame:
+    """
+    Synthetic multi-asset GBM with a simple correlation structure.
+    Used if yfinance download fails.
+    """
+    print("[WARN] Falling back to synthetic prices (Level-59).")
+    rng = np.random.default_rng(59)
+    n_assets = len(cfg.symbols)
+    n_days = 4000
+
+    dates = pd.bdate_range("2010-01-04", periods=n_days, freq="B")
+
+    # Base correlation (for 8 assets); fall back to identity if sizes differ.
+    base_corr = np.array(
+        [
+            [1.0, 0.85, 0.7, 0.5, 0.4, -0.2, -0.1, 0.1],
+            [0.85, 1.0, 0.7, 0.5, 0.4, -0.2, -0.1, 0.1],
+            [0.7, 0.7, 1.0, 0.4, 0.3, -0.1, -0.1, 0.0],
+            [0.5, 0.5, 0.4, 1.0, 0.6, -0.2, -0.1, 0.0],
+            [0.4, 0.4, 0.3, 0.6, 1.0, -0.3, -0.2, 0.0],
+            [-0.2, -0.2, -0.1, -0.2, -0.3, 1.0, 0.6, -0.1],
+            [-0.1, -0.1, -0.1, -0.1, -0.2, 0.6, 1.0, -0.1],
+            [0.1, 0.1, 0.0, 0.0, 0.0, -0.1, -0.1, 1.0],
+        ]
+    )
+    if n_assets != base_corr.shape[0]:
+        corr = np.eye(n_assets)
+    else:
+        corr = base_corr
+
+    chol = np.linalg.cholesky(corr)
+
+    vols = np.array([0.18, 0.22, 0.20, 0.17, 0.22, 0.12, 0.10, 0.15])[:n_assets]
+    mus = np.array([0.07, 0.09, 0.08, 0.06, 0.09, 0.04, 0.03, 0.05])[:n_assets]
+
+    dt = 1.0 / 252.0
+    z = rng.standard_normal((n_days, n_assets))
+    eps = z @ chol.T
+
+    rets = (mus - 0.5 * vols**2) * dt + vols * math.sqrt(dt) * eps
+    prices = 100.0 * np.exp(np.cumsum(rets, axis=0))
+
+    df = pd.DataFrame(prices, index=dates, columns=list(cfg.symbols))
+    return df
+
+
+def load_price_series(cfg: Config) -> pd.DataFrame:
+    """
+    Download daily adjusted close prices for the symbols from yfinance.
+    Handles MultiIndex columns and falls back to synthetic if needed.
+
+    Returns:
+        DataFrame with columns = cfg.symbols, index = dates, dtype=float.
+    """
+    try:
+        raw = yf.download(
+            list(cfg.symbols),
+            start=cfg.start,
+            auto_adjust=True,
+            progress=False,
+        )
+    except Exception:
+        raw = pd.DataFrame()
+
+    if raw is None or raw.empty:
+        return build_synthetic_prices(cfg)
+
+    if isinstance(raw.columns, pd.MultiIndex):
+        top = raw.columns.get_level_values(0)
+        if "Adj Close" in top and "Close" not in top:
+            px = raw["Adj Close"].copy()
+        else:
+            px = raw["Close"].copy()
+    else:
+        px = raw.copy()
+
+    cols = [c for c in px.columns if c in cfg.symbols]
+    if not cols:
+        return build_synthetic_prices(cfg)
+
+    px = px[cols].sort_index().dropna(how="any").copy()
+
+    for sym in cfg.symbols:
+        if sym not in px.columns:
+            px[sym] = 1.0
+
+    px = px[list(cfg.symbols)].astype(float)
+    return px
+
+
+# -------------------- Performance utilities --------------------- #
+
+
+def annualized_stats(ret: pd.Series) -> Dict[str, float]:
+    """
+    Compute CAGR, vol, Sharpe, and max drawdown for daily returns.
+    """
+    ret = ret.dropna()
+    if len(ret) == 0:
+        return {
+            "cagr": 0.0,
+            "vol": 0.0,
+            "sharpe": 0.0,
+            "max_drawdown": 0.0,
+        }
+
+    total_return = float((1.0 + ret).prod())
+    years = len(ret) / 252.0
+    cagr = total_return ** (1.0 / years) - 1.0 if years > 0 else 0.0
+
+    vol = float(ret.std() * math.sqrt(252.0))
+    sharpe = cagr / vol if vol > 0 else 0.0
+
+    equity = (1.0 + ret).cumprod()
+    roll_max = equity.cummax()
+    dd = equity / roll_max - 1.0
+    max_dd = float(dd.min())
+
+    return {
+        "cagr": float(cagr),
+        "vol": float(vol),
+        "sharpe": float(sharpe),
+        "max_drawdown": max_dd,
+    }
+
+
+# -------------------- Factor construction ----------------------- #
+
+
+def build_factor_panel(prices: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build a (date, asset) panel of factor values:
+
+        - mom20    : 20-day momentum (price_t / price_{t-20} - 1)
+        - mom60    : 60-day momentum
+        - rev5     : 5-day reversal (negative 5-day return)
+        - vol20    : 20-day realized vol (std of returns)
+        - val200   : price / 200-day MA - 1
+
+    Returns:
+        DataFrame with index = (date, asset), columns = factor names.
+    """
+    symbols = list(prices.columns)
+    rets = prices.pct_change()
+
+    mom20 = prices.pct_change(20)
+    mom60 = prices.pct_change(60)
+    rev5 = -prices.pct_change(5)
+    vol20 = rets.rolling(20).std()
+    val200 = prices / prices.rolling(200).mean() - 1.0
+
+    factor_frames = []
+    for name, mat in [
+        ("mom20", mom20),
+        ("mom60", mom60),
+        ("rev5", rev5),
+        ("vol20", vol20),
+        ("val200", val200),
+    ]:
+        f = mat.stack().rename(name)  # index (date, asset)
+        factor_frames.append(f)
+
+    panel = pd.concat(factor_frames, axis=1)
+    panel.index.set_names(["date", "asset"], inplace=True)
+
+    # Drop early rows with insufficient history for all factors
+    panel = panel.dropna(how="any")
+    # Keep only assets in prices columns
+    panel = panel[panel.index.get_level_values("asset").isin(symbols)]
+
+    return panel
+
+
+def zscore_cross_section(panel: pd.DataFrame) -> pd.DataFrame:
+    """
+    Cross-sectional z-score per date for each factor column.
+    """
+    def _z(col: pd.Series) -> pd.Series:
+        mean = col.mean()
+        std = col.std(ddof=0)
+        if std <= 0 or not np.isfinite(std):
+            return pd.Series(0.0, index=col.index)
+        return (col - mean) / std
+
+    zpanel = panel.groupby(level="date").transform(_z)
+    zpanel.index = panel.index
+    return zpanel
+
+
+# ----------------- Long-short weight construction --------------- #
+
+
+def build_longshort_weights(
+    cfg: Config,
+    zpanel: pd.DataFrame,
+    factor_weights: Dict[str, float],
+) -> pd.Series:
+    """
+    Build daily long-short weights based on composite scores.
+
+    Args:
+        cfg           : configuration with top_k, bottom_k, long/short gross.
+        zpanel        : DataFrame (date, asset) with z-scored factors.
+        factor_weights: dict of factor_name -> weight in composite score.
+
+    Returns:
+        Series with index (date, asset) and values = portfolio weights.
+    """
+    # Composite score
+    missing_cols = [f for f in factor_weights.keys() if f not in zpanel.columns]
+    if missing_cols:
+        raise ValueError(f"Missing factors in zpanel: {missing_cols}")
+
+    # Weighted sum across factors
+    cols = list(factor_weights.keys())
+    w = np.array([factor_weights[c] for c in cols], dtype=float)
+    scores = (zpanel[cols].values @ w).astype(float)
+    zpanel = zpanel.copy()
+    zpanel["score"] = scores
+
+    def _assign_weights(group: pd.DataFrame) -> pd.Series:
+        # group index: (date, asset)
+        s = group["score"].dropna()
+        weights = pd.Series(0.0, index=group.index)
+
+        n = len(s)
+        if n < cfg.top_k + cfg.bottom_k:
+            return weights
+
+        # Top K and bottom K by score
+        long_idx = s.nlargest(cfg.top_k).index
+        short_idx = s.nsmallest(cfg.bottom_k).index
+
+        long_w = cfg.long_gross / cfg.top_k if cfg.top_k > 0 else 0.0
+        short_w = -cfg.short_gross / cfg.bottom_k if cfg.bottom_k > 0 else 0.0
+
+        for idx in long_idx:
+            weights.loc[idx] = long_w
+        for idx in short_idx:
+            weights.loc[idx] = short_w
+
+        return weights
+
+    weights = zpanel.groupby(level="date", group_keys=False).apply(_assign_weights)
+    weights.name = "weight"
+    return weights
+
+
+# --------------------- Portfolio construction ------------------- #
+
+
+def build_portfolio(
+    cfg: Config,
+    prices: pd.DataFrame,
+) -> Tuple[pd.DataFrame, Dict]:
+    """
+    Build cross-sectional long-short portfolio and equal-weight benchmark.
+
+    Returns:
+        out_df : combined DataFrame with prices, returns, weights, scores, portfolio returns
+        summary: dict with weights, factor info, performance metrics
+    """
+    symbols = list(prices.columns)
+    rets = prices.pct_change().dropna()
+    aligned_prices = prices.reindex(rets.index)
+
+    # 1) Factor panel
+    panel = build_factor_panel(prices)
+    zpanel = zscore_cross_section(panel)
+
+    # 2) Composite factor weights (you can tweak these)
+    factor_weights = {
+        "mom20": 0.3,
+        "mom60": 0.3,
+        "rev5": 0.2,
+        "vol20": -0.1,   # prefer lower volatility
+        "val200": 0.3,
+    }
+
+    # 3) Long-short weights (date, asset)
+    weights_long = build_longshort_weights(cfg, zpanel, factor_weights)
+
+    # 4) Align returns to weights index
+    rets_long = rets.stack().rename("ret")  # (date, asset)
+    rets_long.index.set_names(["date", "asset"], inplace=True)
+
+    combo = pd.concat([rets_long, weights_long], axis=1).dropna(subset=["ret"])
+    combo["contrib"] = combo["ret"] * combo["weight"]
+
+    port_ret = combo.groupby(level="date")["contrib"].sum()
+    port_ret.name = "port_ret"
+
+    # Equal-weight long-only benchmark (daily rebalanced)
+    ew_weights = np.full(len(symbols), 1.0 / len(symbols), dtype=float)
+    port_ret_ew = (rets.values @ ew_weights)
+    port_ret_ew = pd.Series(port_ret_ew, index=rets.index, name="port_ret_ew")
+
+    # 5) Unstack scores and weights for output
+    scores = zpanel["score"]
+    scores_wide = scores.unstack("asset").reindex(rets.index).rename_axis(index="date")
+    scores_wide = scores_wide.rename(columns=lambda s: f"score_{s}")
+
+    weights_wide = weights_long.unstack("asset").reindex(rets.index).rename_axis(index="date")
+    weights_wide = weights_wide.rename(columns=lambda s: f"w_{s}")
+
+    prices_wide = aligned_prices.add_prefix("px_")
+    rets_wide = rets.add_prefix("ret_")
+
+    out_df = pd.concat(
+        [
+            prices_wide,
+            rets_wide,
+            weights_wide,
+            scores_wide,
+            port_ret,
+            port_ret_ew,
+        ],
+        axis=1,
+    )
+
+    # Performance stats
+    perf_longshort = annualized_stats(port_ret)
+    perf_ew = annualized_stats(port_ret_ew)
+
+    summary = {
+        "universe": symbols,
+        "start": str(out_df.index.min().date()),
+        "end": str(out_df.index.max().date()),
+        "top_k": cfg.top_k,
+        "bottom_k": cfg.bottom_k,
+        "long_gross": cfg.long_gross,
+        "short_gross": cfg.short_gross,
+        "factor_weights": factor_weights,
+        "performance": {
+            "longshort": perf_longshort,
+            "equal_weight_long_only": perf_ew,
+        },
+    }
+
+    return out_df, summary
+
+
+# ----------------------------- Main ----------------------------- #
+
+
+def run_pipeline(cfg: Config) -> None:
+    # 1) Load prices
+    prices = load_price_series(cfg)
+    print(
+        f"[INFO] Loaded prices for {cfg.symbols} from "
+        f"{prices.index.min().date()} to {prices.index.max().date()} (n={len(prices)})"
+    )
+
+    # 2) Build portfolio
+    out_df, summary = build_portfolio(cfg, prices)
+
+    # 3) Save CSV
+    out_df.to_csv(cfg.out_csv)
+    print(f"[OK] Saved daily portfolio data -> {cfg.out_csv}")
+
+    # 4) Save JSON summary
+    with open(cfg.out_json, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+    print(f"[OK] Saved summary -> {cfg.out_json}")
+
+    # 5) Print quick stats
+    print("\n[SUMMARY — Annualized stats]")
+    ls = summary["performance"]["longshort"]
+    ew = summary["performance"]["equal_weight_long_only"]
+    print(
+        "  Long-Short: "
+        f"CAGR={ls['cagr']:.2%}, Vol={ls['vol']:.2%}, "
+        f"Sharpe={ls['sharpe']:.2f}, MaxDD={ls['max_drawdown']:.2%}"
+    )
+    print(
+        "  EW Long  : "
+        f"CAGR={ew['cagr']:.2%}, Vol={ew['vol']:.2%}, "
+        f"Sharpe={ew['sharpe']:.2f}, MaxDD={ew['max_drawdown']:.2%}"
+    )
+
+
+def main() -> None:
+    cfg = Config()
+    run_pipeline(cfg)
+
+
+if __name__ == "__main__":
+    # Jupyter-safe: strip any unwanted args like "-f kernel-xxxx.json"
+    import sys
+
+    sys.argv = [sys.argv[0]]
+    main()

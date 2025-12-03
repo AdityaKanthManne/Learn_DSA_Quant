@@ -1,0 +1,542 @@
+"""
+Level-58 — Hierarchical Risk Parity (HRP) vs Equal-Weight vs Inverse-Variance
+
+Concept focus
+-------------
+This level combines:
+
+1) Quant model:
+   - Hierarchical Risk Parity (HRP) allocation on a small ETF universe
+     (default: SPY, QQQ, TLT, GLD).
+   - Benchmarks:
+       * Equal-weight (EW)
+       * Inverse-variance (IV) portfolio
+
+2) DSA concept:
+   - Hierarchical clustering as a tree of clusters built bottom-up.
+   - We implement a simple agglomerative clustering from scratch
+     (single-linkage) without SciPy, using:
+        * A distance matrix (graph on assets),
+        * Iterative merging of closest clusters,
+        * A tree structure built via nested lists,
+        * Recursive traversal of that tree to obtain an ordered leaf layout.
+   - This is essentially “build a tree by repeatedly joining the closest
+     nodes, then traverse it recursively” — a classic divide-and-conquer
+     pattern with an explicit tree data structure.
+
+What the script does
+--------------------
+- Downloads daily prices for ETFs (SPY, QQQ, TLT, GLD) using yfinance,
+  with a synthetic multi-asset GBM fallback if download fails.
+- Computes daily returns, covariance and correlation.
+- Builds a hierarchical cluster tree of assets using a custom
+  agglomerative single-linkage clustering (no SciPy required).
+- Derives an asset ordering from that tree (leaf ordering).
+- Computes three portfolios:
+    1) Equal-weight (EW)
+    2) Inverse-variance (IV)
+    3) Hierarchical Risk Parity (HRP)
+- Applies static weights over the full sample, computes daily portfolio
+  returns and performance statistics (CAGR, vol, Sharpe, max drawdown).
+- Saves:
+    - level58_hrp_portfolios.csv  (prices, returns, weights, portfolio returns)
+    - level58_hrp_summary.json    (weights + performance metrics)
+
+External references to learn more
+---------------------------------
+(This script is self-contained, but to study HRP in depth, see:)
+- López de Prado, “Building Diversified Portfolios that Perform Well
+  Out-of-Sample” (SSRN / arXiv).
+- Quantpedia overview of Hierarchical Risk Parity strategies.
+- Various HRP implementations and discussions:
+  - https://github.com/robertmartin8/PyPortfolioOpt
+  - https://www.quantconnect.com/tutorials/strategy-library/hierarchical-risk-parity
+
+Drop this into PyCharm or a Jupyter cell and run.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+from dataclasses import dataclass
+from typing import Dict, List, Tuple, Any
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+
+
+# ---------------------------- Config ---------------------------- #
+
+
+@dataclass
+class Config:
+    symbols: Tuple[str, ...] = ("SPY", "QQQ", "TLT", "GLD")
+    start: str = "2010-01-01"
+
+    # Output
+    out_csv: str = "level58_hrp_portfolios.csv"
+    out_json: str = "level58_hrp_summary.json"
+
+
+# ---------------------- Data utilities -------------------------- #
+
+
+def build_synthetic_prices(cfg: Config) -> pd.DataFrame:
+    """
+    Synthetic multi-asset GBM with a simple correlation structure.
+    Used if yfinance download fails.
+    """
+    print("[WARN] Falling back to synthetic prices (Level-58).")
+    rng = np.random.default_rng(58)
+    n_assets = len(cfg.symbols)
+    n_days = 4000
+
+    dates = pd.bdate_range("2010-01-04", periods=n_days, freq="B")
+
+    base_corr = np.array(
+        [
+            [1.0, 0.85, -0.2, 0.1],
+            [0.85, 1.0, -0.2, 0.1],
+            [-0.2, -0.2, 1.0, 0.0],
+            [0.1, 0.1, 0.0, 1.0],
+        ]
+    )
+    if n_assets != base_corr.shape[0]:
+        corr = np.eye(n_assets)
+    else:
+        corr = base_corr
+
+    chol = np.linalg.cholesky(corr)
+
+    vols = np.array([0.18, 0.22, 0.12, 0.15])[:n_assets]
+    mus = np.array([0.07, 0.09, 0.04, 0.05])[:n_assets]
+
+    dt = 1.0 / 252.0
+    z = rng.standard_normal((n_days, n_assets))
+    eps = z @ chol.T
+
+    rets = (mus - 0.5 * vols**2) * dt + vols * math.sqrt(dt) * eps
+    prices = 100.0 * np.exp(np.cumsum(rets, axis=0))
+
+    df = pd.DataFrame(prices, index=dates, columns=list(cfg.symbols))
+    return df
+
+
+def load_price_series(cfg: Config) -> pd.DataFrame:
+    """
+    Download daily adjusted close prices for the symbols from yfinance.
+    Handles MultiIndex columns and falls back to synthetic if needed.
+    Returns:
+        DataFrame with columns = cfg.symbols, index = dates, dtype=float.
+    """
+    try:
+        raw = yf.download(
+            list(cfg.symbols),
+            start=cfg.start,
+            auto_adjust=True,
+            progress=False,
+        )
+    except Exception:
+        raw = pd.DataFrame()
+
+    if raw is None or raw.empty:
+        return build_synthetic_prices(cfg)
+
+    if isinstance(raw.columns, pd.MultiIndex):
+        top = raw.columns.get_level_values(0)
+        if "Adj Close" in top and "Close" not in top:
+            px = raw["Adj Close"].copy()
+        else:
+            px = raw["Close"].copy()
+    else:
+        px = raw.copy()
+
+    cols = [c for c in px.columns if c in cfg.symbols]
+    if not cols:
+        return build_synthetic_prices(cfg)
+
+    px = px[cols].sort_index()
+    px = px.dropna(how="any").copy()
+
+    for sym in cfg.symbols:
+        if sym not in px.columns:
+            px[sym] = 1.0
+
+    px = px[list(cfg.symbols)].astype(float)
+    return px
+
+
+# -------------------- Performance utilities --------------------- #
+
+
+def annualized_stats(ret: pd.Series) -> Dict[str, float]:
+    """
+    Compute CAGR, vol, Sharpe (CAGR/vol), and max drawdown for daily returns.
+    """
+    ret = ret.dropna()
+    if len(ret) == 0:
+        return {
+            "cagr": 0.0,
+            "vol": 0.0,
+            "sharpe": 0.0,
+            "max_drawdown": 0.0,
+        }
+
+    total_return = float((1.0 + ret).prod())
+    years = len(ret) / 252.0
+    cagr = total_return ** (1.0 / years) - 1.0 if years > 0 else 0.0
+
+    vol = float(ret.std() * math.sqrt(252.0))
+    sharpe = cagr / vol if vol > 0 else 0.0
+
+    equity = (1.0 + ret).cumprod()
+    roll_max = equity.cummax()
+    dd = equity / roll_max - 1.0
+    max_dd = float(dd.min())
+
+    return {
+        "cagr": float(cagr),
+        "vol": float(vol),
+        "sharpe": float(sharpe),
+        "max_drawdown": max_dd,
+    }
+
+
+# -------------------- Hierarchical clustering ------------------- #
+
+
+class ClusterNode:
+    """
+    A simple cluster node for agglomerative clustering:
+    - members: list of asset indices used to compute distances.
+    - struct: nested representation of the cluster tree
+              (int or [left_struct, right_struct]).
+    """
+
+    def __init__(self, members: List[int], struct: Any):
+        self.members = members
+        self.struct = struct
+
+
+def corr_to_distance(corr: np.ndarray) -> np.ndarray:
+    """
+    Convert correlation matrix to a distance matrix using:
+        d_ij = sqrt(0.5 * (1 - corr_ij))
+
+    Ensures a proper distance for clustering.
+    """
+    corr_clipped = np.clip(corr, -1.0, 1.0)
+    dist = np.sqrt(0.5 * (1.0 - corr_clipped))
+    np.fill_diagonal(dist, 0.0)
+    return dist
+
+
+def hierarchical_clustering_single_link(dist: np.ndarray) -> Any:
+    """
+    Very simple agglomerative single-linkage clustering, implemented
+    from scratch to avoid SciPy.
+
+    Args:
+        dist: (n x n) distance matrix between assets.
+
+    Returns:
+        A nested list representation of the cluster tree. Leaves are
+        integers (asset indices). Internal nodes are [left, right].
+    """
+    n = dist.shape[0]
+    nodes: List[ClusterNode] = [ClusterNode([i], i) for i in range(n)]
+
+    # Helper to compute distance between clusters via single-linkage
+    def cluster_distance(a: ClusterNode, b: ClusterNode) -> float:
+        vals = [
+            dist[i, j]
+            for i in a.members
+            for j in b.members
+            if i != j
+        ]
+        if not vals:
+            return float("inf")
+        return float(min(vals))
+
+    # Agglomerative merging
+    while len(nodes) > 1:
+        best_i, best_j, best_d = 0, 1, float("inf")
+        m = len(nodes)
+        for i in range(m):
+            for j in range(i + 1, m):
+                d = cluster_distance(nodes[i], nodes[j])
+                if d < best_d:
+                    best_d = d
+                    best_i, best_j = i, j
+
+        a = nodes[best_i]
+        b = nodes[best_j]
+        merged_members = sorted(a.members + b.members)
+        merged_struct = [a.struct, b.struct]
+
+        new_node = ClusterNode(merged_members, merged_struct)
+
+        # Remove j then i (higher index first) to keep indices valid
+        for idx in sorted([best_i, best_j], reverse=True):
+            del nodes[idx]
+        nodes.append(new_node)
+
+    return nodes[0].struct
+
+
+def tree_to_order(tree: Any) -> List[int]:
+    """
+    Flatten nested cluster tree into a 1D ordering of leaf indices
+    (left-to-right traversal).
+    """
+    if isinstance(tree, int):
+        return [tree]
+    left, right = tree
+    return tree_to_order(left) + tree_to_order(right)
+
+
+# --------------------- HRP weight construction ------------------ #
+
+
+def cluster_variance(cov: np.ndarray, cluster_idx: List[int]) -> float:
+    """
+    Compute variance of a cluster using equal weights within the cluster.
+    """
+    if not cluster_idx:
+        return 0.0
+    sub = cov[np.ix_(cluster_idx, cluster_idx)]
+    n = len(cluster_idx)
+    w = np.full(n, 1.0 / n, dtype=float)
+    var = float(w @ sub @ w)
+    return max(var, 1e-12)
+
+
+def hrp_allocation(cov: np.ndarray, order: List[int]) -> np.ndarray:
+    """
+    Hierarchical Risk Parity allocation given covariance matrix and
+    a leaf ordering.
+
+    Implementation follows the recursive bisection idea:
+    - Start with all assets in one cluster and weight 1.
+    - At each step, split the ordered list in two subclusters,
+      compute cluster variances, and allocate capital inversely
+      to variance, then recurse down the tree.
+    """
+    n = cov.shape[0]
+    w = np.ones(n, dtype=float)
+
+    def _allocate(cluster: List[int]) -> None:
+        if len(cluster) <= 1:
+            return
+        mid = len(cluster) // 2
+        left = cluster[:mid]
+        right = cluster[mid:]
+
+        var_left = cluster_variance(cov, left)
+        var_right = cluster_variance(cov, right)
+        inv_sum = 1.0 / var_left + 1.0 / var_right
+
+        alloc_left = (1.0 / var_left) / inv_sum
+        alloc_right = (1.0 / var_right) / inv_sum
+
+        # Scale existing weights in each subcluster
+        w[left] *= alloc_left
+        w[right] *= alloc_right
+
+        _allocate(left)
+        _allocate(right)
+
+    _allocate(order)
+    # Normalize to sum to 1
+    total = float(w.sum())
+    if total <= 0:
+        return np.full(n, 1.0 / n, dtype=float)
+    return w / total
+
+
+def inverse_variance_weights(cov: np.ndarray) -> np.ndarray:
+    """
+    Inverse-variance portfolio: w_i ∝ 1 / cov_ii, then normalized.
+    """
+    diag = np.diag(cov)
+    diag = np.where(diag <= 0.0, np.nan, diag)
+    inv = 1.0 / diag
+    inv = np.where(np.isfinite(inv), inv, 0.0)
+    s = float(inv.sum())
+    if s <= 0.0:
+        return np.full(len(diag), 1.0 / len(diag), dtype=float)
+    return inv / s
+
+
+def equal_weights(n_assets: int) -> np.ndarray:
+    return np.full(n_assets, 1.0 / n_assets, dtype=float)
+
+
+# --------------------- Portfolio construction ------------------- #
+
+
+def build_portfolios(cfg: Config, prices: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Dict]]:
+    """
+    Given price series, build EW, inverse-variance, and HRP portfolios.
+
+    Returns:
+        df_out: DataFrame with prices, returns, weights, and portfolio returns.
+        stats:  Dict with weights and performance metrics.
+    """
+    assets = list(cfg.symbols)
+    ret_assets = prices.pct_change().dropna()
+    idx = ret_assets.index
+    n_assets = len(assets)
+
+    # Covariance / correlation on entire sample
+    cov = ret_assets.cov().values
+    corr = ret_assets.corr().values
+
+    # Hierarchical clustering → order
+    dist = corr_to_distance(corr)
+    tree = hierarchical_clustering_single_link(dist)
+    order = tree_to_order(tree)
+
+    # Build portfolios
+    w_ew = equal_weights(n_assets)
+    w_iv = inverse_variance_weights(cov)
+    w_hrp = hrp_allocation(cov, order)
+
+    # Ensure numerical stability
+    def _normalize(w: np.ndarray) -> np.ndarray:
+        w = np.clip(w, 0.0, None)
+        s = float(w.sum())
+        if s <= 0.0:
+            return np.full_like(w, 1.0 / len(w))
+        return w / s
+
+    w_ew = _normalize(w_ew)
+    w_iv = _normalize(w_iv)
+    w_hrp = _normalize(w_hrp)
+
+    # Portfolio returns (static weights)
+    rets_ew = ret_assets.values @ w_ew
+    rets_iv = ret_assets.values @ w_iv
+    rets_hrp = ret_assets.values @ w_hrp
+
+    port_rets = pd.DataFrame(
+        {
+            "ret_ew": rets_ew,
+            "ret_iv": rets_iv,
+            "ret_hrp": rets_hrp,
+        },
+        index=idx,
+    )
+
+    # Build weights DataFrame (constant through time)
+    weights_df = pd.DataFrame(
+        {
+            **{f"w_ew_{sym}": w_ew[i] for i, sym in enumerate(assets)},
+            **{f"w_iv_{sym}": w_iv[i] for i, sym in enumerate(assets)},
+            **{f"w_hrp_{sym}": w_hrp[i] for i, sym in enumerate(assets)},
+        },
+        index=[idx[0]],
+    )
+
+    # Broadcast weights to all dates
+    weights_full = weights_df.reindex(idx, method="ffill")
+
+    # Combine everything
+    prices_aligned = prices.reindex(idx)
+    out_df = pd.concat(
+        [
+            prices_aligned.add_prefix("px_"),
+            ret_assets.add_prefix("ret_"),
+            weights_full,
+            port_rets,
+        ],
+        axis=1,
+    )
+
+    # Performance stats
+    stats = {
+        "weights": {
+            "assets": assets,
+            "order_indices": [int(i) for i in order],
+            "order_symbols": [assets[i] for i in order],
+            "w_ew": w_ew.tolist(),
+            "w_iv": w_iv.tolist(),
+            "w_hrp": w_hrp.tolist(),
+        },
+        "performance": {
+            "ret_ew": annualized_stats(port_rets["ret_ew"]),
+            "ret_iv": annualized_stats(port_rets["ret_iv"]),
+            "ret_hrp": annualized_stats(port_rets["ret_hrp"]),
+        },
+    }
+
+    return out_df, stats
+
+
+# ----------------------------- Main ----------------------------- #
+
+
+def run_pipeline(cfg: Config) -> None:
+    # 1) Load prices
+    prices = load_price_series(cfg)
+    print(
+        f"[INFO] Loaded prices for {cfg.symbols} from "
+        f"{prices.index.min().date()} to {prices.index.max().date()} "
+        f"(n={len(prices)})"
+    )
+
+    # 2) Build portfolios
+    out_df, stats = build_portfolios(cfg, prices)
+
+    # 3) Save CSV
+    out_df.to_csv(cfg.out_csv)
+    print(f"[OK] Saved daily portfolios → {cfg.out_csv}")
+
+    # 4) Save JSON summary
+    summary = {
+        "symbols": list(cfg.symbols),
+        "start": str(prices.index.min().date()),
+        "end": str(prices.index.max().date()),
+        "stats": stats,
+    }
+    with open(cfg.out_json, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+    print(f"[OK] Saved summary → {cfg.out_json}")
+
+    # 5) Print quick stats
+    print("\n[SUMMARY — Annualized stats]")
+    for key, s in stats["performance"].items():
+        print(
+            f"  {key:8s}: "
+            f"CAGR={s['cagr']:.2%}, "
+            f"Vol={s['vol']:.2%}, "
+            f"Sharpe={s['sharpe']:.2f}, "
+            f"MaxDD={s['max_drawdown']:.2%}"
+        )
+
+    print("\n[WEIGHTS]")
+    for name, w in [
+        ("EW", stats["weights"]["w_ew"]),
+        ("IV", stats["weights"]["w_iv"]),
+        ("HRP", stats["weights"]["w_hrp"]),
+    ]:
+        line = ", ".join(
+            f"{sym}={weight:.2%}"
+            for sym, weight in zip(stats["weights"]["assets"], w)
+        )
+        print(f"  {name:3s}: {line}")
+
+
+def main() -> None:
+    cfg = Config()
+    run_pipeline(cfg)
+
+
+if __name__ == "__main__":
+    # Jupyter-safe: strip any unwanted args like "-f kernel-xxxx.json"
+    import sys
+
+    sys.argv = [sys.argv[0]]
+    main()
