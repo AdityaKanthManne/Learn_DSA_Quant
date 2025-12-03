@@ -1,0 +1,28 @@
+{
+  "config": {
+    "symbol": "SPY",
+    "side": "buy",
+    "qty": 50000,
+    "minutes": 120,
+    "strategy": "twap",
+    "interval": "1m",
+    "lookback_days": 5,
+    "start_offset_min": 0,
+    "participation": 0.1,
+    "spread_bps": 2.0,
+    "k_temp": 0.3,
+    "alpha": 0.6,
+    "k_perm": 0.02,
+    "vol_span": 20,
+    "vol_floor_bps": 5.0,
+    "out_csv": "level55_exec_slices.csv",
+    "out_json": "level55_exec_summary.json",
+    "seed": 42
+  },
+  "arrival_mid": 668.5599975585938,
+  "exec_avg": 668.8452531184261,
+  "shortfall_bps": 4.266715939840651,
+  "completed_qty": 50000.00000000001,
+  "completion_pct": 100.00000000000001,
+  "slices": 120
+}
