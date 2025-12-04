@@ -1,0 +1,514 @@
+Nice, rolling into Level-61 🚀
+
+For this level, let’s do a **Regime-Aware Volatility-Targeted Risk-Parity Portfolio** across your usual ETF sleeve:
+
+* Universe: `SPY, QQQ, IWM, EFA, EEM, TLT, LQD, GLD`
+* Baseline: inverse-volatility “risk-parity” across all assets
+* Overlay:
+
+  * **Vol target** at portfolio level (e.g. 10%)
+  * **Risk-off regime filter**: if global equity basket is too volatile or in drawdown, shrink risky assets and rotate into defensives (TLT/LQD/GLD)
+* Outputs: daily returns, equity curve, weights, summary JSON
+
+All free data via `yfinance`, single script, ready for PyCharm/Jupyter.
+
+---
+
+```python
+# level61_regime_riskparity.py
+# Level-61: Regime-Aware Volatility-Targeted Risk-Parity Portfolio
+#
+# Idea:
+#   - Multi-asset universe: SPY, QQQ, IWM, EFA, EEM, TLT, LQD, GLD
+#   - Baseline weights: inverse volatility (poor-man's risk parity)
+#   - Volatility target at portfolio level (e.g. 10% annualized)
+#   - Regime filter:
+#        * Build an "equity basket" from risky assets (SPY, QQQ, IWM, EFA, EEM)
+#        * If equity vol > threshold OR lookback return < threshold -> risk-off
+#        * In risk-off: shrink risky weights and rotate capital to defensive sleeve (TLT, LQD, GLD)
+#   - Rebalance on a fixed schedule (e.g. monthly)
+#
+# Usage examples:
+#   python level61_regime_riskparity.py
+#   python level61_regime_riskparity.py --start 2010-01-01 --vol-target 0.10 --rebalance-freq M
+#   python level61_regime_riskparity.py --vol-target 0.08 --tc-bps 5
+#
+# Outputs:
+#   - level61_regime_riskparity.csv        (daily prices, returns, weights, portfolio series)
+#   - level61_regime_riskparity_summary.json  (performance metrics & config)
+
+import argparse
+import json
+from dataclasses import dataclass, asdict
+from typing import List, Tuple
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+
+
+# ----------------------------- Config -----------------------------
+
+
+@dataclass
+class Config:
+    symbols: Tuple[str, ...] = (
+        "SPY", "QQQ", "IWM", "EFA", "EEM", "TLT", "LQD", "GLD"
+    )
+    start: str = "2010-01-01"
+    vol_lookback: int = 60         # days for vol & cov estimation
+    rebalance_freq: str = "M"      # "M" (month-end), "W-FRI", etc.
+    vol_target: float = 0.10       # target annualized portfolio volatility
+    max_leverage: float = 2.0      # cap leverage
+    risk_off_vol: float = 0.25     # equity basket annual vol threshold
+    risk_off_mom: float = -0.10    # equity basket lookback return threshold
+    risk_off_shrink: float = 0.5   # risky sleeve shrink factor in risk-off
+    tc_bps: float = 10.0           # round-trip transaction cost in bps
+    out_csv: str = "level61_regime_riskparity.csv"
+    out_json: str = "level61_regime_riskparity_summary.json"
+    seed: int = 42
+
+
+# ----------------------------- Data Loading -----------------------------
+
+
+def load_prices(cfg: Config) -> pd.DataFrame:
+    tickers = list(cfg.symbols)
+    px = yf.download(
+        tickers,
+        start=cfg.start,
+        auto_adjust=True,
+        progress=False,
+    )
+    if px.empty:
+        raise RuntimeError("No data downloaded. Check tickers or internet connection.")
+
+    # yfinance with multiple tickers returns a MultiIndex on columns
+    if isinstance(px.columns, pd.MultiIndex):
+        # Prefer "Close" when auto_adjust=True (already adjusted)
+        if "Close" not in px.columns.levels[0]:
+            raise RuntimeError("Expected 'Close' in yfinance output.")
+        close = px["Close"].copy()
+    else:
+        # Single-ticker case, keep as DataFrame with one column
+        close = px[["Close"]].copy()
+        close.columns = tickers[:1]
+
+    close = close.dropna(how="all")
+    close = close[tickers]  # ensure column order
+    return close
+
+
+def compute_returns(close: pd.DataFrame) -> pd.DataFrame:
+    rets = close.pct_change().dropna()
+    return rets
+
+
+# ----------------------------- Helpers -----------------------------
+
+
+def annualize_vol(daily_vol: float) -> float:
+    return float(daily_vol * np.sqrt(252.0))
+
+
+def portfolio_vol(weights: np.ndarray, cov: np.ndarray) -> float:
+    return float(np.sqrt(weights @ cov @ weights))
+
+
+def inverse_vol_weights(vol_vec: pd.Series) -> pd.Series:
+    """Inverse-volatility weights (normalized)."""
+    vol_vec = vol_vec.replace(0.0, np.nan)
+    inv = 1.0 / vol_vec
+    inv = inv.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    if inv.sum() <= 0:
+        # fallback: equal weights
+        return pd.Series(1.0 / len(inv), index=inv.index)
+    w = inv / inv.sum()
+    return w
+
+
+def equity_basket_stats(
+    hist_rets: pd.DataFrame,
+    risky_cols: List[str],
+) -> Tuple[float, float]:
+    """
+    Build an equal-weight equity basket from risky_cols and compute:
+      - annualized vol
+      - total return over the lookback window
+    """
+    cols = [c for c in risky_cols if c in hist_rets.columns]
+    if len(cols) == 0:
+        return 0.0, 0.0
+    basket = hist_rets[cols].mean(axis=1)
+    if basket.empty:
+        return 0.0, 0.0
+
+    vol_ann = annualize_vol(basket.std())
+    cum_ret = (1.0 + basket).prod() - 1.0
+    return vol_ann, float(cum_ret)
+
+
+def apply_risk_off_overlay(
+    w: pd.Series,
+    risky_cols: List[str],
+    defensive_cols: List[str],
+    shrink: float,
+) -> pd.Series:
+    """
+    shrink risky weights by 'shrink', reallocate freed capital to defensive sleeve.
+    """
+    w = w.copy()
+    risky_cols = [c for c in risky_cols if c in w.index]
+    defensive_cols = [c for c in defensive_cols if c in w.index]
+
+    if len(risky_cols) == 0 or len(defensive_cols) == 0:
+        return w  # nothing to do
+
+    risky_before = float(w[risky_cols].sum())
+    if risky_before <= 0:
+        return w
+
+    # shrink risky sleeve
+    w[risky_cols] *= shrink
+    risky_after = float(w[risky_cols].sum())
+    freed = risky_before - risky_after
+
+    # reallocate freed + existing defensive proportionally within defensive sleeve
+    def_before = float(w[defensive_cols].sum())
+    new_def_total = def_before + freed
+
+    if new_def_total <= 0:
+        # if defensive was zero, allocate freed equally
+        add_each = freed / len(defensive_cols)
+        for c in defensive_cols:
+            w[c] += add_each
+    else:
+        # scale existing defensive weights
+        if def_before > 0:
+            scale = new_def_total / def_before
+            w[defensive_cols] *= scale
+        else:
+            # no initial defensive; spread new_def_total equally
+            add_each = new_def_total / len(defensive_cols)
+            for c in defensive_cols:
+                w[c] = add_each
+
+    # numerical cleanup
+    total = float(w.sum())
+    if total != 0.0:
+        w = w / total
+    return w
+
+
+# ----------------------------- Weight Construction -----------------------------
+
+
+def build_rebalance_schedule(
+    rets: pd.DataFrame,
+    cfg: Config,
+) -> pd.DatetimeIndex:
+    """
+    Rebalance at the chosen frequency using the returns index.
+    """
+    if cfg.rebalance_freq.upper().startswith("M"):
+        # Month end
+        rebal_dates = rets.resample("M").last().index
+    else:
+        # Pass directly to resample (e.g. 'W-FRI')
+        rebal_dates = rets.resample(cfg.rebalance_freq).last().index
+    # Ensure rebal dates are within rets index range
+    rebal_dates = rebal_dates[rebal_dates >= rets.index[0]]
+    return rebal_dates
+
+
+def compute_weights(
+    rets: pd.DataFrame,
+    cfg: Config,
+) -> pd.DataFrame:
+    """
+    For each rebalance date:
+      1) Use last vol_lookback days to compute asset vol & cov.
+      2) Get inverse-vol baseline weights.
+      3) Compute equity basket stats and decide risk-on / risk-off.
+      4) In risk-off, shrink risky sleeve and rotate to defensive.
+      5) Scale to hit vol_target with leverage cap.
+    """
+    risky_cols = ["SPY", "QQQ", "IWM", "EFA", "EEM"]
+    defensive_cols = ["TLT", "LQD", "GLD"]
+
+    rebal_dates = build_rebalance_schedule(rets, cfg)
+    all_dates = rets.index
+
+    weights_list = []
+
+    for dt in rebal_dates:
+        # lookback window: including dt, using previous vol_lookback days
+        window = rets.loc[:dt].tail(cfg.vol_lookback)
+        if window.shape[0] < cfg.vol_lookback // 2:
+            # skip if too little history
+            continue
+
+        # asset vol (daily), then convert to annual
+        vol_daily = window.std()
+        vol_ann = vol_daily * np.sqrt(252.0)
+        w_base = inverse_vol_weights(vol_ann)
+        w_base = w_base.reindex(rets.columns).fillna(0.0)
+
+        # equity basket stats for regime detection
+        eq_vol_ann, eq_cum_ret = equity_basket_stats(window, risky_cols)
+        risk_off = (eq_vol_ann > cfg.risk_off_vol) or (eq_cum_ret < cfg.risk_off_mom)
+
+        w_adj = w_base.copy()
+        if risk_off:
+            w_adj = apply_risk_off_overlay(
+                w_adj,
+                risky_cols=risky_cols,
+                defensive_cols=defensive_cols,
+                shrink=cfg.risk_off_shrink,
+            )
+
+        # target vol scaling with leverage cap
+        cov = window.cov() * 252.0  # annualized covariance
+        w_vec = w_adj.values
+        try:
+            port_vol = portfolio_vol(w_vec, cov.values)
+        except Exception:
+            port_vol = 0.0
+
+        if port_vol > 0:
+            lev = cfg.vol_target / port_vol
+        else:
+            lev = 0.0
+        lev = float(min(cfg.max_leverage, max(0.0, lev)))
+
+        w_final = w_adj * lev
+
+        rec = {
+            "date": dt,
+            "risk_off": int(risk_off),
+            "eq_vol_ann": float(eq_vol_ann),
+            "eq_cum_ret": float(eq_cum_ret),
+        }
+        for col in rets.columns:
+            rec[f"w_{col}"] = float(w_final.get(col, 0.0))
+
+        weights_list.append(rec)
+
+    if not weights_list:
+        raise RuntimeError("No rebalance weights computed (check lookback and start date).")
+
+    weights_df = pd.DataFrame(weights_list).set_index("date")
+    # align to trading calendar: forward-fill weights over daily dates
+    weights_daily = (
+        weights_df[[c for c in weights_df.columns if c.startswith("w_")]]
+        .reindex(all_dates)
+        .ffill()
+        .fillna(0.0)
+    )
+    meta_daily = (
+        weights_df[["risk_off", "eq_vol_ann", "eq_cum_ret"]]
+        .reindex(all_dates)
+        .ffill()
+    )
+    return weights_daily, meta_daily
+
+
+# ----------------------------- Backtest -----------------------------
+
+
+def backtest(
+    rets: pd.DataFrame,
+    weights_daily: pd.DataFrame,
+    meta_daily: pd.DataFrame,
+    cfg: Config,
+) -> pd.DataFrame:
+    """
+    Compute daily portfolio returns with and without transaction costs.
+    Transaction cost model:
+      - tc_bps is round-trip cost (e.g. 10 bps)
+      - per rebalance, slippage = 0.5 * tc_bps * turnover
+      - turnover_t = sum(|w_t - w_{t-1}|), portfolio cost = turnover_t * (tc_bps * 1e-4 / 2)
+    """
+    # Ensure alignment
+    common_idx = rets.index.intersection(weights_daily.index)
+    rets = rets.loc[common_idx]
+    weights_daily = weights_daily.loc[common_idx]
+    meta_daily = meta_daily.loc[common_idx]
+
+    # Extract pure weights matrix (no "risk_off" columns)
+    w_cols = [c for c in weights_daily.columns if c.startswith("w_")]
+    asset_cols = [c.replace("w_", "") for c in w_cols]
+
+    W = weights_daily[w_cols].copy()
+    W.columns = asset_cols
+    W = W.reindex(columns=rets.columns).fillna(0.0)
+
+    # raw portfolio returns
+    port_ret = (W * rets).sum(axis=1)
+
+    # transaction costs
+    turnover = W.diff().abs().sum(axis=1).fillna(0.0)
+    # cost per day
+    tc_per_unit = cfg.tc_bps * 1e-4 / 2.0
+    cost = turnover * tc_per_unit
+
+    port_ret_tc = port_ret - cost
+
+    equity = (1.0 + port_ret).cumprod()
+    equity_tc = (1.0 + port_ret_tc).cumprod()
+
+    out = pd.DataFrame(index=common_idx)
+    out["port_ret"] = port_ret
+    out["port_ret_tc"] = port_ret_tc
+    out["equity"] = equity
+    out["equity_tc"] = equity_tc
+    out["turnover"] = turnover
+    out["tc_cost"] = cost
+
+    # bring through meta
+    out["risk_off"] = meta_daily["risk_off"].reindex(common_idx)
+    out["eq_vol_ann"] = meta_daily["eq_vol_ann"].reindex(common_idx)
+    out["eq_cum_ret"] = meta_daily["eq_cum_ret"].reindex(common_idx)
+
+    # also include underlying prices and weights if desired
+    for col in rets.columns:
+        out[f"ret_{col}"] = rets[col]
+        out[f"w_{col}"] = W[col]
+
+    return out
+
+
+# ----------------------------- Metrics -----------------------------
+
+
+def max_drawdown(series: pd.Series) -> float:
+    running_max = series.cummax()
+    dd = series / running_max - 1.0
+    return float(dd.min())
+
+
+def summary_stats(df: pd.DataFrame, cfg: Config) -> dict:
+    port_ret = df["port_ret_tc"]
+    if port_ret.empty:
+        raise RuntimeError("No returns to summarize.")
+
+    ann_ret = (1.0 + port_ret).prod() ** (252.0 / len(port_ret)) - 1.0
+    ann_vol = annualize_vol(port_ret.std())
+    sharpe = float(ann_ret / ann_vol) if ann_vol > 0 else 0.0
+
+    eq_tc = df["equity_tc"]
+    mdd = max_drawdown(eq_tc)
+
+    risk_off_days = int(df["risk_off"].fillna(0).sum())
+    total_days = len(df)
+
+    stats = {
+        "start": str(df.index[0].date()),
+        "end": str(df.index[-1].date()),
+        "n_days": total_days,
+        "ann_return": float(ann_ret),
+        "ann_vol": float(ann_vol),
+        "sharpe": sharpe,
+        "max_drawdown": float(mdd),
+        "risk_off_days": risk_off_days,
+        "risk_off_ratio": float(risk_off_days / total_days),
+    }
+    return stats
+
+
+# ----------------------------- I/O -----------------------------
+
+
+def save_outputs(df: pd.DataFrame, stats: dict, cfg: Config) -> None:
+    df.to_csv(cfg.out_csv, index=True, date_format="%Y-%m-%d")
+    summary = {
+        "config": asdict(cfg),
+        "stats": stats,
+    }
+    with open(cfg.out_json, "w") as f:
+        json.dump(summary, f, indent=2)
+
+    print(f"[OK] Saved daily series → {cfg.out_csv}")
+    print(f"[OK] Saved summary → {cfg.out_json}")
+    print(
+        f"Period {stats['start']} → {stats['end']}, "
+        f"AnnRet={stats['ann_return']:.2%}, "
+        f"AnnVol={stats['ann_vol']:.2%}, "
+        f"Sharpe={stats['sharpe']:.2f}, "
+        f"MaxDD={stats['max_drawdown']:.2%}"
+    )
+
+
+# ----------------------------- CLI -----------------------------
+
+
+def parse_args() -> Config:
+    p = argparse.ArgumentParser(description="Level-61: Regime-Aware Risk-Parity Portfolio")
+    p.add_argument("--start", type=str, default="2010-01-01")
+    p.add_argument("--vol-lookback", type=int, default=60)
+    p.add_argument("--rebalance-freq", type=str, default="M")
+    p.add_argument("--vol-target", type=float, default=0.10)
+    p.add_argument("--max-leverage", type=float, default=2.0)
+    p.add_argument("--risk-off-vol", type=float, default=0.25)
+    p.add_argument("--risk-off-mom", type=float, default=-0.10)
+    p.add_argument("--risk-off-shrink", type=float, default=0.5)
+    p.add_argument("--tc-bps", type=float, default=10.0)
+    p.add_argument("--csv", type=str, default="level61_regime_riskparity.csv")
+    p.add_argument("--json", type=str, default="level61_regime_riskparity_summary.json")
+    p.add_argument("--seed", type=int, default=42)
+    args = p.parse_args()
+
+    return Config(
+        start=args.start,
+        vol_lookback=args.vol_lookback,
+        rebalance_freq=args.rebalance_freq,
+        vol_target=args.vol_target,
+        max_leverage=args.max_leverage,
+        risk_off_vol=args.risk_off_vol,
+        risk_off_mom=args.risk_off_mom,
+        risk_off_shrink=args.risk_off_shrink,
+        tc_bps=args.tc_bps,
+        out_csv=args.csv,
+        out_json=args.json,
+        seed=args.seed,
+    )
+
+
+# ----------------------------- Main -----------------------------
+
+
+def main():
+    cfg = parse_args()
+    np.random.seed(cfg.seed)
+
+    print(f"[INFO] Downloading prices for {cfg.symbols} from {cfg.start} ...")
+    close = load_prices(cfg)
+    rets = compute_returns(close)
+    print(f"[INFO] Got {len(close)} price rows, {len(rets)} return rows.")
+
+    weights_daily, meta_daily = compute_weights(rets, cfg)
+    print(f"[INFO] Computed weights on {weights_daily.index[0].date()} → {weights_daily.index[-1].date()}")
+
+    out_df = backtest(rets, weights_daily, meta_daily, cfg)
+    stats = summary_stats(out_df, cfg)
+    save_outputs(out_df, stats, cfg)
+
+
+if __name__ == "__main__":
+    # Jupyter / PyCharm shim: strip kernel args like "-f kernel-xxxx.json"
+    import sys
+
+    sys.argv = [sys.argv[0]] + [
+        arg
+        for arg in sys.argv[1:]
+        if arg != "-f" and not (arg.endswith(".json") and "kernel" in arg)
+    ]
+    main()
+```
+
+Drop this into `level61_regime_riskparity.py`, run it, and you’ll get:
+
+* CSV with prices, returns, weights, regime flags, and equity curves
+* JSON with config + performance stats
+
+If you want Level-61 to be something different (e.g., pure HRP, or macro-overlay), we can pivot the same skeleton.
