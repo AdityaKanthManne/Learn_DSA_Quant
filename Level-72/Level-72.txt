@@ -1,0 +1,451 @@
+Here’s **Level-72 – Correlation Regime Switcher Portfolio**:
+
+* Universe: `SPY, QQQ, IWM, EFA, EEM, TLT, LQD, GLD`
+* Detects **rolling correlation regime** (low / mid / high) from equities.
+* Switches allocation between **risk assets** (equities) and **defensives** (`TLT, LQD, GLD`) depending on regime.
+* Rebalances **monthly (month-end)**, then holds weights daily.
+* Outputs:
+
+  * `level72_corr_regime_switcher.csv`
+  * `level72_corr_regime_switcher_summary.json`
+
+Save as `level72_corr_regime_switcher.py` and run.
+
+```python
+# level72_corr_regime_switcher.py
+# Correlation Regime Switcher Portfolio:
+# - Computes rolling average cross-asset correlation across equities
+# - Classifies regimes: LOW / MID / HIGH correlation
+# - Allocates between risk assets (equities) and defensives (bonds/gold)
+# - Rebalances monthly (month-end), holds weights daily
+#
+# Universe default:
+#   SPY, QQQ, IWM, EFA, EEM, TLT, LQD, GLD
+#
+# Outputs:
+#   - level72_corr_regime_switcher.csv
+#   - level72_corr_regime_switcher_summary.json
+#
+# Risk / defensive split by regime (defaults):
+#   LOW  corr → 80% risk, 20% defensive
+#   MID  corr → 60% risk, 40% defensive
+#   HIGH corr → 30% risk, 70% defensive
+
+import argparse
+import json
+from dataclasses import dataclass, asdict
+from typing import Sequence, Tuple, List, Dict
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+
+
+# --------------------------- Config ---------------------------
+
+@dataclass
+class Config:
+    # Universe
+    symbols: Tuple[str, ...] = (
+        "SPY", "QQQ", "IWM", "EFA", "EEM", "TLT", "LQD", "GLD"
+    )
+    start: str = "2010-01-01"
+
+    # Rolling correlation regime detection
+    lookback_corr: int = 63       # ~3 months of daily returns
+    low_quantile: float = 0.33
+    high_quantile: float = 0.67
+
+    # Rebalance
+    rebalance_freq: str = "ME"    # 'ME' = month-end
+    min_hist: int = 252           # min history before using regimes (1y)
+
+    # Regime-dependent risk share (defensive = 1 - risk share)
+    risk_low: float = 0.80        # low correlation (diversified) → risk-on
+    risk_mid: float = 0.60
+    risk_high: float = 0.30       # high corr (crisis) → de-risk
+
+    # Outputs
+    out_csv: str = "level72_corr_regime_switcher.csv"
+    out_json: str = "level72_corr_regime_switcher_summary.json"
+
+    seed: int = 42
+
+
+# --------------------------- Data Loader ---------------------------
+
+def load_prices(symbols: Sequence[str], start: str) -> pd.DataFrame:
+    """Download adjusted close prices for a list of symbols from yfinance."""
+    frames = []
+    for s in symbols:
+        px = yf.download(s, start=start, auto_adjust=True, progress=False)
+        if px.empty:
+            raise RuntimeError(f"No price data downloaded for {s}.")
+        if "Close" not in px.columns:
+            raise RuntimeError(f"'Close' column missing for {s}.")
+        close = px["Close"].copy()
+        close.name = s
+        frames.append(close)
+
+    prices = pd.concat(frames, axis=1).sort_index()
+    prices = prices.dropna(how="all")
+    prices = prices.ffill().dropna(how="any")
+    return prices
+
+
+def compute_returns(prices: pd.DataFrame) -> pd.DataFrame:
+    """Daily log returns."""
+    rets = np.log(prices).diff()
+    rets = rets.dropna(how="all")
+    return rets
+
+
+# --------------------------- Correlation Regime Logic ---------------------------
+
+def rolling_avg_correlation(rets: pd.DataFrame,
+                            risk_assets: Sequence[str],
+                            lookback: int) -> pd.Series:
+    """
+    For each date, compute the average off-diagonal correlation across risk_assets
+    using a rolling lookback window.
+    """
+    risk_assets = [a for a in risk_assets if a in rets.columns]
+    if len(risk_assets) < 2:
+        raise ValueError("Need at least 2 risk assets for correlation regime detection.")
+
+    idx = rets.index
+    avg_corr = pd.Series(index=idx, dtype=float)
+
+    for i in range(len(idx)):
+        if i + 1 < lookback:
+            continue
+        window = rets.iloc[i + 1 - lookback:i + 1][risk_assets]
+        if window.isnull().all().all():
+            continue
+        c = window.corr().values
+        n = c.shape[0]
+        if n < 2:
+            continue
+        mask = ~np.eye(n, dtype=bool)
+        vals = c[mask]
+        vals = vals[np.isfinite(vals)]
+        if vals.size == 0:
+            continue
+        avg_corr.iloc[i] = float(vals.mean())
+
+    return avg_corr
+
+
+def classify_regimes(avg_corr: pd.Series,
+                     low_q: float,
+                     high_q: float) -> Tuple[pd.Series, float, float]:
+    """
+    Classify each date into LOW / MID / HIGH correlation regimes
+    based on quantiles of the rolling average correlation.
+    """
+    s = avg_corr.dropna()
+    if s.empty:
+        raise RuntimeError("No valid average correlation values to classify regimes.")
+
+    low_thr = float(s.quantile(low_q))
+    high_thr = float(s.quantile(high_q))
+
+    regime = pd.Series(index=avg_corr.index, dtype=object)
+    for dt, val in avg_corr.items():
+        if not np.isfinite(val):
+            regime.loc[dt] = None
+        elif val < low_thr:
+            regime.loc[dt] = "LOW"
+        elif val > high_thr:
+            regime.loc[dt] = "HIGH"
+        else:
+            regime.loc[dt] = "MID"
+
+    return regime, low_thr, high_thr
+
+
+def compute_rebalance_dates(rets: pd.DataFrame, freq: str) -> pd.DatetimeIndex:
+    """
+    Rebalance dates. Here we only support 'ME' for month-end.
+    """
+    if freq != "ME":
+        raise ValueError("This script expects rebalance_freq 'ME' (month-end).")
+    return rets.resample("ME").last().index
+
+
+# --------------------------- Weight Construction ---------------------------
+
+def build_regime_weights(rets: pd.DataFrame,
+                         regime: pd.Series,
+                         cfg: Config) -> pd.DataFrame:
+    """
+    Build monthly regime-based weights and forward-fill to daily.
+    - Risk assets: all symbols except known defensives (TLT, LQD, GLD).
+    - Defensive assets: intersection with known defensives.
+    - Within each bucket, equal-weight.
+    """
+    symbols = list(cfg.symbols)
+    idx = rets.index
+
+    # Identify risk vs defensive
+    known_def = {"TLT", "LQD", "GLD"}
+    def_assets = [s for s in symbols if s in known_def]
+    risk_assets = [s for s in symbols if s not in known_def]
+
+    # If no defensive assets in universe, treat all as risk, but still keep logic
+    if len(risk_assets) == 0:
+        risk_assets = symbols
+    if len(def_assets) == 0:
+        def_assets = []
+
+    w = pd.DataFrame(index=idx, columns=symbols, dtype=float)
+
+    rebal_dates = compute_rebalance_dates(rets, cfg.rebalance_freq)
+
+    for d in rebal_dates:
+        if d not in regime.index:
+            continue
+        r = regime.loc[d]
+        if r not in ("LOW", "MID", "HIGH"):
+            continue
+
+        # enforce minimum history before using regimes
+        if (rets.loc[:d].shape[0] < cfg.min_hist):
+            continue
+
+        if r == "LOW":
+            risk_share = cfg.risk_low
+        elif r == "MID":
+            risk_share = cfg.risk_mid
+        else:
+            risk_share = cfg.risk_high
+
+        risk_share = float(np.clip(risk_share, 0.0, 1.0))
+        def_share = 1.0 - risk_share
+
+        w_row = pd.Series(0.0, index=symbols, dtype=float)
+
+        if len(risk_assets) > 0 and risk_share > 0:
+            per = risk_share / len(risk_assets)
+            for s in risk_assets:
+                w_row[s] = per
+
+        if len(def_assets) > 0 and def_share > 0:
+            per_d = def_share / len(def_assets)
+            for s in def_assets:
+                w_row[s] = per_d
+
+        # if something went wrong (all zeros), fall back to equal-weight
+        if float(w_row.sum()) <= 0:
+            w_row[:] = 1.0 / len(symbols)
+        else:
+            w_row /= float(w_row.sum())
+
+        w.loc[d] = w_row
+
+    w = w.ffill().dropna()
+    return w, risk_assets, def_assets
+
+
+# --------------------------- Performance Stats ---------------------------
+
+def stats_from_returns(r: pd.Series) -> dict:
+    r = r.dropna()
+    if r.empty:
+        return dict(ann_ret=np.nan, ann_vol=np.nan, sharpe=np.nan, max_dd=np.nan)
+
+    mu = float(r.mean())
+    sig = float(r.std())
+
+    ann_ret = (1.0 + mu) ** 252 - 1.0
+    ann_vol = sig * np.sqrt(252.0)
+    sharpe = ann_ret / ann_vol if ann_vol > 0 else np.nan
+
+    eq = (1.0 + r).cumprod()
+    peak = eq.cummax()
+    dd = eq / peak - 1.0
+    max_dd = float(dd.min()) if not dd.empty else np.nan
+
+    return dict(
+        ann_ret=float(ann_ret),
+        ann_vol=float(ann_vol),
+        sharpe=float(sharpe),
+        max_dd=float(max_dd),
+    )
+
+
+# --------------------------- Pipeline ---------------------------
+
+def run_pipeline(cfg: Config):
+    prices = load_prices(cfg.symbols, cfg.start)
+    rets = compute_returns(prices)
+
+    # Define risk assets for correlation index: all except defensives
+    known_def = {"TLT", "LQD", "GLD"}
+    risk_assets_corr = [s for s in cfg.symbols if s not in known_def]
+    if len(risk_assets_corr) < 2:
+        risk_assets_corr = list(cfg.symbols)
+
+    # Rolling average correlation
+    avg_corr = rolling_avg_correlation(rets, risk_assets_corr, cfg.lookback_corr)
+
+    # Regimes
+    regime, low_thr, high_thr = classify_regimes(
+        avg_corr, cfg.low_quantile, cfg.high_quantile
+    )
+
+    # Regime-based weights
+    w, risk_assets, def_assets = build_regime_weights(rets, regime, cfg)
+
+    # Align
+    common_idx = rets.index.intersection(w.index)
+    prices = prices.reindex(common_idx)
+    rets = rets.reindex(common_idx)
+    w = w.reindex(common_idx)
+    avg_corr = avg_corr.reindex(common_idx)
+    regime = regime.reindex(common_idx)
+
+    # Portfolio returns & equity
+    port_ret = (w * rets).sum(axis=1).rename("ret_port")
+    eq_port = (1.0 + port_ret).cumprod().rename("eq_port")
+
+    out = pd.DataFrame(index=common_idx)
+    # Raw prices
+    out[list(cfg.symbols)] = prices
+    # Asset returns
+    out[[f"ret_{s}" for s in cfg.symbols]] = rets.add_prefix("ret_")
+    # Weights
+    out[[f"w_{s}" for s in cfg.symbols]] = w.add_prefix("w_")
+    # Regime information
+    out["avg_corr"] = avg_corr
+    out["regime"] = regime
+    # Portfolio series
+    out["ret_port"] = port_ret
+    out["eq_port"] = eq_port
+
+    # Summary
+    idx = out.index
+    summary = {
+        "config": asdict(cfg),
+        "start_date": str(idx.min().date()) if len(idx) else None,
+        "end_date": str(idx.max().date()) if len(idx) else None,
+        "n_days": int(len(idx)),
+        "risk_assets": risk_assets,
+        "def_assets": def_assets,
+        "corr_low_threshold": low_thr,
+        "corr_high_threshold": high_thr,
+        "Performance": stats_from_returns(port_ret),
+    }
+
+    # Regime counts
+    counts = regime.value_counts(dropna=False).to_dict()
+    summary["regime_counts"] = {str(k): int(v) for k, v in counts.items()}
+
+    return out, summary
+
+
+# --------------------------- I/O ---------------------------
+
+def save_outputs(out: pd.DataFrame, summary: dict, cfg: Config) -> None:
+    out.to_csv(cfg.out_csv, index=True, date_format="%Y-%m-%d")
+    with open(cfg.out_json, "w") as f:
+        json.dump(summary, f, indent=2)
+
+    print(f"[OK] Saved daily series → {cfg.out_csv}")
+    print(f"[OK] Saved summary → {cfg.out_json}")
+    if summary["start_date"] and summary["end_date"]:
+        print(
+            f"Period {summary['start_date']} → {summary['end_date']}, "
+            f"n_days={summary['n_days']}"
+        )
+    perf = summary["Performance"]
+    print(
+        f"Regime Switcher: AnnRet={perf['ann_ret']*100:.2f}%, "
+        f"AnnVol={perf['ann_vol']*100:.2f}%, "
+        f"Sharpe={perf['sharpe']:.2f}, "
+        f"MaxDD={perf['max_dd']*100:.2f}%"
+    )
+    print(
+        f"Corr thresholds: low<{summary['corr_low_threshold']:.3f}, "
+        f"high>{summary['corr_high_threshold']:.3f}"
+    )
+    print("Regime counts:", summary["regime_counts"])
+
+
+# --------------------------- CLI ---------------------------
+
+def parse_args() -> Config:
+    p = argparse.ArgumentParser(
+        description="Level-72: Correlation Regime Switcher Multi-Asset Portfolio"
+    )
+    p.add_argument(
+        "--symbols",
+        type=str,
+        default="SPY,QQQ,IWM,EFA,EEM,TLT,LQD,GLD",
+        help="Comma-separated tickers.",
+    )
+    p.add_argument("--start", type=str, default="2010-01-01")
+
+    p.add_argument("--lookback-corr", type=int, default=63)
+    p.add_argument("--low-quantile", type=float, default=0.33)
+    p.add_argument("--high-quantile", type=float, default=0.67)
+    p.add_argument(
+        "--rebalance-freq",
+        type=str,
+        default="ME",
+        help="Rebalance frequency (use 'ME' for month-end).",
+    )
+    p.add_argument("--min-hist", type=int, default=252)
+
+    p.add_argument("--risk-low", type=float, default=0.80)
+    p.add_argument("--risk-mid", type=float, default=0.60)
+    p.add_argument("--risk-high", type=float, default=0.30)
+
+    p.add_argument("--csv", type=str, default="level72_corr_regime_switcher.csv")
+    p.add_argument("--json", type=str, default="level72_corr_regime_switcher_summary.json")
+    p.add_argument("--seed", type=int, default=42)
+
+    a = p.parse_args()
+    symbols = tuple(s.strip() for s in a.symbols.split(",") if s.strip())
+
+    return Config(
+        symbols=symbols,
+        start=a.start,
+        lookback_corr=a.lookback_corr,
+        low_quantile=a.low_quantile,
+        high_quantile=a.high_quantile,
+        rebalance_freq=a.rebalance_freq,
+        min_hist=a.min_hist,
+        risk_low=a.risk_low,
+        risk_mid=a.risk_mid,
+        risk_high=a.risk_high,
+        out_csv=a.csv,
+        out_json=a.json,
+        seed=a.seed,
+    )
+
+
+# --------------------------- Main ---------------------------
+
+def main() -> None:
+    cfg = parse_args()
+    np.random.seed(cfg.seed)
+
+    print(f"[INFO] Downloading prices for {cfg.symbols} from {cfg.start} ...")
+    out, summary = run_pipeline(cfg)
+    save_outputs(out, summary, cfg)
+
+
+if __name__ == "__main__":
+    # Jupyter / PyCharm shim
+    import sys
+
+    sys.argv = [sys.argv[0]] + [
+        arg
+        for arg in sys.argv[1:]
+        if arg != "-f" and not (arg.endswith(".json") and "kernel" in arg)
+    ]
+    main()
+```
+
+If you get any traceback when you run Level-72, paste it and we’ll do a quick v2 fix.

@@ -1,0 +1,44 @@
+{
+  "config": {
+    "symbols": [
+      "SPY",
+      "QQQ",
+      "IWM",
+      "EFA",
+      "EEM",
+      "TLT",
+      "LQD",
+      "GLD"
+    ],
+    "start": "2010-01-01",
+    "base_mode": "hrp",
+    "cov_lookback": 252,
+    "min_lookback": 126,
+    "rebalance_freq": "ME",
+    "vol_lookback": 60,
+    "vol_target": 0.1,
+    "lev_min": 0.0,
+    "lev_max": 2.0,
+    "dd_thresh": 0.15,
+    "dd_max": 0.3,
+    "dd_min_scale": 0.2,
+    "out_csv": "level70_vol_target_drawdown.csv",
+    "out_json": "level70_vol_target_drawdown_summary.json",
+    "seed": 42
+  },
+  "start_date": "2010-08-31",
+  "end_date": "2025-12-04",
+  "n_days": 3840,
+  "Base": {
+    "ann_ret": 0.05871152982810934,
+    "ann_vol": 0.07991307079539144,
+    "sharpe": 0.7346924507310414,
+    "max_dd": -0.2593185116983423
+  },
+  "VolTarget_DD": {
+    "ann_ret": 0.09375227543885245,
+    "ann_vol": 0.09539800376775151,
+    "sharpe": 0.9827488179636796,
+    "max_dd": -0.2285424561658529
+  }
+}

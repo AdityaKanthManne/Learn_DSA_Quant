@@ -1,0 +1,446 @@
+Nice, rolling right along 😄
+Here’s **Level-75**: a **Historical VaR / CVaR Risk Engine** for a multi-asset portfolio with rolling tail-risk stats and (optionally) a Kupiec VaR backtest.
+
+It uses only free data (yfinance), pure Python + NumPy + pandas (+ SciPy if available, but it’s optional).
+
+---
+
+```python
+# level75_var_cvar_engine.py
+# Historical VaR / CVaR risk engine with rolling tail-risk stats
+# and Kupiec backtest for VaR breaches.
+#
+# - Downloads daily adjusted prices via yfinance
+# - Builds a portfolio (equal-weight or user-specified weights)
+# - Computes rolling historical VaR & CVaR
+# - Flags VaR breaches and (if SciPy is available) runs Kupiec test
+# - Outputs CSV and JSON summary
+#
+# Usage examples:
+#   python level75_var_cvar_engine.py
+#   python level75_var_cvar_engine.py --symbols SPY,QQQ,TQQQ --weights 0.4,0.3,0.3
+#   python level75_var_cvar_engine.py --alpha 0.99 --window 500
+#
+# All VaR/CVaR numbers are in *return space* (e.g. 0.03 = 3% loss).
+
+import argparse
+import json
+from dataclasses import dataclass, asdict
+from typing import Sequence, Tuple, Optional, List
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+
+try:
+    from scipy.stats import chi2
+    SCIPY_AVAILABLE = True
+except ImportError:
+    chi2 = None
+    SCIPY_AVAILABLE = False
+
+
+# --------------------------- Config ---------------------------
+
+@dataclass
+class Config:
+    symbols: Tuple[str, ...] = (
+        "SPY", "QQQ", "IWM", "EFA", "EEM", "TLT", "LQD", "GLD"
+    )
+    start: str = "2010-01-01"
+
+    # Portfolio weights (if None → equal-weight)
+    weights: Optional[Tuple[float, ...]] = None
+
+    # VaR / CVaR settings
+    alpha: float = 0.95          # confidence level
+    window: int = 252            # rolling window length (days)
+
+    # Outputs
+    out_csv: str = "level75_var_cvar.csv"
+    out_json: str = "level75_var_cvar_summary.json"
+
+    seed: int = 42
+
+
+# --------------------------- Data Loader ---------------------------
+
+def _extract_close_series(px: pd.DataFrame, symbol: str) -> pd.Series:
+    """
+    Robustly extract a 1D close price Series for a symbol from a yfinance DataFrame.
+    Handles Series or DataFrame 'Close'.
+    """
+    if "Close" not in px.columns:
+        raise RuntimeError(f"'Close' column missing for {symbol}.")
+
+    close_obj = px["Close"]
+
+    if isinstance(close_obj, pd.Series):
+        close = pd.Series(close_obj.values, index=close_obj.index, name=symbol)
+    elif isinstance(close_obj, pd.DataFrame):
+        if close_obj.shape[1] < 1:
+            raise RuntimeError(f"No close data columns for {symbol}.")
+        col0 = close_obj.iloc[:, 0]
+        close = pd.Series(col0.values, index=col0.index, name=symbol)
+    else:
+        raise RuntimeError("Unexpected type for Close data.")
+
+    close = close.astype(float)
+    return close
+
+
+def load_prices(symbols: Sequence[str], start: str) -> pd.DataFrame:
+    """Download adjusted close prices for the given symbols."""
+    frames: List[pd.Series] = []
+    for s in symbols:
+        px = yf.download(s, start=start, auto_adjust=True, progress=False)
+        if px.empty:
+            raise RuntimeError(f"No price data downloaded for {s}.")
+        close = _extract_close_series(px, s)
+        frames.append(close)
+
+    prices = pd.concat(frames, axis=1).sort_index()
+    prices = prices.dropna(how="all")
+    prices = prices.ffill().dropna(how="any")
+    return prices
+
+
+def compute_returns(prices: pd.DataFrame) -> pd.DataFrame:
+    """Daily log returns."""
+    rets = np.log(prices).diff()
+    rets = rets.dropna(how="all")
+    return rets
+
+
+# --------------------------- Portfolio & Risk ---------------------------
+
+def build_weights(cfg: Config, symbols: Sequence[str]) -> np.ndarray:
+    if cfg.weights is None:
+        w = np.ones(len(symbols)) / float(len(symbols))
+        return w
+
+    if len(cfg.weights) != len(symbols):
+        raise ValueError(
+            f"Length of weights ({len(cfg.weights)}) "
+            f"does not match number of symbols ({len(symbols)})."
+        )
+    w = np.array(cfg.weights, dtype=float)
+    s = float(np.sum(w))
+    if s != 0.0:
+        w = w / s
+    return w
+
+
+def portfolio_returns(rets: pd.DataFrame, weights: np.ndarray) -> pd.Series:
+    """Compute portfolio returns as weighted sum of asset returns."""
+    r = (rets * weights).sum(axis=1)
+    r.name = "ret_port"
+    return r
+
+
+def _rolling_var(losses: np.ndarray, alpha: float) -> float:
+    """
+    Historical VaR for 1D array of losses (positive = loss, negative = gain).
+    Returns VaR at level alpha (e.g. 0.95).
+    """
+    if losses.size == 0:
+        return np.nan
+    return float(np.quantile(losses, alpha))
+
+
+def _rolling_cvar(losses: np.ndarray, alpha: float) -> float:
+    """
+    Historical CVaR (expected shortfall) for 1D array of losses.
+    Mean of losses >= VaR.
+    """
+    if losses.size == 0:
+        return np.nan
+    var = np.quantile(losses, alpha)
+    tail = losses[losses >= var]
+    if tail.size == 0:
+        return float(var)
+    return float(tail.mean())
+
+
+def compute_rolling_var_cvar(port_ret: pd.Series, window: int, alpha: float) -> pd.DataFrame:
+    """
+    Compute rolling historical VaR and CVaR on portfolio returns.
+    loss_t = -ret_t (so VaR / CVaR are positive loss numbers).
+    """
+    r = port_ret.dropna()
+    loss = -r
+
+    def var_func(x: np.ndarray) -> float:
+        return _rolling_var(x, alpha)
+
+    def cvar_func(x: np.ndarray) -> float:
+        return _rolling_cvar(x, alpha)
+
+    var_series = loss.rolling(window=window, min_periods=window).apply(
+        lambda x: var_func(x.to_numpy()), raw=False
+    )
+    cvar_series = loss.rolling(window=window, min_periods=window).apply(
+        lambda x: cvar_func(x.to_numpy()), raw=False
+    )
+
+    var_series.name = "VaR"
+    cvar_series.name = "CVaR"
+
+    out = pd.concat([loss, var_series, cvar_series], axis=1)
+    out.columns = ["loss", "VaR", "CVaR"]
+    return out
+
+
+# --------------------------- Kupiec VaR Test ---------------------------
+
+def kupiec_test(loss: pd.Series, var: pd.Series, alpha: float) -> dict:
+    """
+    Kupiec unconditional coverage test for VaR breaches.
+
+    H0: breach probability = (1 - alpha)
+    Returns dict with:
+      - N: number of non-NaN VaR points
+      - x: number of breaches (loss > VaR)
+      - breach_rate: x / N
+      - LR: likelihood ratio
+      - p_value: chi-square(1) p-value (if SciPy available, else None)
+    """
+    valid = (~loss.isna()) & (~var.isna())
+    L = loss[valid]
+    V = var[valid]
+
+    if L.empty:
+        return dict(N=0, x=0, breach_rate=np.nan, LR=np.nan, p_value=None)
+
+    breaches = L > V
+    x = int(breaches.sum())
+    N = int(breaches.shape[0])
+
+    if N == 0:
+        return dict(N=0, x=0, breach_rate=np.nan, LR=np.nan, p_value=None)
+
+    pi_hat = x / float(N)
+    pi0 = 1.0 - alpha
+
+    # Avoid log(0) issues
+    def _safe_log_prob(count: int, p: float) -> float:
+        if p <= 0 or p >= 1:
+            return -np.inf
+        return count * np.log(p)
+
+    logL_null = (
+        _safe_log_prob(x, pi0) +
+        _safe_log_prob(N - x, 1.0 - pi0)
+    )
+    logL_alt = (
+        _safe_log_prob(x, pi_hat if 0 < pi_hat < 1 else pi0) +
+        _safe_log_prob(N - x, 1.0 - pi_hat if 0 < pi_hat < 1 else 1.0 - pi0)
+    )
+
+    LR = -2.0 * (logL_null - logL_alt)
+    if np.isinf(LR) or np.isnan(LR):
+        p_val = None
+    else:
+        if SCIPY_AVAILABLE:
+            p_val = float(1.0 - chi2.cdf(LR, df=1))
+        else:
+            p_val = None
+
+    return dict(
+        N=N,
+        x=x,
+        breach_rate=float(x) / float(N),
+        LR=float(LR),
+        p_value=p_val,
+    )
+
+
+# --------------------------- Pipeline ---------------------------
+
+def run_pipeline(cfg: Config):
+    prices = load_prices(cfg.symbols, cfg.start)
+    rets = compute_returns(prices)
+    symbols = list(rets.columns)
+
+    w = build_weights(cfg, symbols)
+    port_ret = portfolio_returns(rets, w)
+
+    risk_df = compute_rolling_var_cvar(port_ret, cfg.window, cfg.alpha)
+    risk_df["ret_port"] = port_ret.reindex(risk_df.index)
+    risk_df["equity"] = (1.0 + risk_df["ret_port"].fillna(0.0)).cumprod()
+
+    # Breaches: loss > VaR
+    risk_df["breach"] = (risk_df["loss"] > risk_df["VaR"]).astype(float)
+
+    # Stats
+    r = risk_df["ret_port"].dropna()
+    mu = float(r.mean()) if not r.empty else np.nan
+    sig = float(r.std()) if not r.empty else np.nan
+    ann_ret = (1.0 + mu) ** 252 - 1.0 if not np.isnan(mu) else np.nan
+    ann_vol = sig * np.sqrt(252.0) if not np.isnan(sig) else np.nan
+    sharpe = ann_ret / ann_vol if (not np.isnan(ann_ret) and ann_vol > 0) else np.nan
+
+    eq = (1.0 + r).cumprod()
+    peak = eq.cummax()
+    dd = eq / peak - 1.0
+    max_dd = float(dd.min()) if not dd.empty else np.nan
+
+    kupiec = kupiec_test(risk_df["loss"], risk_df["VaR"], cfg.alpha)
+
+    risk_slice = risk_df.dropna(subset=["VaR"])
+    if risk_slice.empty:
+        median_var = np.nan
+        median_cvar = np.nan
+        last_var = np.nan
+        last_cvar = np.nan
+    else:
+        median_var = float(risk_slice["VaR"].median())
+        median_cvar = float(risk_slice["CVaR"].median())
+        last_var = float(risk_slice["VaR"].iloc[-1])
+        last_cvar = float(risk_slice["CVaR"].iloc[-1])
+
+    idx = risk_df.index
+    summary = {
+        "config": asdict(cfg),
+        "start_date": str(idx.min().date()) if len(idx) else None,
+        "end_date": str(idx.max().date()) if len(idx) else None,
+        "n_days": int(len(idx)),
+        "portfolio": {
+            "symbols": cfg.symbols,
+            "weights": w.tolist(),
+        },
+        "stats": {
+            "ann_ret": float(ann_ret) if not np.isnan(ann_ret) else np.nan,
+            "ann_vol": float(ann_vol) if not np.isnan(ann_vol) else np.nan,
+            "sharpe": float(sharpe) if not np.isnan(sharpe) else np.nan,
+            "max_dd": float(max_dd) if not np.isnan(max_dd) else np.nan,
+        },
+        "tail_risk": {
+            "alpha": cfg.alpha,
+            "window": cfg.window,
+            "median_VaR": median_var,
+            "median_CVaR": median_cvar,
+            "last_VaR": last_var,
+            "last_CVaR": last_cvar,
+        },
+        "kupiec": kupiec,
+        "scipy_available": SCIPY_AVAILABLE,
+    }
+
+    return risk_df, summary
+
+
+# --------------------------- I/O ---------------------------
+
+def save_outputs(risk_df: pd.DataFrame, summary: dict, cfg: Config) -> None:
+    risk_df.to_csv(cfg.out_csv, index=True, date_format="%Y-%m-%d")
+    with open(cfg.out_json, "w") as f:
+        json.dump(summary, f, indent=2)
+
+    print(f"[OK] Saved daily series → {cfg.out_csv}")
+    print(f"[OK] Saved summary      → {cfg.out_json}")
+
+    if summary["start_date"] and summary["end_date"]:
+        print(
+            f"Period {summary['start_date']} → {summary['end_date']}, "
+            f"n_days={summary['n_days']}"
+        )
+
+    stats = summary["stats"]
+    tail = summary["tail_risk"]
+    kup = summary["kupiec"]
+
+    print(
+        "Portfolio: "
+        f"AnnRet={stats['ann_ret']*100:.2f}%, "
+        f"AnnVol={stats['ann_vol']*100:.2f}%, "
+        f"Sharpe={stats['sharpe']:.2f}, "
+        f"MaxDD={stats['max_dd']*100:.2f}%"
+    )
+    print(
+        f"Tail risk @ alpha={tail['alpha']:.3f}, window={tail['window']}d: "
+        f"Median VaR={tail['median_VaR']*100:.2f}%, "
+        f"Median CVaR={tail['median_CVaR']*100:.2f}%, "
+        f"Last VaR={tail['last_VaR']*100:.2f}%, "
+        f"Last CVaR={tail['last_CVaR']*100:.2f}%"
+    )
+    if kup["N"] > 0:
+        print(
+            f"Kupiec: N={kup['N']}, breaches={kup['x']}, "
+            f"breach_rate={kup['breach_rate']*100:.2f}%, LR={kup['LR']:.3f}, "
+            f"p_value={kup['p_value'] if kup['p_value'] is not None else 'N/A'}"
+        )
+    else:
+        print("Kupiec: insufficient data for test.")
+    if not SCIPY_AVAILABLE:
+        print("NOTE: SciPy not available; Kupiec p-value is reported as N/A.")
+
+
+# --------------------------- CLI ---------------------------
+
+def parse_args() -> Config:
+    p = argparse.ArgumentParser(
+        description="Level-75: Historical VaR / CVaR risk engine for a multi-asset portfolio"
+    )
+    p.add_argument(
+        "--symbols",
+        type=str,
+        default="SPY,QQQ,IWM,EFA,EEM,TLT,LQD,GLD",
+        help="Comma-separated tickers",
+    )
+    p.add_argument("--start", type=str, default="2010-01-01")
+    p.add_argument("--weights", type=str, default=None,
+                   help="Comma-separated weights (same order as symbols). If omitted, equal-weight.")
+    p.add_argument("--alpha", type=float, default=0.95,
+                   help="VaR/CVaR confidence level (e.g., 0.95)")
+    p.add_argument("--window", type=int, default=252,
+                   help="Rolling window length in days")
+    p.add_argument("--csv", type=str, default="level75_var_cvar.csv")
+    p.add_argument("--json", type=str, default="level75_var_cvar_summary.json")
+    p.add_argument("--seed", type=int, default=42)
+
+    a = p.parse_args()
+    symbols = tuple(s.strip() for s in a.symbols.split(",") if s.strip())
+
+    if a.weights is not None:
+        w_list = [float(x) for x in a.weights.split(",") if x.strip() != ""]
+        weights = tuple(w_list)
+    else:
+        weights = None
+
+    return Config(
+        symbols=symbols,
+        start=a.start,
+        weights=weights,
+        alpha=a.alpha,
+        window=a.window,
+        out_csv=a.csv,
+        out_json=a.json,
+        seed=a.seed,
+    )
+
+
+# --------------------------- Main ---------------------------
+
+def main() -> None:
+    cfg = parse_args()
+    np.random.seed(cfg.seed)
+
+    print(f"[INFO] Downloading prices for {cfg.symbols} from {cfg.start} ...")
+    risk_df, summary = run_pipeline(cfg)
+    save_outputs(risk_df, summary, cfg)
+
+
+if __name__ == "__main__":
+    # Jupyter / PyCharm shim: strip kernel args
+    import sys
+
+    sys.argv = [sys.argv[0]] + [
+        arg
+        for arg in sys.argv[1:]
+        if arg != "-f" and not (arg.endswith(".json") and "kernel" in arg)
+    ]
+    main()
+```
+
+If you want, next step we can plug this into a **dash-style** or **Streamlit** UI as a “VaR / CVaR risk dashboard” for your portfolio.

@@ -1,0 +1,522 @@
+Nice, rolling into Level-71. Here’s a full script for:
+
+**Level-71 – Momentum-Tilted HRP Portfolio (Time-Series + Cross-Sectional Overlay)**
+
+* Universe: `SPY, QQQ, IWM, EFA, EEM, TLT, LQD, GLD`
+* Base portfolio: HRP or Equal-Weight, rebalanced monthly.
+* Overlay:
+
+  * **Time-series momentum**: de-emphasize assets with negative recent trend.
+  * **Cross-sectional momentum**: overweight recent winners, underweight losers.
+* Outputs:
+
+  * `level71_mom_tilt_portfolio.csv`
+  * `level71_mom_tilt_portfolio_summary.json`
+
+Save this as **`level71_mom_tilt_portfolio.py`** and run in PyCharm / Jupyter.
+
+```python
+# level71_mom_tilt_portfolio.py
+# Momentum-Tilted HRP/EW Portfolio:
+#   - Base portfolio: HRP or Equal-Weight, rebalanced monthly.
+#   - Overlay: Time-series + Cross-sectional momentum tilt.
+#
+# Universe: SPY, QQQ, IWM, EFA, EEM, TLT, LQD, GLD
+#
+# Outputs:
+#   - level71_mom_tilt_portfolio.csv
+#   - level71_mom_tilt_portfolio_summary.json
+
+import argparse
+import json
+from dataclasses import dataclass, asdict
+from typing import Sequence, Tuple, List, Dict
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+
+
+# --------------------------- Config ---------------------------
+
+@dataclass
+class Config:
+    symbols: Tuple[str, ...] = (
+        "SPY", "QQQ", "IWM", "EFA", "EEM", "TLT", "LQD", "GLD"
+    )
+    start: str = "2010-01-01"
+
+    # Base portfolio construction
+    base_mode: str = "hrp"        # "hrp" or "ew"
+    cov_lookback: int = 252       # days for covariance estimation
+    min_lookback: int = 126       # minimum history before using HRP/EW
+    rebalance_freq: str = "ME"    # month-end
+
+    # Momentum overlay
+    lookback_ts: int = 126        # time-series momentum lookback (days)
+    lookback_cs: int = 252        # cross-sectional momentum lookback (days)
+    cs_top_frac: float = 0.3      # top fraction for winners (e.g. 0.3 → top 30%)
+    cs_bottom_frac: float = 0.3   # bottom fraction for losers
+    cs_tilt_strength: float = 0.5 # winners ×(1+0.5), losers ×(1-0.5)
+    ts_scale_neg: float = 0.2     # scale factor for assets with negative TS momentum
+
+    # Outputs
+    out_csv: str = "level71_mom_tilt_portfolio.csv"
+    out_json: str = "level71_mom_tilt_portfolio_summary.json"
+
+    seed: int = 42
+
+
+# --------------------------- Data Loader ---------------------------
+
+def load_prices(symbols: Sequence[str], start: str) -> pd.DataFrame:
+    """Download adjusted close prices for a list of symbols from yfinance."""
+    frames = []
+    for s in symbols:
+        px = yf.download(s, start=start, auto_adjust=True, progress=False)
+        if px.empty:
+            raise RuntimeError(f"No price data downloaded for {s}.")
+        if "Close" not in px.columns:
+            raise RuntimeError(f"'Close' column missing for {s}.")
+        close = px["Close"].copy()
+        close.name = s
+        frames.append(close)
+
+    prices = pd.concat(frames, axis=1).sort_index()
+    prices = prices.dropna(how="all")
+    prices = prices.ffill().dropna(how="any")
+    return prices
+
+
+def compute_returns(prices: pd.DataFrame) -> pd.DataFrame:
+    """Daily log returns."""
+    rets = np.log(prices).diff()
+    rets = rets.dropna(how="all")
+    return rets
+
+
+# --------------------------- HRP Helpers ---------------------------
+
+def equal_weight(symbols: Sequence[str]) -> pd.Series:
+    n = len(symbols)
+    w = np.ones(n) / n
+    return pd.Series(w, index=list(symbols))
+
+
+def cov_to_corr(cov: pd.DataFrame) -> pd.DataFrame:
+    if not isinstance(cov, pd.DataFrame):
+        cov = pd.DataFrame(cov)
+    diag = np.diag(cov.values)
+    diag = np.where(diag <= 0, 1e-12, diag)
+    std = np.sqrt(diag)
+    denom = np.outer(std, std)
+    corr = cov.values / denom
+    corr[~np.isfinite(corr)] = 0.0
+    np.fill_diagonal(corr, 1.0)
+    return pd.DataFrame(corr, index=cov.index, columns=cov.columns)
+
+
+def correl_to_dist(corr: pd.DataFrame) -> pd.DataFrame:
+    if not isinstance(corr, pd.DataFrame):
+        corr = pd.DataFrame(corr)
+    d = np.sqrt(0.5 * (1.0 - corr.values))
+    np.fill_diagonal(d, 0.0)
+    return pd.DataFrame(d, index=corr.index, columns=corr.columns)
+
+
+def single_linkage_order(dist: pd.DataFrame) -> List[int]:
+    """
+    Naive single-linkage clustering to get a leaf ordering
+    (no external libraries).
+    """
+    n = dist.shape[0]
+    D = dist.values.astype(float)
+    np.fill_diagonal(D, np.inf)
+
+    clusters: Dict[int, List[int]] = {i: [i] for i in range(n)}
+    next_id = n
+
+    while len(clusters) > 1:
+        ids = list(clusters.keys())
+        best = None
+        best_pair = None
+
+        for i in range(len(ids)):
+            for j in range(i + 1, len(ids)):
+                ci = ids[i]
+                cj = ids[j]
+                members_i = clusters[ci]
+                members_j = clusters[cj]
+                sub = D[np.ix_(members_i, members_j)]
+                d_ij = float(np.min(sub))
+                if (best is None) or (d_ij < best):
+                    best = d_ij
+                    best_pair = (ci, cj)
+
+        if best_pair is None:
+            break
+
+        a, b = best_pair
+        new_members = clusters[a] + clusters[b]
+        del clusters[a]
+        del clusters[b]
+        clusters[next_id] = new_members
+        next_id += 1
+
+    final_members = list(clusters.values())[0]
+    return final_members
+
+
+def hrp_weights(cov: pd.DataFrame) -> pd.Series:
+    """Hierarchical Risk Parity long-only weights."""
+    if not isinstance(cov, pd.DataFrame):
+        cov = pd.DataFrame(cov)
+    cols = list(cov.columns)
+    n = len(cols)
+
+    corr = cov_to_corr(cov)
+    dist = correl_to_dist(corr)
+    order = single_linkage_order(dist)
+
+    cov_reordered = cov.values[order][:, order]
+    diag = np.diag(cov_reordered)
+    diag = np.where(diag <= 0, 1e-8, diag)
+    inv_var = 1.0 / diag
+
+    weights = np.ones(n)
+    clusters = [np.arange(n)]
+
+    while clusters:
+        cluster = clusters.pop(0)
+        if len(cluster) <= 1:
+            continue
+
+        split = len(cluster) // 2
+        left = cluster[:split]
+        right = cluster[split:]
+
+        inv_var_left = inv_var[left]
+        inv_var_right = inv_var[right]
+
+        w_left = inv_var_left / inv_var_left.sum()
+        w_right = inv_var_right / inv_var_right.sum()
+
+        cov_left = cov_reordered[np.ix_(left, left)]
+        cov_right = cov_reordered[np.ix_(right, right)]
+
+        var_left = float(w_left @ cov_left @ w_left)
+        var_right = float(w_right @ cov_right @ w_right)
+
+        if var_left + var_right == 0:
+            alpha = 0.5
+        else:
+            alpha = 1.0 - var_left / (var_left + var_right)
+
+        weights[left] *= alpha
+        weights[right] *= (1.0 - alpha)
+
+        clusters.append(left)
+        clusters.append(right)
+
+    w_final = np.zeros(n)
+    for pos, asset_idx in enumerate(order):
+        w_final[asset_idx] = weights[pos]
+
+    return pd.Series(w_final, index=cols)
+
+
+def compute_rebalance_dates(rets: pd.DataFrame, freq: str) -> pd.DatetimeIndex:
+    """
+    Rebalance dates; here, we expect 'ME' for month-end.
+    """
+    if freq != "ME":
+        raise ValueError("This script expects rebalance_freq 'ME' (month-end).")
+    return rets.resample("ME").last().index
+
+
+# --------------------------- Momentum Overlay ---------------------------
+
+def compute_base_and_tilt_weights(rets: pd.DataFrame, cfg: Config):
+    """
+    Build base weights (HRP/EW) and momentum-tilted weights on month-end dates,
+    then forward-fill to daily.
+    """
+    symbols = list(cfg.symbols)
+    idx = rets.index
+    w_base = pd.DataFrame(index=idx, columns=symbols, dtype=float)
+    w_tilt = pd.DataFrame(index=idx, columns=symbols, dtype=float)
+
+    rebal_dates = compute_rebalance_dates(rets, cfg.rebalance_freq)
+
+    for d in rebal_dates:
+        window_cs = rets.loc[:d].tail(cfg.lookback_cs)
+        if window_cs.shape[0] < cfg.min_lookback:
+            continue
+
+        # Base weights
+        if cfg.base_mode.lower() == "ew":
+            w_b = equal_weight(symbols)
+        elif cfg.base_mode.lower() == "hrp":
+            cov = window_cs.tail(cfg.cov_lookback).cov()
+            if cov.isnull().any().any():
+                continue
+            w_b = hrp_weights(cov).reindex(symbols)
+        else:
+            raise ValueError("base_mode must be 'hrp' or 'ew'")
+
+        if w_b.isnull().any():
+            continue
+
+        # Time-series momentum (recent trend)
+        window_ts = rets.loc[:d].tail(cfg.lookback_ts)
+        if window_ts.shape[0] == 0:
+            continue
+        ts_mom = window_ts.sum()   # sum of log returns ~ cumulative log return
+
+        # Cross-sectional momentum: cumulative over lookback_cs
+        cs_mom = window_cs.sum()
+
+        # Cross-sectional ranks (higher mom → better rank)
+        cs_rank = cs_mom.rank(ascending=False, method="first")
+        n = len(symbols)
+        top_n = max(1, int(np.floor(cfg.cs_top_frac * n)))
+        bottom_n = max(1, int(np.floor(cfg.cs_bottom_frac * n)))
+
+        top_assets = cs_rank.nsmallest(top_n).index
+        bottom_assets = cs_rank.nlargest(bottom_n).index
+
+        w_t = w_b.copy()
+
+        # Cross-sectional tilt
+        if cfg.cs_tilt_strength != 0.0:
+            # winners: amplify
+            w_t.loc[top_assets] *= (1.0 + cfg.cs_tilt_strength)
+            # losers: de-emphasize but keep non-negative
+            loser_scale = max(0.0, 1.0 - cfg.cs_tilt_strength)
+            w_t.loc[bottom_assets] *= loser_scale
+
+        # Time-series gating: assets with negative TS momentum get scaled down
+        if cfg.ts_scale_neg < 1.0:
+            neg_assets = ts_mom[ts_mom <= 0].index
+            w_t.loc[neg_assets] *= cfg.ts_scale_neg
+
+        # Renormalize
+        total = float(w_t.sum())
+        if total <= 0:
+            w_t = w_b.copy()
+        else:
+            w_t /= total
+
+        w_base.loc[d] = w_b
+        w_tilt.loc[d] = w_t
+
+    w_base = w_base.ffill().dropna()
+    w_tilt = w_tilt.ffill().dropna()
+
+    common_idx = w_base.index.intersection(w_tilt.index)
+    w_base = w_base.reindex(common_idx)
+    w_tilt = w_tilt.reindex(common_idx)
+    return w_base, w_tilt
+
+
+# --------------------------- Performance Stats ---------------------------
+
+def stats_from_returns(r: pd.Series) -> dict:
+    r = r.dropna()
+    if r.empty:
+        return dict(ann_ret=np.nan, ann_vol=np.nan, sharpe=np.nan, max_dd=np.nan)
+
+    mu = float(r.mean())
+    sig = float(r.std())
+
+    ann_ret = (1.0 + mu) ** 252 - 1.0
+    ann_vol = sig * np.sqrt(252.0)
+    sharpe = ann_ret / ann_vol if ann_vol > 0 else np.nan
+
+    eq = (1.0 + r).cumprod()
+    peak = eq.cummax()
+    dd = eq / peak - 1.0
+    max_dd = float(dd.min()) if not dd.empty else np.nan
+
+    return dict(
+        ann_ret=float(ann_ret),
+        ann_vol=float(ann_vol),
+        sharpe=float(sharpe),
+        max_dd=float(max_dd),
+    )
+
+
+# --------------------------- Pipeline ---------------------------
+
+def run_pipeline(cfg: Config):
+    prices = load_prices(cfg.symbols, cfg.start)
+    rets = compute_returns(prices)
+
+    w_base, w_tilt = compute_base_and_tilt_weights(rets, cfg)
+
+    # Align everything
+    common_idx = rets.index.intersection(w_base.index).intersection(w_tilt.index)
+    prices = prices.reindex(common_idx)
+    rets = rets.reindex(common_idx)
+    w_base = w_base.reindex(common_idx)
+    w_tilt = w_tilt.reindex(common_idx)
+
+    # Portfolio returns
+    ret_base = (w_base * rets).sum(axis=1).rename("ret_base")
+    ret_tilt = (w_tilt * rets).sum(axis=1).rename("ret_tilt")
+
+    eq_base = (1.0 + ret_base).cumprod()
+    eq_tilt = (1.0 + ret_tilt).cumprod()
+
+    out = pd.DataFrame(index=common_idx)
+    # Prices and asset returns
+    out[list(cfg.symbols)] = prices
+    out[[f"ret_{s}" for s in cfg.symbols]] = rets.add_prefix("ret_")
+
+    # Weights
+    out[[f"w_base_{s}" for s in cfg.symbols]] = w_base.add_prefix("w_base_")
+    out[[f"w_tilt_{s}" for s in cfg.symbols]] = w_tilt.add_prefix("w_tilt_")
+
+    # Portfolio series
+    out["ret_base"] = ret_base
+    out["ret_tilt"] = ret_tilt
+    out["eq_base"] = eq_base
+    out["eq_tilt"] = eq_tilt
+
+    # Summary stats
+    idx = out.index
+    summary = {
+        "config": asdict(cfg),
+        "start_date": str(idx.min().date()) if len(idx) else None,
+        "end_date": str(idx.max().date()) if len(idx) else None,
+        "n_days": int(len(idx)),
+        "Base": stats_from_returns(ret_base),
+        "MomentumTilt": stats_from_returns(ret_tilt),
+    }
+
+    # Correlation between base and tilted returns
+    aligned = pd.concat([ret_base, ret_tilt], axis=1).dropna()
+    if aligned.shape[0] > 1:
+        corr = float(aligned.iloc[:, 0].corr(aligned.iloc[:, 1]))
+    else:
+        corr = np.nan
+    summary["corr_base_tilt"] = corr
+
+    return out, summary
+
+
+# --------------------------- I/O ---------------------------
+
+def save_outputs(out: pd.DataFrame, summary: dict, cfg: Config) -> None:
+    out.to_csv(cfg.out_csv, index=True, date_format="%Y-%m-%d")
+    with open(cfg.out_json, "w") as f:
+        json.dump(summary, f, indent=2)
+
+    print(f"[OK] Saved daily series → {cfg.out_csv}")
+    print(f"[OK] Saved summary → {cfg.out_json}")
+    if summary["start_date"] and summary["end_date"]:
+        print(
+            f"Period {summary['start_date']} → {summary['end_date']}, "
+            f"n_days={summary['n_days']}"
+        )
+
+    for name in ["Base", "MomentumTilt"]:
+        s = summary[name]
+        print(
+            f"{name}: AnnRet={s['ann_ret']*100:.2f}%, "
+            f"AnnVol={s['ann_vol']*100:.2f}%, "
+            f"Sharpe={s['sharpe']:.2f}, "
+            f"MaxDD={s['max_dd']*100:.2f}%"
+        )
+    print(f"Correlation(Base, MomentumTilt) = {summary['corr_base_tilt']:.3f}")
+
+
+# --------------------------- CLI ---------------------------
+
+def parse_args() -> Config:
+    p = argparse.ArgumentParser(
+        description="Level-71: Momentum-Tilted HRP/EW Multi-Asset Portfolio"
+    )
+    p.add_argument(
+        "--symbols",
+        type=str,
+        default="SPY,QQQ,IWM,EFA,EEM,TLT,LQD,GLD",
+        help="Comma-separated tickers.",
+    )
+    p.add_argument("--start", type=str, default="2010-01-01")
+
+    p.add_argument(
+        "--base-mode",
+        type=str,
+        default="hrp",
+        choices=["hrp", "ew"],
+        help="Base portfolio type: 'hrp' or 'ew'.",
+    )
+    p.add_argument("--cov-lookback", type=int, default=252)
+    p.add_argument("--min-lookback", type=int, default=126)
+    p.add_argument(
+        "--rebalance-freq",
+        type=str,
+        default="ME",
+        help="Rebalance frequency (use 'ME' for month-end).",
+    )
+
+    p.add_argument("--lookback-ts", type=int, default=126)
+    p.add_argument("--lookback-cs", type=int, default=252)
+    p.add_argument("--cs-top-frac", type=float, default=0.3)
+    p.add_argument("--cs-bottom-frac", type=float, default=0.3)
+    p.add_argument("--cs-tilt-strength", type=float, default=0.5)
+    p.add_argument("--ts-scale-neg", type=float, default=0.2)
+
+    p.add_argument("--csv", type=str, default="level71_mom_tilt_portfolio.csv")
+    p.add_argument(
+        "--json", type=str, default="level71_mom_tilt_portfolio_summary.json"
+    )
+    p.add_argument("--seed", type=int, default=42)
+
+    a = p.parse_args()
+    symbols = tuple(s.strip() for s in a.symbols.split(",") if s.strip())
+
+    return Config(
+        symbols=symbols,
+        start=a.start,
+        base_mode=a.base_mode,
+        cov_lookback=a.cov_lookback,
+        min_lookback=a.min_lookback,
+        rebalance_freq=a.rebalance_freq,
+        lookback_ts=a.lookback_ts,
+        lookback_cs=a.lookback_cs,
+        cs_top_frac=a.cs_top_frac,
+        cs_bottom_frac=a.cs_bottom_frac,
+        cs_tilt_strength=a.cs_tilt_strength,
+        ts_scale_neg=a.ts_scale_neg,
+        out_csv=a.csv,
+        out_json=a.json,
+        seed=a.seed,
+    )
+
+
+# --------------------------- Main ---------------------------
+
+def main() -> None:
+    cfg = parse_args()
+    np.random.seed(cfg.seed)
+
+    print(f"[INFO] Downloading prices for {cfg.symbols} from {cfg.start} ...")
+    out, summary = run_pipeline(cfg)
+    save_outputs(out, summary, cfg)
+
+
+if __name__ == "__main__":
+    # Jupyter / PyCharm shim
+    import sys
+
+    sys.argv = [sys.argv[0]] + [
+        arg
+        for arg in sys.argv[1:]
+        if arg != "-f" and not (arg.endswith(".json") and "kernel" in arg)
+    ]
+    main()
+```
+
+If you hit any error when you run this (e.g. shape / index issues), paste the traceback and I’ll debug it in the next “Level-71 – v2” iteration.

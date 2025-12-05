@@ -1,0 +1,54 @@
+{
+  "config": {
+    "symbols": [
+      "SPY",
+      "QQQ",
+      "IWM",
+      "EFA",
+      "EEM",
+      "TLT",
+      "LQD",
+      "GLD"
+    ],
+    "start": "2010-01-01",
+    "lookback_corr": 63,
+    "low_quantile": 0.33,
+    "high_quantile": 0.67,
+    "rebalance_freq": "ME",
+    "min_hist": 252,
+    "risk_low": 0.8,
+    "risk_mid": 0.6,
+    "risk_high": 0.3,
+    "out_csv": "level72_corr_regime_switcher.csv",
+    "out_json": "level72_corr_regime_switcher_summary.json",
+    "seed": 42
+  },
+  "start_date": "2011-01-31",
+  "end_date": "2025-12-04",
+  "n_days": 3735,
+  "risk_assets": [
+    "SPY",
+    "QQQ",
+    "IWM",
+    "EFA",
+    "EEM"
+  ],
+  "def_assets": [
+    "TLT",
+    "LQD",
+    "GLD"
+  ],
+  "corr_low_threshold": 0.7388066815673183,
+  "corr_high_threshold": 0.8330267832209687,
+  "Performance": {
+    "ann_ret": 0.06979933962115781,
+    "ann_vol": 0.11164937080597596,
+    "sharpe": 0.6251655438565341,
+    "max_dd": -0.2879184224876069
+  },
+  "regime_counts": {
+    "MID": 1326,
+    "LOW": 1301,
+    "HIGH": 1108
+  }
+}

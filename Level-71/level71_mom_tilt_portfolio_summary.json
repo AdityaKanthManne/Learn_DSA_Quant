@@ -1,0 +1,44 @@
+{
+  "config": {
+    "symbols": [
+      "SPY",
+      "QQQ",
+      "IWM",
+      "EFA",
+      "EEM",
+      "TLT",
+      "LQD",
+      "GLD"
+    ],
+    "start": "2010-01-01",
+    "base_mode": "hrp",
+    "cov_lookback": 252,
+    "min_lookback": 126,
+    "rebalance_freq": "ME",
+    "lookback_ts": 126,
+    "lookback_cs": 252,
+    "cs_top_frac": 0.3,
+    "cs_bottom_frac": 0.3,
+    "cs_tilt_strength": 0.5,
+    "ts_scale_neg": 0.2,
+    "out_csv": "level71_mom_tilt_portfolio.csv",
+    "out_json": "level71_mom_tilt_portfolio_summary.json",
+    "seed": 42
+  },
+  "start_date": "2010-08-31",
+  "end_date": "2025-12-04",
+  "n_days": 3840,
+  "Base": {
+    "ann_ret": 0.058711473716287266,
+    "ann_vol": 0.0799129505602138,
+    "sharpe": 0.734692853970504,
+    "max_dd": -0.2593183693848702
+  },
+  "MomentumTilt": {
+    "ann_ret": 0.07067831658287926,
+    "ann_vol": 0.08996737021936256,
+    "sharpe": 0.7855994502289904,
+    "max_dd": -0.2530446118126085
+  },
+  "corr_base_tilt": 0.9046043242462778
+}

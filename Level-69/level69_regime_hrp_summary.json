@@ -1,0 +1,58 @@
+{
+  "config": {
+    "symbols": [
+      "SPY",
+      "QQQ",
+      "IWM",
+      "EFA",
+      "EEM",
+      "TLT",
+      "LQD",
+      "GLD"
+    ],
+    "start": "2010-01-01",
+    "cov_lookback": 252,
+    "min_lookback": 126,
+    "rebalance_freq": "ME",
+    "vol_anchor": "SPY",
+    "vol_lookback": 60,
+    "vol_low": 0.12,
+    "vol_high": 0.2,
+    "growth_symbols": [
+      "SPY",
+      "QQQ",
+      "IWM",
+      "EFA",
+      "EEM"
+    ],
+    "defensive_symbols": [
+      "TLT",
+      "LQD",
+      "GLD"
+    ],
+    "out_csv": "level69_regime_hrp_portfolio.csv",
+    "out_json": "level69_regime_hrp_summary.json",
+    "seed": 42
+  },
+  "start_date": "2010-07-31",
+  "end_date": "2025-12-31",
+  "n_days": 3895,
+  "DynamicRegimeHRP": {
+    "ann_ret": 0.06633487899912272,
+    "ann_vol": 0.10724357420721653,
+    "sharpe": 0.6185440898393609,
+    "max_dd": -0.2871337571562229
+  },
+  "StaticHRP": {
+    "ann_ret": 0.057859028472991625,
+    "ann_vol": 0.07934773840410327,
+    "sharpe": 0.7291830824254418,
+    "max_dd": -0.2593185030817068
+  },
+  "EqualWeight": {
+    "ann_ret": 0.08636587217067082,
+    "ann_vol": 0.11779269946918879,
+    "sharpe": 0.7332022490346414,
+    "max_dd": -0.2795759878926718
+  }
+}

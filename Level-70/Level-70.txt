@@ -1,0 +1,538 @@
+Here’s Level-70: **Volatility-Targeted + Drawdown-Aware Overlay on a Base Portfolio (EW or HRP)**. Save as `level70_vol_target_drawdown.py`.
+
+```python
+# level70_vol_target_drawdown.py
+# Volatility-Targeted, Drawdown-Aware Overlay on a Base Portfolio (EW or HRP)
+# Universe: SPY, QQQ, IWM, EFA, EEM, TLT, LQD, GLD
+#
+# Steps:
+#   1) Build a base daily portfolio (Equal-Weight or static HRP, rebalanced monthly).
+#   2) Compute rolling realized vol of base portfolio.
+#   3) Apply volatility targeting with leverage bounds.
+#   4) Apply drawdown-aware scaling (reduce leverage as drawdown deepens).
+#   5) Compare base vs vol-targeted+DD-controlled performance.
+#
+# Outputs:
+#   - level70_vol_target_drawdown.csv
+#   - level70_vol_target_drawdown_summary.json
+
+import argparse
+import json
+from dataclasses import dataclass, asdict
+from typing import Sequence, Tuple, List, Dict
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+
+
+# --------------------------- Config ---------------------------
+
+@dataclass
+class Config:
+    symbols: Tuple[str, ...] = (
+        "SPY", "QQQ", "IWM", "EFA", "EEM", "TLT", "LQD", "GLD"
+    )
+    start: str = "2010-01-01"
+
+    # Base portfolio construction
+    base_mode: str = "hrp"        # "hrp" or "ew"
+    cov_lookback: int = 252       # days for covariance estimation
+    min_lookback: int = 126       # min days before we start using HRP
+    rebalance_freq: str = "ME"    # month-end
+
+    # Vol targeting overlay
+    vol_lookback: int = 60        # days of realized vol
+    vol_target: float = 0.10      # 10% annual target
+    lev_min: float = 0.0          # min leverage
+    lev_max: float = 2.0          # max leverage
+
+    # Drawdown-aware scaling
+    dd_thresh: float = 0.15       # 15% drawdown threshold
+    dd_max: float = 0.30          # 30% drawdown where scaling hits minimum
+    dd_min_scale: float = 0.20    # at max drawdown, leverage is scaled to 20% of base
+
+    # Outputs
+    out_csv: str = "level70_vol_target_drawdown.csv"
+    out_json: str = "level70_vol_target_drawdown_summary.json"
+
+    seed: int = 42
+
+
+# --------------------------- Data Loader ---------------------------
+
+def load_prices(symbols: Sequence[str], start: str) -> pd.DataFrame:
+    """Download adjusted close prices for a list of symbols from yfinance."""
+    frames = []
+    for s in symbols:
+        px = yf.download(s, start=start, auto_adjust=True, progress=False)
+        if px.empty:
+            raise RuntimeError(f"No price data downloaded for {s}.")
+        if "Close" not in px.columns:
+            raise RuntimeError(f"'Close' column missing for {s}.")
+
+        close = px["Close"].copy()
+        close.name = s
+        frames.append(close)
+
+    prices = pd.concat(frames, axis=1).sort_index()
+    prices = prices.dropna(how="all")
+    prices = prices.ffill().dropna(how="any")
+    return prices
+
+
+def compute_returns(prices: pd.DataFrame) -> pd.DataFrame:
+    """Daily log returns."""
+    rets = np.log(prices).diff()
+    rets = rets.dropna(how="all")
+    return rets
+
+
+# --------------------------- Base Portfolio Helpers ---------------------------
+
+def equal_weight(symbols: Sequence[str]) -> pd.Series:
+    n = len(symbols)
+    w = np.ones(n) / n
+    return pd.Series(w, index=list(symbols))
+
+
+def cov_to_corr(cov: pd.DataFrame) -> pd.DataFrame:
+    if not isinstance(cov, pd.DataFrame):
+        cov = pd.DataFrame(cov)
+    diag = np.diag(cov.values)
+    diag = np.where(diag <= 0, 1e-12, diag)
+    std = np.sqrt(diag)
+    denom = np.outer(std, std)
+    corr = cov.values / denom
+    corr[~np.isfinite(corr)] = 0.0
+    np.fill_diagonal(corr, 1.0)
+    return pd.DataFrame(corr, index=cov.index, columns=cov.columns)
+
+
+def correl_to_dist(corr: pd.DataFrame) -> pd.DataFrame:
+    if not isinstance(corr, pd.DataFrame):
+        corr = pd.DataFrame(corr)
+    d = np.sqrt(0.5 * (1.0 - corr.values))
+    np.fill_diagonal(d, 0.0)
+    return pd.DataFrame(d, index=corr.index, columns=corr.columns)
+
+
+def single_linkage_order(dist: pd.DataFrame) -> List[int]:
+    """
+    Naive single-linkage clustering to get a leaf ordering
+    (no external libraries).
+    """
+    n = dist.shape[0]
+    D = dist.values.astype(float)
+    np.fill_diagonal(D, np.inf)
+
+    clusters: Dict[int, List[int]] = {i: [i] for i in range(n)}
+    next_id = n
+
+    while len(clusters) > 1:
+        ids = list(clusters.keys())
+        best = None
+        best_pair = None
+
+        for i in range(len(ids)):
+            for j in range(i + 1, len(ids)):
+                ci = ids[i]
+                cj = ids[j]
+                members_i = clusters[ci]
+                members_j = clusters[cj]
+                sub = D[np.ix_(members_i, members_j)]
+                d_ij = float(np.min(sub))
+                if (best is None) or (d_ij < best):
+                    best = d_ij
+                    best_pair = (ci, cj)
+
+        if best_pair is None:
+            break
+
+        a, b = best_pair
+        new_members = clusters[a] + clusters[b]
+        del clusters[a]
+        del clusters[b]
+        clusters[next_id] = new_members
+        next_id += 1
+
+    final_members = list(clusters.values())[0]
+    return final_members
+
+
+def hrp_weights(cov: pd.DataFrame) -> pd.Series:
+    """Hierarchical Risk Parity long-only weights."""
+    if not isinstance(cov, pd.DataFrame):
+        cov = pd.DataFrame(cov)
+    cols = list(cov.columns)
+    n = len(cols)
+
+    corr = cov_to_corr(cov)
+    dist = correl_to_dist(corr)
+    order = single_linkage_order(dist)
+
+    cov_reordered = cov.values[order][:, order]
+    diag = np.diag(cov_reordered)
+    diag = np.where(diag <= 0, 1e-8, diag)
+    inv_var = 1.0 / diag
+
+    weights = np.ones(n)
+    clusters = [np.arange(n)]
+
+    while clusters:
+        cluster = clusters.pop(0)
+        if len(cluster) <= 1:
+            continue
+
+        split = len(cluster) // 2
+        left = cluster[:split]
+        right = cluster[split:]
+
+        inv_var_left = inv_var[left]
+        inv_var_right = inv_var[right]
+
+        w_left = inv_var_left / inv_var_left.sum()
+        w_right = inv_var_right / inv_var_right.sum()
+
+        cov_left = cov_reordered[np.ix_(left, left)]
+        cov_right = cov_reordered[np.ix_(right, right)]
+
+        var_left = float(w_left @ cov_left @ w_left)
+        var_right = float(w_right @ cov_right @ w_right)
+
+        if var_left + var_right == 0:
+            alpha = 0.5
+        else:
+            alpha = 1.0 - var_left / (var_left + var_right)
+
+        weights[left] *= alpha
+        weights[right] *= (1.0 - alpha)
+
+        clusters.append(left)
+        clusters.append(right)
+
+    w_final = np.zeros(n)
+    for pos, asset_idx in enumerate(order):
+        w_final[asset_idx] = weights[pos]
+
+    return pd.Series(w_final, index=cols)
+
+
+def compute_rebalance_dates(rets: pd.DataFrame, freq: str) -> pd.DatetimeIndex:
+    """
+    Rebalance dates; here, we expect 'ME' for month-end.
+    """
+    if freq != "ME":
+        raise ValueError("This script expects rebalance_freq 'ME' (month-end).")
+    return rets.resample("ME").last().index
+
+
+def build_base_weights(rets: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+    """
+    Build base portfolio weights (EW or HRP) on monthly rebalancing.
+    """
+    symbols = list(cfg.symbols)
+    idx = rets.index
+    w = pd.DataFrame(index=idx, columns=symbols, dtype=float)
+
+    rebal_dates = compute_rebalance_dates(rets, cfg.rebalance_freq)
+
+    for d in rebal_dates:
+        window = rets.loc[:d].tail(cfg.cov_lookback)
+        if window.shape[0] < cfg.min_lookback:
+            continue
+
+        if cfg.base_mode.lower() == "ew":
+            w_d = equal_weight(symbols)
+        elif cfg.base_mode.lower() == "hrp":
+            cov = window.cov()
+            if cov.isnull().any().any():
+                continue
+            w_d = hrp_weights(cov).reindex(symbols)
+        else:
+            raise ValueError("base_mode must be 'ew' or 'hrp'")
+
+        w.loc[d] = w_d
+
+    w = w.ffill().dropna()
+    return w
+
+
+# --------------------------- Overlay (Vol Target + DD) ---------------------------
+
+def realized_vol_annual(r: pd.Series, lookback: int) -> pd.Series:
+    """
+    Rolling realized annualized volatility of returns.
+    """
+    rolling_std = r.rolling(lookback).std()
+    return rolling_std * np.sqrt(252.0)
+
+
+def drawdown_series(ret: pd.Series) -> pd.Series:
+    """
+    Compute drawdown series from daily returns.
+    Returns in [-1, 0], where 0 is no drawdown.
+    """
+    eq = (1.0 + ret).cumprod()
+    peak = eq.cummax()
+    dd = eq / peak - 1.0
+    return dd
+
+
+def dd_scaling(
+    dd_mag: pd.Series, dd_thresh: float, dd_max: float, dd_min_scale: float
+) -> pd.Series:
+    """
+    Piecewise linear scaling based on drawdown magnitude (0..1).
+    dd_mag = -drawdown (so 0 means no drawdown, 0.2 means -20%).
+    """
+    scale = pd.Series(1.0, index=dd_mag.index, dtype=float)
+
+    # where drawdown <= threshold: scale = 1
+    # between threshold and max: linearly down to dd_min_scale
+    mask = (dd_mag > dd_thresh) & (dd_mag < dd_max)
+    mask_hi = dd_mag >= dd_max
+
+    denom = (dd_max - dd_thresh) if dd_max > dd_thresh else 1e-6
+    slope = (dd_min_scale - 1.0) / denom
+
+    scale.loc[mask] = 1.0 + slope * (dd_mag.loc[mask] - dd_thresh)
+    scale.loc[mask_hi] = dd_min_scale
+
+    return scale.clip(lower=dd_min_scale, upper=1.0)
+
+
+def apply_overlay(
+    base_ret: pd.Series,
+    cfg: Config
+) -> pd.DataFrame:
+    """
+    Compute volatility-targeted + DD-aware leveraged returns.
+
+    Returns DataFrame with:
+        base_ret, lev_raw, lev_final, ret_targeted, eq_base, eq_targeted,
+        dd_base, dd_mag, dd_scale, vol_ann
+    """
+    base_ret = base_ret.dropna()
+    idx = base_ret.index
+
+    vol_ann = realized_vol_annual(base_ret, cfg.vol_lookback)
+    lev_raw = cfg.vol_target / vol_ann
+    lev_raw = lev_raw.clip(lower=cfg.lev_min, upper=cfg.lev_max)
+
+    dd_base = drawdown_series(base_ret)
+    dd_mag = (-dd_base).clip(lower=0.0)
+
+    dd_scale = dd_scaling(dd_mag, cfg.dd_thresh, cfg.dd_max, cfg.dd_min_scale)
+
+    lev_final = lev_raw * dd_scale
+    lev_final = lev_final.fillna(0.0)
+
+    ret_targeted = lev_final * base_ret
+
+    eq_base = (1.0 + base_ret).cumprod()
+    eq_targeted = (1.0 + ret_targeted).cumprod()
+
+    out = pd.DataFrame(
+        {
+            "ret_base": base_ret,
+            "vol_ann": vol_ann,
+            "lev_raw": lev_raw,
+            "dd_base": dd_base,
+            "dd_mag": dd_mag,
+            "dd_scale": dd_scale,
+            "lev_final": lev_final,
+            "ret_targeted": ret_targeted,
+            "eq_base": eq_base,
+            "eq_targeted": eq_targeted,
+        }
+    )
+    return out
+
+
+# --------------------------- Backtest & Stats ---------------------------
+
+def stats_from_returns(r: pd.Series) -> dict:
+    if r.empty:
+        return dict(ann_ret=np.nan, ann_vol=np.nan, sharpe=np.nan, max_dd=np.nan)
+    r = r.dropna()
+    if r.empty:
+        return dict(ann_ret=np.nan, ann_vol=np.nan, sharpe=np.nan, max_dd=np.nan)
+
+    mu = float(r.mean())
+    sig = float(r.std())
+
+    ann_ret = (1.0 + mu) ** 252 - 1.0
+    ann_vol = sig * np.sqrt(252.0)
+    sharpe = ann_ret / ann_vol if ann_vol > 0 else np.nan
+
+    eq = (1.0 + r).cumprod()
+    peak = eq.cummax()
+    dd = eq / peak - 1.0
+    max_dd = float(dd.min()) if not dd.empty else np.nan
+
+    return dict(
+        ann_ret=float(ann_ret),
+        ann_vol=float(ann_vol),
+        sharpe=float(sharpe),
+        max_dd=float(max_dd),
+    )
+
+
+def run_pipeline(cfg: Config) -> Tuple[pd.DataFrame, dict]:
+    prices = load_prices(cfg.symbols, cfg.start)
+    rets = compute_returns(prices)
+
+    # Base portfolio weights and returns
+    w_base = build_base_weights(rets, cfg)
+    common_idx = rets.index.intersection(w_base.index)
+    rets = rets.reindex(common_idx)
+    w_base = w_base.reindex(common_idx)
+
+    base_ret = (w_base * rets).sum(axis=1).rename("ret_base")
+
+    # Overlay
+    overlay = apply_overlay(base_ret, cfg)
+
+    # Align everything on overlay index
+    idx = overlay.index
+    prices = prices.reindex(idx)
+    rets = rets.reindex(idx)
+    w_base = w_base.reindex(idx)
+
+    out = pd.DataFrame(index=idx)
+    out[list(cfg.symbols)] = prices
+    out[[f"ret_{s}" for s in cfg.symbols]] = rets.add_prefix("ret_")
+    out[[f"w_base_{s}" for s in cfg.symbols]] = w_base.add_prefix("w_base_")
+
+    for col in overlay.columns:
+        out[col] = overlay[col]
+
+    summary = {
+        "config": asdict(cfg),
+        "start_date": str(idx.min().date()) if len(idx) else None,
+        "end_date": str(idx.max().date()) if len(idx) else None,
+        "n_days": int(len(idx)),
+        "Base": stats_from_returns(overlay["ret_base"]),
+        "VolTarget_DD": stats_from_returns(overlay["ret_targeted"]),
+    }
+
+    return out, summary
+
+
+# --------------------------- I/O ---------------------------
+
+def save_outputs(out: pd.DataFrame, summary: dict, cfg: Config) -> None:
+    out.to_csv(cfg.out_csv, index=True, date_format="%Y-%m-%d")
+    with open(cfg.out_json, "w") as f:
+        json.dump(summary, f, indent=2)
+
+    print(f"[OK] Saved daily series → {cfg.out_csv}")
+    print(f"[OK] Saved summary → {cfg.out_json}")
+    if summary["start_date"] and summary["end_date"]:
+        print(
+            f"Period {summary['start_date']} → {summary['end_date']}, "
+            f"n_days={summary['n_days']}"
+        )
+
+    for name in ["Base", "VolTarget_DD"]:
+        s = summary[name]
+        print(
+            f"{name}: AnnRet={s['ann_ret']*100:.2f}%, "
+            f"AnnVol={s['ann_vol']*100:.2f}%, "
+            f"Sharpe={s['sharpe']:.2f}, "
+            f"MaxDD={s['max_dd']*100:.2f}%"
+        )
+
+
+# --------------------------- CLI ---------------------------
+
+def parse_args() -> Config:
+    p = argparse.ArgumentParser(
+        description="Level-70: Volatility-Targeted, Drawdown-Aware Overlay"
+    )
+    p.add_argument(
+        "--symbols",
+        type=str,
+        default="SPY,QQQ,IWM,EFA,EEM,TLT,LQD,GLD",
+        help="Comma-separated tickers.",
+    )
+    p.add_argument("--start", type=str, default="2010-01-01")
+    p.add_argument(
+        "--base-mode",
+        type=str,
+        default="hrp",
+        choices=["hrp", "ew"],
+        help="Base portfolio type: 'hrp' or 'ew'.",
+    )
+    p.add_argument("--cov-lookback", type=int, default=252)
+    p.add_argument("--min-lookback", type=int, default=126)
+    p.add_argument(
+        "--rebalance-freq",
+        type=str,
+        default="ME",
+        help="Rebalance frequency (use 'ME' for month-end).",
+    )
+
+    p.add_argument("--vol-lookback", type=int, default=60)
+    p.add_argument("--vol-target", type=float, default=0.10)
+    p.add_argument("--lev-min", type=float, default=0.0)
+    p.add_argument("--lev-max", type=float, default=2.0)
+
+    p.add_argument("--dd-thresh", type=float, default=0.15)
+    p.add_argument("--dd-max", type=float, default=0.30)
+    p.add_argument("--dd-min-scale", type=float, default=0.20)
+
+    p.add_argument(
+        "--csv", type=str, default="level70_vol_target_drawdown.csv"
+    )
+    p.add_argument(
+        "--json", type=str, default="level70_vol_target_drawdown_summary.json"
+    )
+    p.add_argument("--seed", type=int, default=42)
+
+    a = p.parse_args()
+    symbols = tuple(s.strip() for s in a.symbols.split(",") if s.strip())
+
+    return Config(
+        symbols=symbols,
+        start=a.start,
+        base_mode=a.base_mode,
+        cov_lookback=a.cov_lookback,
+        min_lookback=a.min_lookback,
+        rebalance_freq=a.rebalance_freq,
+        vol_lookback=a.vol_lookback,
+        vol_target=a.vol_target,
+        lev_min=a.lev_min,
+        lev_max=a.lev_max,
+        dd_thresh=a.dd_thresh,
+        dd_max=a.dd_max,
+        dd_min_scale=a.dd_min_scale,
+        out_csv=a.csv,
+        out_json=a.json,
+        seed=a.seed,
+    )
+
+
+# --------------------------- Main ---------------------------
+
+def main() -> None:
+    cfg = parse_args()
+    np.random.seed(cfg.seed)
+
+    print(f"[INFO] Downloading prices for {cfg.symbols} from {cfg.start} ...")
+    out, summary = run_pipeline(cfg)
+    save_outputs(out, summary, cfg)
+
+
+if __name__ == "__main__":
+    # Jupyter / PyCharm shim
+    import sys
+
+    sys.argv = [sys.argv[0]] + [
+        arg
+        for arg in sys.argv[1:]
+        if arg != "-f" and not (arg.endswith(".json") and "kernel" in arg)
+    ]
+    main()
+```

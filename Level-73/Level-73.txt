@@ -1,0 +1,460 @@
+Nice, rolling into Level-73. This one will be a **Volatility-Targeted Overlay** on a static multi-asset portfolio:
+
+* Universe: `SPY, QQQ, IWM, EFA, EEM, TLT, LQD, GLD`
+* Build a **static 60/40-style base portfolio** (risk assets vs defensives).
+* Estimate **rolling realized volatility** of the base portfolio.
+* Scale **leverage up/down daily** to hit a **target annual volatility** (e.g., 10%), with caps.
+* Outputs:
+
+  * `level73_vol_target_overlay.csv`
+  * `level73_vol_target_overlay_summary.json`
+
+Save as `level73_vol_target_overlay.py` and run.
+
+```python
+# level73_vol_target_overlay.py
+# Volatility-Targeted Overlay on a Multi-Asset Portfolio
+#
+# - Universe: SPY, QQQ, IWM, EFA, EEM, TLT, LQD, GLD (configurable)
+# - Build a static base portfolio (e.g., 60% risk assets, 40% defensives, equal-weight within buckets)
+# - Estimate rolling realized volatility of base portfolio
+# - Apply volatility targeting: scale exposure each day to hit a target annual volatility
+#   with leverage caps and a volatility floor to prevent blow-ups
+#
+# Outputs:
+#   - level73_vol_target_overlay.csv
+#   - level73_vol_target_overlay_summary.json
+#
+# Usage example:
+#   python level73_vol_target_overlay.py --target-vol 0.10 --lookback 63 --max-lev 2.0
+#
+# All data is from yfinance (free).
+
+import argparse
+import json
+from dataclasses import dataclass, asdict
+from typing import Sequence, Tuple, List, Dict
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+
+
+# --------------------------- Config ---------------------------
+
+@dataclass
+class Config:
+    # Universe
+    symbols: Tuple[str, ...] = (
+        "SPY", "QQQ", "IWM", "EFA", "EEM", "TLT", "LQD", "GLD"
+    )
+    start: str = "2010-01-01"
+
+    # Base portfolio structure: risk vs defensive share
+    risk_share: float = 0.60     # total weight for risk assets (equities, EM, etc.)
+    def_share: float = 0.40      # total weight for defensives (bonds, gold)
+
+    # Known defensives (intersection with universe)
+    defensive_set: Tuple[str, ...] = ("TLT", "LQD", "GLD")
+
+    # Vol targeting parameters
+    target_vol: float = 0.10     # target annual volatility (e.g., 0.10 = 10%)
+    lookback: int = 63           # days for realized vol estimate
+    vol_floor: float = 0.02      # minimum annual vol used for leverage calc
+    max_leverage: float = 2.0    # cap on leverage
+    min_leverage: float = 0.0    # floor on leverage (can be 0 = fully in cash)
+
+    # Outputs
+    out_csv: str = "level73_vol_target_overlay.csv"
+    out_json: str = "level73_vol_target_overlay_summary.json"
+
+    seed: int = 42
+
+
+# --------------------------- Data Loader ---------------------------
+
+def _extract_close_series(px: pd.DataFrame, symbol: str) -> pd.Series:
+    """
+    Robustly extract a 1D close price Series for a symbol from a yfinance DataFrame.
+
+    Handles cases where:
+      - px["Close"] is a Series
+      - px["Close"] is a DataFrame with shape (n, 1)
+    """
+    if "Close" not in px.columns:
+        raise RuntimeError(f"'Close' column missing for {symbol}.")
+
+    close_obj = px["Close"]
+
+    if isinstance(close_obj, pd.Series):
+        close = pd.Series(close_obj.values, index=close_obj.index, name=symbol)
+    elif isinstance(close_obj, pd.DataFrame):
+        if close_obj.shape[1] < 1:
+            raise RuntimeError(f"No close data columns for {symbol}.")
+        col0 = close_obj.iloc[:, 0]
+        close = pd.Series(col0.values, index=col0.index, name=symbol)
+    else:
+        raise RuntimeError("Unexpected type for Close data.")
+
+    close = close.astype(float)
+    return close
+
+
+def load_prices(symbols: Sequence[str], start: str) -> pd.DataFrame:
+    """Download adjusted close prices for a list of symbols from yfinance."""
+    frames = []
+    for s in symbols:
+        px = yf.download(s, start=start, auto_adjust=True, progress=False)
+        if px.empty:
+            raise RuntimeError(f"No price data downloaded for {s}.")
+        close = _extract_close_series(px, s)
+        frames.append(close)
+
+    prices = pd.concat(frames, axis=1).sort_index()
+    prices = prices.dropna(how="all")
+    prices = prices.ffill().dropna(how="any")
+    return prices
+
+
+def compute_returns(prices: pd.DataFrame) -> pd.DataFrame:
+    """Daily log returns."""
+    rets = np.log(prices).diff()
+    rets = rets.dropna(how="all")
+    return rets
+
+
+# --------------------------- Base Portfolio Weights ---------------------------
+
+def build_base_weights(symbols: Sequence[str],
+                       defensive_set: Sequence[str],
+                       risk_share: float,
+                       def_share: float) -> Dict[str, float]:
+    """
+    Build static base portfolio weights:
+    - Risk assets = symbols not in defensive_set
+    - Defensive assets = intersection(symbols, defensive_set)
+    - Risk bucket gets risk_share, defensive bucket gets def_share
+    - Equal-weight within each bucket, then normalized to sum to 1.
+    """
+    symbols = list(symbols)
+    def_set = set(defensive_set)
+
+    def_assets = [s for s in symbols if s in def_set]
+    risk_assets = [s for s in symbols if s not in def_set]
+
+    # Edge cases: if one bucket is empty, put all weight in the other.
+    if len(risk_assets) == 0 and len(def_assets) == 0:
+        raise ValueError("Universe has no symbols to allocate.")
+    if len(risk_assets) == 0:
+        risk_assets = []
+        def_assets = symbols
+        risk_share = 0.0
+        def_share = 1.0
+    if len(def_assets) == 0:
+        def_assets = []
+        risk_assets = symbols
+        risk_share = 1.0
+        def_share = 0.0
+
+    risk_share = float(np.clip(risk_share, 0.0, 1.0))
+    def_share = float(np.clip(def_share, 0.0, 1.0))
+
+    if risk_share + def_share == 0:
+        risk_share = 1.0
+        def_share = 0.0
+
+    weights = {s: 0.0 for s in symbols}
+
+    if len(risk_assets) > 0 and risk_share > 0:
+        per_risk = risk_share / len(risk_assets)
+        for s in risk_assets:
+            weights[s] = per_risk
+
+    if len(def_assets) > 0 and def_share > 0:
+        per_def = def_share / len(def_assets)
+        for s in def_assets:
+            weights[s] = per_def
+
+    # Normalize just in case of rounding
+    total = float(sum(weights.values()))
+    if total <= 0:
+        # fall back to equal-weight
+        equal = 1.0 / len(symbols)
+        weights = {s: equal for s in symbols}
+    else:
+        for s in weights:
+            weights[s] /= total
+
+    return weights
+
+
+# --------------------------- Vol Targeting Logic ---------------------------
+
+def realized_vol_ann(returns: pd.Series, lookback: int) -> pd.Series:
+    """
+    Compute rolling realized annualized volatility from daily returns.
+    Using simple standard deviation over last `lookback` days.
+    """
+    rolling_std = returns.rolling(window=lookback, min_periods=lookback).std()
+    ann_vol = rolling_std * np.sqrt(252.0)
+    return ann_vol
+
+
+def build_vol_target_series(base_ret: pd.Series,
+                            cfg: Config) -> pd.DataFrame:
+    """
+    Build a DataFrame with:
+      - base_ret: base portfolio daily return
+      - sigma_ann: rolling annualized volatility estimate
+      - leverage: vol-targeted leverage applied to NEXT day's return
+      - port_ret: volatility-targeted portfolio returns
+      - base_eq / port_eq: cumulative equity curves
+    """
+    base_ret = base_ret.dropna()
+    idx = base_ret.index
+
+    sigma_ann = realized_vol_ann(base_ret, cfg.lookback)
+    sigma_ann = sigma_ann.clip(lower=cfg.vol_floor)
+
+    # Leverage_t decided at end of day t, applied to return at t+1
+    leverage = pd.Series(index=idx, dtype=float)
+
+    for i, dt in enumerate(idx):
+        if i == 0:
+            leverage.iloc[i] = 1.0
+            continue
+        sig = sigma_ann.iloc[i - 1]  # use yesterday's vol estimate
+        if not np.isfinite(sig) or sig <= 0:
+            lev = 1.0
+        else:
+            lev = cfg.target_vol / sig
+        lev = float(np.clip(lev, cfg.min_leverage, cfg.max_leverage))
+        leverage.iloc[i] = lev
+
+    leverage.iloc[0] = 1.0
+
+    port_ret = leverage * base_ret
+    base_eq = (1.0 + base_ret).cumprod()
+    port_eq = (1.0 + port_ret).cumprod()
+
+    out = pd.DataFrame(
+        {
+            "base_ret": base_ret,
+            "sigma_ann": sigma_ann,
+            "leverage": leverage,
+            "port_ret": port_ret,
+            "base_eq": base_eq,
+            "port_eq": port_eq,
+        },
+        index=idx,
+    )
+    return out
+
+
+# --------------------------- Performance Stats ---------------------------
+
+def stats_from_returns(r: pd.Series) -> dict:
+    r = r.dropna()
+    if r.empty:
+        return dict(ann_ret=np.nan, ann_vol=np.nan, sharpe=np.nan, max_dd=np.nan)
+
+    mu = float(r.mean())
+    sig = float(r.std())
+
+    ann_ret = (1.0 + mu) ** 252 - 1.0
+    ann_vol = sig * np.sqrt(252.0)
+    sharpe = ann_ret / ann_vol if ann_vol > 0 else np.nan
+
+    eq = (1.0 + r).cumprod()
+    peak = eq.cummax()
+    dd = eq / peak - 1.0
+    max_dd = float(dd.min()) if not dd.empty else np.nan
+
+    return dict(
+        ann_ret=float(ann_ret),
+        ann_vol=float(ann_vol),
+        sharpe=float(sharpe),
+        max_dd=float(max_dd),
+    )
+
+
+# --------------------------- Pipeline ---------------------------
+
+def run_pipeline(cfg: Config):
+    prices = load_prices(cfg.symbols, cfg.start)
+    rets = compute_returns(prices)
+
+    # Base static weights
+    base_w = build_base_weights(cfg.symbols,
+                                cfg.defensive_set,
+                                cfg.risk_share,
+                                cfg.def_share)
+
+    # Base portfolio returns
+    w_vec = pd.Series(base_w)
+    base_ret = (rets * w_vec.reindex(rets.columns)).sum(axis=1)
+    base_ret.name = "base_ret"
+
+    # Vol-target series
+    vt = build_vol_target_series(base_ret, cfg)
+
+    # Align for output
+    idx = vt.index
+    prices = prices.reindex(idx)
+    rets = rets.reindex(idx)
+
+    out = pd.DataFrame(index=idx)
+    out[list(cfg.symbols)] = prices
+    out[[f"ret_{s}" for s in cfg.symbols]] = rets.add_prefix("ret_")
+    for s in cfg.symbols:
+        out[f"w_base_{s}"] = base_w.get(s, 0.0)
+
+    out["base_ret"] = vt["base_ret"]
+    out["sigma_ann"] = vt["sigma_ann"]
+    out["leverage"] = vt["leverage"]
+    out["port_ret"] = vt["port_ret"]
+    out["base_eq"] = vt["base_eq"]
+    out["port_eq"] = vt["port_eq"]
+
+    # Summary
+    base_stats = stats_from_returns(out["base_ret"])
+    port_stats = stats_from_returns(out["port_ret"])
+
+    lever = out["leverage"].dropna()
+    avg_lev = float(lever.mean()) if not lever.empty else np.nan
+    pct_at_cap = float((lever >= cfg.max_leverage - 1e-8).mean()) if not lever.empty else np.nan
+    pct_at_floor = float((lever <= cfg.min_leverage + 1e-8).mean()) if not lever.empty else np.nan
+
+    idx_all = out.index
+    summary = {
+        "config": asdict(cfg),
+        "start_date": str(idx_all.min().date()) if len(idx_all) else None,
+        "end_date": str(idx_all.max().date()) if len(idx_all) else None,
+        "n_days": int(len(idx_all)),
+        "base_weights": base_w,
+        "Performance_base": base_stats,
+        "Performance_vol_targeted": port_stats,
+        "avg_leverage": avg_lev,
+        "pct_days_at_max_leverage": pct_at_cap,
+        "pct_days_at_min_leverage": pct_at_floor,
+    }
+
+    return out, summary
+
+
+# --------------------------- I/O ---------------------------
+
+def save_outputs(out: pd.DataFrame, summary: dict, cfg: Config) -> None:
+    out.to_csv(cfg.out_csv, index=True, date_format="%Y-%m-%d")
+    with open(cfg.out_json, "w") as f:
+        json.dump(summary, f, indent=2)
+
+    print(f"[OK] Saved daily series → {cfg.out_csv}")
+    print(f"[OK] Saved summary → {cfg.out_json}")
+    if summary["start_date"] and summary["end_date"]:
+        print(
+            f"Period {summary['start_date']} → {summary['end_date']}, "
+            f"n_days={summary['n_days']}"
+        )
+
+    base = summary["Performance_base"]
+    vt = summary["Performance_vol_targeted"]
+    print(
+        "Base portfolio: "
+        f"AnnRet={base['ann_ret']*100:.2f}%, "
+        f"AnnVol={base['ann_vol']*100:.2f}%, "
+        f"Sharpe={base['sharpe']:.2f}, "
+        f"MaxDD={base['max_dd']*100:.2f}%"
+    )
+    print(
+        "Vol-targeted:  "
+        f"AnnRet={vt['ann_ret']*100:.2f}%, "
+        f"AnnVol={vt['ann_vol']*100:.2f}%, "
+        f"Sharpe={vt['sharpe']:.2f}, "
+        f"MaxDD={vt['max_dd']*100:.2f}%"
+    )
+    print(
+        f"Avg leverage={summary['avg_leverage']:.2f}, "
+        f"%days at max={summary['pct_days_at_max_leverage']*100:.1f}%, "
+        f"%days at min={summary['pct_days_at_min_leverage']*100:.1f}%"
+    )
+
+
+# --------------------------- CLI ---------------------------
+
+def parse_args() -> Config:
+    p = argparse.ArgumentParser(
+        description="Level-73: Volatility-Targeted Overlay on a Multi-Asset Portfolio"
+    )
+    p.add_argument(
+        "--symbols",
+        type=str,
+        default="SPY,QQQ,IWM,EFA,EEM,TLT,LQD,GLD",
+        help="Comma-separated tickers.",
+    )
+    p.add_argument("--start", type=str, default="2010-01-01")
+
+    p.add_argument("--risk-share", type=float, default=0.60)
+    p.add_argument("--def-share", type=float, default=0.40)
+    p.add_argument(
+        "--defensives",
+        type=str,
+        default="TLT,LQD,GLD",
+        help="Comma-separated list of defensive tickers (subset of universe).",
+    )
+
+    p.add_argument("--target-vol", type=float, default=0.10)
+    p.add_argument("--lookback", type=int, default=63)
+    p.add_argument("--vol-floor", type=float, default=0.02)
+    p.add_argument("--max-lev", type=float, default=2.0)
+    p.add_argument("--min-lev", type=float, default=0.0)
+
+    p.add_argument("--csv", type=str, default="level73_vol_target_overlay.csv")
+    p.add_argument("--json", type=str, default="level73_vol_target_overlay_summary.json")
+    p.add_argument("--seed", type=int, default=42)
+
+    a = p.parse_args()
+    symbols = tuple(s.strip() for s in a.symbols.split(",") if s.strip())
+    defensives = tuple(s.strip() for s in a.defensives.split(",") if s.strip())
+
+    return Config(
+        symbols=symbols,
+        start=a.start,
+        risk_share=a.risk_share,
+        def_share=a.def_share,
+        defensive_set=defensives,
+        target_vol=a.target_vol,
+        lookback=a.lookback,
+        vol_floor=a.vol_floor,
+        max_leverage=a.max_lev,
+        min_leverage=a.min_lev,
+        out_csv=a.csv,
+        out_json=a.json,
+        seed=a.seed,
+    )
+
+
+# --------------------------- Main ---------------------------
+
+def main() -> None:
+    cfg = parse_args()
+    np.random.seed(cfg.seed)
+
+    print(f"[INFO] Downloading prices for {cfg.symbols} from {cfg.start} ...")
+    out, summary = run_pipeline(cfg)
+    save_outputs(out, summary, cfg)
+
+
+if __name__ == "__main__":
+    # Jupyter / PyCharm shim
+    import sys
+
+    sys.argv = [sys.argv[0]] + [
+        arg
+        for arg in sys.argv[1:]
+        if arg != "-f" and not (arg.endswith(".json") and "kernel" in arg)
+    ]
+    main()
+```
+
+Run it and, if anything throws (especially around yfinance / pandas shapes), paste the traceback and we’ll patch it for Level-73b.

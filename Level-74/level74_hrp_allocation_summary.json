@@ -1,0 +1,36 @@
+{
+  "config": {
+    "symbols": [
+      "SPY",
+      "QQQ",
+      "IWM",
+      "EFA",
+      "EEM",
+      "TLT",
+      "LQD",
+      "GLD"
+    ],
+    "start": "2010-01-01",
+    "lookback": 252,
+    "rebalance_freq": "ME",
+    "out_csv": "level74_hrp_allocation.csv",
+    "out_json": "level74_hrp_allocation_summary.json",
+    "seed": 42
+  },
+  "start_date": "2011-01-31",
+  "end_date": "2025-12-04",
+  "n_days": 3735,
+  "Performance_HRP": {
+    "ann_ret": 0.06019413006925478,
+    "ann_vol": 0.08016221746730934,
+    "sharpe": 0.7509040040440789,
+    "max_dd": -0.25931843716183844
+  },
+  "Performance_EqualWeight": {
+    "ann_ret": 0.08156326710485562,
+    "ann_vol": 0.11904668425029594,
+    "sharpe": 0.6851368235789639,
+    "max_dd": -0.2795760134844657
+  },
+  "scipy_available": true
+}

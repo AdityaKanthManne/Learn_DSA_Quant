@@ -1,0 +1,470 @@
+On to Level-74 🚀
+This one will be a **Hierarchical Risk Parity (HRP) multi-asset allocation** with monthly rebalancing:
+
+* Universe: `SPY, QQQ, IWM, EFA, EEM, TLT, LQD, GLD`
+* HRP weights based on rolling covariance of returns
+* Monthly rebalancing using a rolling lookback window
+* Compare vs equal-weight benchmark
+* Outputs:
+
+  * `level74_hrp_allocation.csv`
+  * `level74_hrp_allocation_summary.json`
+
+Save as `level74_hrp_allocation.py` and run.
+
+```python
+# level74_hrp_allocation.py
+# Hierarchical Risk Parity (HRP) multi-asset allocation with monthly rebalancing.
+#
+# - Universe: SPY, QQQ, IWM, EFA, EEM, TLT, LQD, GLD (configurable)
+# - Download daily prices from yfinance (auto-adjusted).
+# - Compute daily log returns.
+# - Each rebalance date (monthly), estimate covariance on a rolling window
+#   and compute HRP weights.
+# - Forward-fill weights between rebalances, compute portfolio returns and equity curve.
+# - Compare vs equal-weight benchmark.
+#
+# Outputs:
+#   - level74_hrp_allocation.csv
+#   - level74_hrp_allocation_summary.json
+#
+# Usage:
+#   python level74_hrp_allocation.py --lookback 252 --rebalance-freq ME
+#
+# Notes:
+#   - Requires numpy, pandas, yfinance.
+#   - SciPy is optional; if not installed, falls back to simple inverse-variance weights.
+
+import argparse
+import json
+from dataclasses import dataclass, asdict
+from typing import Sequence, Tuple, Dict, List, Optional
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+
+try:
+    from scipy.cluster.hierarchy import linkage, leaves_list
+    SCIPY_AVAILABLE = True
+except ImportError:
+    linkage = None
+    leaves_list = None
+    SCIPY_AVAILABLE = False
+
+
+# --------------------------- Config ---------------------------
+
+@dataclass
+class Config:
+    symbols: Tuple[str, ...] = (
+        "SPY", "QQQ", "IWM", "EFA", "EEM", "TLT", "LQD", "GLD"
+    )
+    start: str = "2010-01-01"
+
+    # HRP settings
+    lookback: int = 252            # days in covariance window
+    rebalance_freq: str = "ME"     # pandas offset alias (ME = month end, MS = month start)
+
+    # Outputs
+    out_csv: str = "level74_hrp_allocation.csv"
+    out_json: str = "level74_hrp_allocation_summary.json"
+
+    # Misc
+    seed: int = 42
+
+
+# --------------------------- Data Loader ---------------------------
+
+def _extract_close_series(px: pd.DataFrame, symbol: str) -> pd.Series:
+    """
+    Robustly extract a 1D close price Series for a symbol from a yfinance DataFrame.
+
+    Handles cases where:
+      - px["Close"] is a Series
+      - px["Close"] is a DataFrame with shape (n, 1)
+    """
+    if "Close" not in px.columns:
+        raise RuntimeError(f"'Close' column missing for {symbol}.")
+
+    close_obj = px["Close"]
+
+    if isinstance(close_obj, pd.Series):
+        close = pd.Series(close_obj.values, index=close_obj.index, name=symbol)
+    elif isinstance(close_obj, pd.DataFrame):
+        if close_obj.shape[1] < 1:
+            raise RuntimeError(f"No close data columns for {symbol}.")
+        col0 = close_obj.iloc[:, 0]
+        close = pd.Series(col0.values, index=col0.index, name=symbol)
+    else:
+        raise RuntimeError("Unexpected type for Close data.")
+
+    close = close.astype(float)
+    return close
+
+
+def load_prices(symbols: Sequence[str], start: str) -> pd.DataFrame:
+    """Download adjusted close prices for a list of symbols from yfinance."""
+    frames = []
+    for s in symbols:
+        px = yf.download(s, start=start, auto_adjust=True, progress=False)
+        if px.empty:
+            raise RuntimeError(f"No price data downloaded for {s}.")
+        close = _extract_close_series(px, s)
+        frames.append(close)
+
+    prices = pd.concat(frames, axis=1).sort_index()
+    prices = prices.dropna(how="all")
+    prices = prices.ffill().dropna(how="any")
+    return prices
+
+
+def compute_returns(prices: pd.DataFrame) -> pd.DataFrame:
+    """Daily log returns."""
+    rets = np.log(prices).diff()
+    rets = rets.dropna(how="all")
+    return rets
+
+
+# --------------------------- HRP Core ---------------------------
+
+def cov_to_corr(cov: pd.DataFrame) -> pd.DataFrame:
+    diag = np.sqrt(np.diag(cov.values))
+    diag[diag == 0] = 1.0
+    corr = cov.values / np.outer(diag, diag)
+    corr = np.clip(corr, -1.0, 1.0)
+    return pd.DataFrame(corr, index=cov.index, columns=cov.columns)
+
+
+def correlation_distance(corr: pd.DataFrame) -> pd.DataFrame:
+    """
+    Lopez de Prado's correlation distance:
+        d_ij = sqrt(0.5 * (1 - corr_ij))
+    """
+    dist = np.sqrt(0.5 * (1.0 - corr.values))
+    return pd.DataFrame(dist, index=corr.index, columns=corr.columns)
+
+
+def _cluster_order(cov: pd.DataFrame) -> List[str]:
+    """
+    Get the hierarchical clustering order of assets based on covariance.
+    If SciPy is unavailable, return the original order.
+    """
+    if not SCIPY_AVAILABLE:
+        # Fallback: no clustering, just keep original order
+        return list(cov.index)
+
+    corr = cov_to_corr(cov)
+    dist = correlation_distance(corr)
+
+    # Use condensed distance matrix for linkage
+    # SciPy expects a 1D array from the upper triangle
+    tri_upper = dist.values[np.triu_indices(len(dist), k=1)]
+    Z = linkage(tri_upper, method="single")
+    order_idx = leaves_list(Z)
+    assets = list(cov.index)
+    ordered = [assets[i] for i in order_idx]
+    return ordered
+
+
+def _cluster_variance(cov: pd.DataFrame, cluster: List[str]) -> float:
+    """Compute the variance of a cluster using inverse-variance weights."""
+    sub = cov.loc[cluster, cluster]
+    iv = 1.0 / np.diag(sub.values)
+    iv = iv / iv.sum()
+    w = iv.reshape(-1, 1)
+    var = float(np.dot(np.dot(w.T, sub.values), w))
+    return var
+
+
+def hrp_weights(cov: pd.DataFrame) -> pd.Series:
+    """
+    Hierarchical Risk Parity weights from a covariance matrix.
+
+    If SciPy is not installed, we fall back to inverse-variance weights.
+    """
+    assets = list(cov.index)
+
+    if len(assets) == 0:
+        raise ValueError("Empty covariance matrix.")
+
+    # Fallback: no SciPy
+    if not SCIPY_AVAILABLE:
+        var = np.diag(cov.values)
+        var[var <= 0] = 1e-6
+        inv_var = 1.0 / var
+        w = inv_var / inv_var.sum()
+        return pd.Series(w, index=assets, name="hrp_weight")
+
+    # 1) Get hierarchical order
+    ordered = _cluster_order(cov)
+    # 2) Recursive bisection
+    w = pd.Series(1.0, index=ordered)
+    clusters = [ordered]
+
+    while len(clusters) > 0:
+        cluster = clusters.pop(0)
+        if len(cluster) <= 1:
+            continue
+
+        # split cluster into two halves
+        split = len(cluster) // 2
+        left = cluster[:split]
+        right = cluster[split:]
+
+        var_left = _cluster_variance(cov, left)
+        var_right = _cluster_variance(cov, right)
+
+        if var_left + var_right == 0:
+            alpha = 0.5
+        else:
+            # Allocate more weight to lower-variance cluster
+            alpha = 1.0 - var_left / (var_left + var_right)
+
+        for i in left:
+            w[i] *= alpha
+        for j in right:
+            w[j] *= (1.0 - alpha)
+
+        clusters.append(left)
+        clusters.append(right)
+
+    w = w / w.sum()
+    w.name = "hrp_weight"
+    return w
+
+
+# --------------------------- Backtest Logic ---------------------------
+
+def build_hrp_backtest(rets: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+    """
+    For each rebalance date:
+      - Use past `cfg.lookback` days of returns to estimate covariance.
+      - Compute HRP weights.
+      - Apply weights from next day until the next rebalance date.
+    """
+    rets = rets.dropna(how="all")
+    idx = rets.index
+    symbols = list(rets.columns)
+
+    # Rebalance dates (e.g., month-end)
+    # We'll use the last available return in each period as the rebalance date.
+    rebal_dates = rets.resample(cfg.rebalance_freq).last().index
+    rebal_dates = rebal_dates[rebal_dates.isin(idx)]
+
+    weights_df = pd.DataFrame(index=idx, columns=symbols, dtype=float)
+
+    last_weights: Optional[pd.Series] = None
+    for d in rebal_dates:
+        window = rets.loc[:d].tail(cfg.lookback)
+        if window.shape[0] < cfg.lookback:
+            # Not enough history yet; skip
+            continue
+
+        cov = window.cov()
+        w_hrp = hrp_weights(cov)
+
+        # Store weights at this rebalance date
+        weights_df.loc[d, w_hrp.index] = w_hrp.values
+        last_weights = w_hrp
+
+    # Forward-fill weights
+    if last_weights is not None:
+        weights_df = weights_df.ffill()
+
+    # Drop days before first actual weight
+    first_non_na = weights_df.dropna(how="all").index.min()
+    if first_non_na is None:
+        raise RuntimeError("No HRP weights were computed (not enough history / bad data).")
+
+    weights_df = weights_df.loc[first_non_na:]
+    rets = rets.loc[first_non_na:]
+
+    # Normalize weights daily (just in case of numerical drift)
+    weights_df = weights_df.div(weights_df.abs().sum(axis=1), axis=0).fillna(0.0)
+
+    # Portfolio returns
+    port_ret_hrp = (weights_df * rets).sum(axis=1)
+    port_ret_hrp.name = "ret_hrp"
+
+    # Equal-weight benchmark
+    eq_w = np.ones(len(symbols)) / len(symbols)
+    port_ret_eq = (rets * eq_w).sum(axis=1)
+    port_ret_eq.name = "ret_eqw"
+
+    out = pd.DataFrame(
+        {
+            "ret_hrp": port_ret_hrp,
+            "ret_eqw": port_ret_eq,
+        },
+        index=rets.index,
+    )
+
+    # Attach weights as separate columns
+    for s in symbols:
+        out[f"w_hrp_{s}"] = weights_df[s]
+
+    # Equity curves
+    out["eq_hrp"] = (1.0 + out["ret_hrp"]).cumprod()
+    out["eq_eqw"] = (1.0 + out["ret_eqw"]).cumprod()
+
+    return out
+
+
+# --------------------------- Performance Stats ---------------------------
+
+def stats_from_returns(r: pd.Series) -> dict:
+    r = r.dropna()
+    if r.empty:
+        return dict(ann_ret=np.nan, ann_vol=np.nan, sharpe=np.nan, max_dd=np.nan)
+
+    mu = float(r.mean())
+    sig = float(r.std())
+
+    ann_ret = (1.0 + mu) ** 252 - 1.0
+    ann_vol = sig * np.sqrt(252.0)
+    sharpe = ann_ret / ann_vol if ann_vol > 0 else np.nan
+
+    eq = (1.0 + r).cumprod()
+    peak = eq.cummax()
+    dd = eq / peak - 1.0
+    max_dd = float(dd.min()) if not dd.empty else np.nan
+
+    return dict(
+        ann_ret=float(ann_ret),
+        ann_vol=float(ann_vol),
+        sharpe=float(sharpe),
+        max_dd=float(max_dd),
+    )
+
+
+# --------------------------- Pipeline ---------------------------
+
+def run_pipeline(cfg: Config):
+    prices = load_prices(cfg.symbols, cfg.start)
+    rets = compute_returns(prices)
+
+    out = build_hrp_backtest(rets, cfg)
+
+    hrp_stats = stats_from_returns(out["ret_hrp"])
+    eqw_stats = stats_from_returns(out["ret_eqw"])
+
+    idx_all = out.index
+    summary = {
+        "config": asdict(cfg),
+        "start_date": str(idx_all.min().date()) if len(idx_all) else None,
+        "end_date": str(idx_all.max().date()) if len(idx_all) else None,
+        "n_days": int(len(idx_all)),
+        "Performance_HRP": hrp_stats,
+        "Performance_EqualWeight": eqw_stats,
+        "scipy_available": SCIPY_AVAILABLE,
+    }
+
+    return out, summary, prices
+
+
+# --------------------------- I/O ---------------------------
+
+def save_outputs(out: pd.DataFrame, summary: dict, prices: pd.DataFrame, cfg: Config) -> None:
+    # Merge prices in output for convenience
+    merged = out.copy()
+    # Reindex prices to match output index
+    p = prices.reindex(merged.index)
+    for s in cfg.symbols:
+        merged[s] = p[s]
+
+    merged.to_csv(cfg.out_csv, index=True, date_format="%Y-%m-%d")
+    with open(cfg.out_json, "w") as f:
+        json.dump(summary, f, indent=2)
+
+    print(f"[OK] Saved daily series → {cfg.out_csv}")
+    print(f"[OK] Saved summary      → {cfg.out_json}")
+    if summary["start_date"] and summary["end_date"]:
+        print(
+            f"Period {summary['start_date']} → {summary['end_date']}, "
+            f"n_days={summary['n_days']}"
+        )
+
+    hrp = summary["Performance_HRP"]
+    eqw = summary["Performance_EqualWeight"]
+
+    print(
+        "HRP portfolio:   "
+        f"AnnRet={hrp['ann_ret']*100:.2f}%, "
+        f"AnnVol={hrp['ann_vol']*100:.2f}%, "
+        f"Sharpe={hrp['sharpe']:.2f}, "
+        f"MaxDD={hrp['max_dd']*100:.2f}%"
+    )
+    print(
+        "Equal-weight:    "
+        f"AnnRet={eqw['ann_ret']*100:.2f}%, "
+        f"AnnVol={eqw['ann_vol']*100:.2f}%, "
+        f"Sharpe={eqw['sharpe']:.2f}, "
+        f"MaxDD={eqw['max_dd']*100:.2f}%"
+    )
+    if not SCIPY_AVAILABLE:
+        print("NOTE: SciPy not available; HRP fell back to inverse-variance weights.")
+
+
+# --------------------------- CLI ---------------------------
+
+def parse_args() -> Config:
+    p = argparse.ArgumentParser(
+        description="Level-74: Hierarchical Risk Parity Multi-Asset Allocation"
+    )
+    p.add_argument(
+        "--symbols",
+        type=str,
+        default="SPY,QQQ,IWM,EFA,EEM,TLT,LQD,GLD",
+        help="Comma-separated tickers.",
+    )
+    p.add_argument("--start", type=str, default="2010-01-01")
+    p.add_argument("--lookback", type=int, default=252)
+    p.add_argument(
+        "--rebalance-freq",
+        type=str,
+        default="ME",
+        help="Pandas offset alias for rebalancing (e.g., ME=month end, MS=month start, W-FRI, etc.)",
+    )
+    p.add_argument("--csv", type=str, default="level74_hrp_allocation.csv")
+    p.add_argument("--json", type=str, default="level74_hrp_allocation_summary.json")
+    p.add_argument("--seed", type=int, default=42)
+
+    a = p.parse_args()
+    symbols = tuple(s.strip() for s in a.symbols.split(",") if s.strip())
+
+    return Config(
+        symbols=symbols,
+        start=a.start,
+        lookback=a.lookback,
+        rebalance_freq=a.rebalance_freq,
+        out_csv=a.csv,
+        out_json=a.json,
+        seed=a.seed,
+    )
+
+
+# --------------------------- Main ---------------------------
+
+def main() -> None:
+    cfg = parse_args()
+    np.random.seed(cfg.seed)
+
+    print(f"[INFO] Downloading prices for {cfg.symbols} from {cfg.start} ...")
+    out, summary, prices = run_pipeline(cfg)
+    save_outputs(out, summary, prices, cfg)
+
+
+if __name__ == "__main__":
+    # Jupyter / PyCharm shim: strip kernel args
+    import sys
+
+    sys.argv = [sys.argv[0]] + [
+        arg
+        for arg in sys.argv[1:]
+        if arg != "-f" and not (arg.endswith(".json") and "kernel" in arg)
+    ]
+    main()
+```
+
+If you run this and something throws (especially around yfinance or SciPy), paste the traceback and we’ll patch Level-74b to be panda-proof again.

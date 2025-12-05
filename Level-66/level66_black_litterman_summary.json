@@ -1,0 +1,34 @@
+{
+  "config": {
+    "symbols": [
+      "SPY",
+      "QQQ",
+      "IWM",
+      "EFA",
+      "EEM",
+      "TLT",
+      "LQD",
+      "GLD"
+    ],
+    "start": "2010-01-01",
+    "lookback": 252,
+    "rebalance_freq": "ME",
+    "risk_aversion": 3.0,
+    "tau": 0.025,
+    "view_strength_ann": 0.03,
+    "view_top_k": 2,
+    "view_bottom_k": 2,
+    "omega_scale": 1.0,
+    "out_csv": "level66_black_litterman_portfolio.csv",
+    "out_json": "level66_black_litterman_summary.json",
+    "seed": 42
+  },
+  "portfolio": {
+    "ann_ret": 0.08888514098405587,
+    "ann_vol": 0.10799484598352528,
+    "sharpe": 0.8230498425602216,
+    "max_drawdown": -0.2544828242798177,
+    "avg_turnover_daily": 0.007638746769634357,
+    "avg_turnover_annualized": 1.9249641859478581
+  }
+}

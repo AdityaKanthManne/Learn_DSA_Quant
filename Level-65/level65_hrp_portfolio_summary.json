@@ -1,0 +1,28 @@
+{
+  "config": {
+    "symbols": [
+      "SPY",
+      "QQQ",
+      "IWM",
+      "EFA",
+      "EEM",
+      "TLT",
+      "LQD",
+      "GLD"
+    ],
+    "start": "2010-01-01",
+    "lookback": 252,
+    "rebalance_freq": "ME",
+    "out_csv": "level65_hrp_portfolio.csv",
+    "out_json": "level65_hrp_portfolio_summary.json",
+    "seed": 42
+  },
+  "portfolio": {
+    "ann_ret": 0.05965748207076316,
+    "ann_vol": 0.07835534434788094,
+    "sharpe": 0.7613709386037119,
+    "max_drawdown": -0.2527906880700199,
+    "avg_turnover_daily": 0.0017741341273955409,
+    "avg_turnover_annualized": 0.4470818001036763
+  }
+}

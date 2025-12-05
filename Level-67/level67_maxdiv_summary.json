@@ -1,0 +1,42 @@
+{
+  "config": {
+    "symbols": [
+      "SPY",
+      "QQQ",
+      "IWM",
+      "EFA",
+      "EEM",
+      "TLT",
+      "LQD",
+      "GLD"
+    ],
+    "start": "2010-01-01",
+    "cov_lookback": 252,
+    "min_lookback": 126,
+    "rebalance_freq": "ME",
+    "out_csv": "level67_maxdiv_portfolio.csv",
+    "out_json": "level67_maxdiv_summary.json",
+    "seed": 42
+  },
+  "start_date": "2010-07-31",
+  "end_date": "2025-12-31",
+  "n_days": 3895,
+  "EW": {
+    "ann_ret": 0.0863658682466455,
+    "ann_vol": 0.117792760728786,
+    "sharpe": 0.733201834410691,
+    "max_dd": -0.2795760591478441
+  },
+  "RiskParity": {
+    "ann_ret": 0.06385137960440401,
+    "ann_vol": 0.13273377595624408,
+    "sharpe": 0.4810484682169573,
+    "max_dd": -0.3542234653712193
+  },
+  "MaxDiv": {
+    "ann_ret": 0.06847766424751134,
+    "ann_vol": 0.09375627765664311,
+    "sharpe": 0.7303795112076886,
+    "max_dd": -0.3071920557380219
+  }
+}
