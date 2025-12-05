@@ -1,0 +1,50 @@
+{
+  "config": {
+    "symbols": [
+      "SPY",
+      "QQQ",
+      "IWM",
+      "EFA",
+      "EEM",
+      "TLT",
+      "LQD",
+      "GLD"
+    ],
+    "start": "2010-01-01",
+    "lookback_vol_short": 20,
+    "lookback_vol_long": 60,
+    "lookback_dd": 60,
+    "lookback_corr": 60,
+    "n_clusters": 3,
+    "min_history": 252,
+    "out_csv": "level64_regime_portfolio.csv",
+    "out_json": "level64_regime_portfolio_summary.json",
+    "seed": 42
+  },
+  "portfolio": {
+    "ann_ret": 0.06803644000085352,
+    "ann_vol": 0.1012349356506027,
+    "sharpe": 0.6720648318054071,
+    "max_drawdown": -0.3123250076082674
+  },
+  "by_regime": {
+    "regime_0": {
+      "ann_ret": 0.07460795974127898,
+      "ann_vol": 0.09332403229207668,
+      "sharpe": 0.7994506656953922,
+      "days": 2136
+    },
+    "regime_1": {
+      "ann_ret": 0.06223376518489743,
+      "ann_vol": 0.09741070073661855,
+      "sharpe": 0.6388801714214808,
+      "days": 1124
+    },
+    "regime_2": {
+      "ann_ret": 0.05302284056187889,
+      "ann_vol": 0.1365552447814875,
+      "sharpe": 0.3882885688259341,
+      "days": 493
+    }
+  }
+}

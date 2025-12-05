@@ -1,0 +1,42 @@
+{
+  "config": {
+    "symbols": [
+      "SPY",
+      "QQQ",
+      "IWM",
+      "EFA",
+      "EEM",
+      "TLT",
+      "LQD",
+      "GLD"
+    ],
+    "start": "2010-01-01",
+    "rebalance_freq": "ME",
+    "cov_lookback": 252,
+    "min_hist": 252,
+    "shrink_alpha": 0.3,
+    "alpha_minvar": 0.3,
+    "vol_lookback": 60,
+    "target_vol": 0.12,
+    "lev_min": 0.3,
+    "lev_max": 2.0,
+    "dd_threshold1": 0.1,
+    "dd_threshold2": 0.25,
+    "dd_min_scale": 0.3,
+    "out_csv": "level63_dd_leverage_series.csv",
+    "out_json": "level63_dd_leverage_summary.json",
+    "seed": 42
+  },
+  "base": {
+    "ann_ret": 0.07412536422263316,
+    "ann_vol": 0.1120545283142658,
+    "sharpe": 0.6615115456534046,
+    "max_drawdown": -0.3035462783484114
+  },
+  "dynamic": {
+    "ann_ret": 0.09493952674800066,
+    "ann_vol": 0.11207887458081318,
+    "sharpe": 0.8470778021557096,
+    "max_drawdown": -0.23074128178705744
+  }
+}

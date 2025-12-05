@@ -1,0 +1,591 @@
+Alright, time for **Level-64** 🎯
+We’ll build a **Regime-Switching Multi-Asset Portfolio using K-Means clustering** on volatility / correlation / trend features, and then apply **regime-dependent weights** (risk-on vs risk-off).
+
+* Universe: `("SPY", "QQQ", "IWM", "EFA", "EEM", "TLT", "LQD", "GLD")`
+* Data: free **yfinance** daily prices
+* Regimes: learned via **KMeans** on features, then ordered from **calm → neutral → stressed** by volatility
+* Portfolio: per-regime weights (risk-on in calm, balanced in neutral, defensive in stressed)
+* Outputs:
+
+  * `level64_regime_portfolio.csv`
+  * `level64_regime_portfolio_summary.json`
+
+Copy–paste this whole script as **`level64_regime_portfolio.py`** (or just into one PyCharm/Jupyter cell) and run:
+
+```python
+# level64_regime_portfolio.py
+#
+# Level-64: Unsupervised Regime Clustering + Regime-Dependent Multi-Asset Portfolio
+#
+# Idea:
+#   1) Load daily prices for a multi-asset ETF universe.
+#   2) Build rolling features:
+#        - short- and medium-horizon SPY vol
+#        - recent SPY return
+#        - SPY drawdown
+#        - cross-asset average correlation
+#   3) Cluster days into K regimes using KMeans on standardized features.
+#   4) Order regimes by volatility => 0 = calm, ..., K-1 = stressed.
+#   5) For each regime, apply different portfolio weights:
+#        - calm   → risk-on (overweight equities)
+#        - middle → balanced
+#        - stressed → risk-off (overweight bonds/gold)
+#   6) Backtest daily returns using regime_t decided from info up to t-1
+#      (no look-ahead), and evaluate performance and regime stats.
+#
+# Usage examples:
+#   python level64_regime_portfolio.py
+#   python level64_regime_portfolio.py --start 2010-01-01 --n-clusters 3
+#
+# Outputs:
+#   - level64_regime_portfolio.csv
+#   - level64_regime_portfolio_summary.json
+
+import argparse
+import json
+import math
+import os
+from dataclasses import dataclass, asdict
+from typing import Tuple, Dict
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+from sklearn.cluster import KMeans
+
+
+# ----------------------------- Config ----------------------------- #
+
+@dataclass
+class Config:
+    symbols: Tuple[str, ...] = (
+        "SPY", "QQQ", "IWM", "EFA", "EEM", "TLT", "LQD", "GLD"
+    )
+    start: str = "2010-01-01"
+
+    # Feature lookbacks
+    lookback_vol_short: int = 20
+    lookback_vol_long: int = 60
+    lookback_dd: int = 60
+    lookback_corr: int = 60
+
+    n_clusters: int = 3  # regimes
+    min_history: int = 252  # minimum days before we start using features
+
+    out_csv: str = "level64_regime_portfolio.csv"
+    out_json: str = "level64_regime_portfolio_summary.json"
+    seed: int = 42
+
+
+# ----------------------------- Data Loading ----------------------------- #
+
+def load_prices(symbols: Tuple[str, ...], start: str) -> pd.DataFrame:
+    """
+    Download daily adjusted close prices for each symbol.
+    Handles both Series and DataFrame returns from yfinance.
+    """
+    frames = []
+    for s in symbols:
+        px = yf.download(s, start=start, auto_adjust=True, progress=False)
+        if px.empty:
+            raise RuntimeError(f"No data returned for symbol {s}. Check ticker or internet.")
+        if "Close" not in px.columns:
+            raise RuntimeError(f"'Close' column missing for {s}.")
+
+        close_obj = px["Close"]
+        if isinstance(close_obj, pd.Series):
+            close = close_obj.rename(s)
+        else:
+            # DataFrame (can happen with some APIs); take first column
+            col0 = close_obj.columns[0]
+            close = pd.Series(close_obj[col0].values, index=close_obj.index, name=s)
+
+        frames.append(close)
+
+    prices = pd.concat(frames, axis=1).sort_index()
+    prices = prices.dropna(how="any")
+    return prices
+
+
+def compute_returns(prices: pd.DataFrame) -> pd.DataFrame:
+    """Daily log returns."""
+    return np.log(prices).diff().dropna()
+
+
+# ----------------------------- Feature Engineering ----------------------------- #
+
+def rolling_equity_and_dd(series: pd.Series, window: int) -> Tuple[pd.Series, pd.Series]:
+    """
+    For a single asset (e.g., SPY), compute rolling equity (starting at 1)
+    and rolling drawdown relative to rolling peak over a trailing window.
+    """
+    # Build full equity curve first
+    equity_full = (series + 1.0).cumprod()
+    roll_max = equity_full.rolling(window, min_periods=1).max()
+    dd = equity_full / roll_max - 1.0
+    return equity_full, dd
+
+
+def avg_offdiag_corr(mat: np.ndarray) -> float:
+    """
+    Average off-diagonal correlation of a correlation matrix.
+    """
+    n = mat.shape[0]
+    if n <= 1:
+        return 0.0
+    mask = ~np.eye(n, dtype=bool)
+    vals = mat[mask]
+    if vals.size == 0:
+        return 0.0
+    return float(np.nanmean(vals))
+
+
+def build_features(rets: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+    """
+    Build daily regime features from rolling windows:
+      - vol_20: 20d SPY vol (annualized)
+      - vol_60: 60d SPY vol (annualized)
+      - ret_20: 20d SPY cumulative return
+      - dd_60:  60d SPY drawdown
+      - avg_corr_60: mean pairwise corr over last 60d across all assets
+    All features aligned on the rets index and dropping leading NaNs.
+    """
+    idx = rets.index
+    spy = rets["SPY"]
+
+    # Volatilities
+    vol_20 = spy.rolling(cfg.lookback_vol_short).std(ddof=0) * math.sqrt(252.0)
+    vol_60 = spy.rolling(cfg.lookback_vol_long).std(ddof=0) * math.sqrt(252.0)
+
+    # 20-day cumulative return
+    ret_20 = spy.rolling(cfg.lookback_vol_short).sum()
+
+    # Drawdown on SPY equity
+    _, dd_60_full = rolling_equity_and_dd(spy, window=cfg.lookback_dd)
+
+    # Average correlation (60d) across the universe
+    avg_corr_list = []
+    for dt in idx:
+        window = rets.loc[:dt].tail(cfg.lookback_corr)
+        if len(window) < cfg.lookback_corr:
+            avg_corr_list.append(np.nan)
+            continue
+        corr = window.corr().values
+        avg_corr_list.append(avg_offdiag_corr(corr))
+    avg_corr_60 = pd.Series(avg_corr_list, index=idx, name="avg_corr_60")
+
+    feats = pd.DataFrame({
+        "vol_20": vol_20,
+        "vol_60": vol_60,
+        "ret_20": ret_20,
+        "dd_60": dd_60_full,
+        "avg_corr_60": avg_corr_60,
+    }, index=idx)
+
+    # Drop rows until we have enough history
+    feats = feats.dropna()
+    # Require at least min_history days before first usable feature date
+    if len(feats) == 0 or (feats.index[0] - idx[0]).days < 0:
+        pass  # nothing special needed beyond dropna
+
+    # Enforce minimum overall history
+    if len(rets.loc[:feats.index[0]]) < cfg.min_history:
+        # shift start further until min_history satisfied
+        valid_idx = feats.index
+        for dt in valid_idx:
+            if len(rets.loc[:dt]) >= cfg.min_history:
+                feats = feats.loc[dt:]
+                break
+
+    return feats
+
+
+# ----------------------------- Regime Clustering ----------------------------- #
+
+def standardize_features(feats: pd.DataFrame) -> pd.DataFrame:
+    """Z-score standardization per column, with safe handling for zero std."""
+    X = feats.copy()
+    for col in X.columns:
+        mu = float(X[col].mean())
+        sigma = float(X[col].std(ddof=0))
+        if sigma <= 0:
+            X[col] = 0.0
+        else:
+            X[col] = (X[col] - mu) / sigma
+    return X
+
+
+def cluster_regimes(feats: pd.DataFrame, cfg: Config) -> pd.Series:
+    """
+    Cluster feature rows into K regimes using KMeans.
+    Then order regimes by vol_20 (ascending) so that:
+      0 = calm, ..., K-1 = stressed.
+    Returns: regime_id Series aligned with feats.index.
+    """
+    X = standardize_features(feats)
+    km = KMeans(
+        n_clusters=cfg.n_clusters,
+        random_state=cfg.seed,
+        n_init=20,
+    )
+    labels_raw = km.fit_predict(X.values)
+    labels_raw = pd.Series(labels_raw, index=feats.index, name="regime_raw")
+
+    # Order regimes by increasing vol_20
+    vol_by_cluster = (
+        feats["vol_20"]
+        .groupby(labels_raw)
+        .mean()
+        .sort_values()
+    )
+    ordered_clusters = list(vol_by_cluster.index)  # from calm to stressed
+    mapping = {raw: i for i, raw in enumerate(ordered_clusters)}
+
+    regime_id = labels_raw.map(mapping)
+    regime_id.name = "regime_id"
+    return regime_id
+
+
+def regime_names_from_ids(regime_id: pd.Series) -> Dict[int, str]:
+    """
+    Map regime ids to human-readable names based on rank:
+      0 -> "calm"
+      1 -> "neutral"
+      2 -> "stressed"
+      ...
+      If more than 3 clusters, middle ones are numbered.
+    """
+    unique_ids = sorted(regime_id.dropna().unique())
+    names = {}
+    if len(unique_ids) == 1:
+        names[unique_ids[0]] = "single_regime"
+        return names
+
+    for i in unique_ids:
+        if i == 0:
+            names[i] = "calm"
+        elif i == max(unique_ids):
+            names[i] = "stressed"
+        elif i == 1:
+            names[i] = "neutral"
+        else:
+            names[i] = f"regime_{i}"
+    return names
+
+
+# ----------------------------- Regime-Dependent Weights ----------------------------- #
+
+def risk_on_template(symbols: Tuple[str, ...]) -> pd.Series:
+    """
+    Risk-on template: overweight equities, some bonds, a bit of gold.
+    """
+    w = pd.Series(0.0, index=list(symbols))
+    # Equities
+    w["SPY"] = 0.25
+    w["QQQ"] = 0.20
+    w["IWM"] = 0.10
+    w["EFA"] = 0.10
+    w["EEM"] = 0.05
+    # Defensives
+    w["TLT"] = 0.15
+    w["LQD"] = 0.10
+    w["GLD"] = 0.05
+    w /= w.sum()
+    return w
+
+
+def risk_off_template(symbols: Tuple[str, ...]) -> pd.Series:
+    """
+    Risk-off template: underweight equities, overweight bonds and gold.
+    """
+    w = pd.Series(0.0, index=list(symbols))
+    # Equities (small allocations)
+    w["SPY"] = 0.10
+    w["QQQ"] = 0.05
+    w["IWM"] = 0.05
+    w["EFA"] = 0.05
+    w["EEM"] = 0.05
+    # Defensives
+    w["TLT"] = 0.35
+    w["LQD"] = 0.25
+    w["GLD"] = 0.10
+    w /= w.sum()
+    return w
+
+
+def weights_for_regime(regime_id: int,
+                       n_clusters: int,
+                       symbols: Tuple[str, ...]) -> pd.Series:
+    """
+    Given an ordered regime id (0=calm ... K-1=stressed), linearly mix
+    between a risk-on and risk-off template.
+    For K=3:
+      0 => mostly risk-on
+      1 => balanced
+      2 => mostly risk-off
+    For larger K, we smoothly interpolate.
+    """
+    w_on = risk_on_template(symbols)
+    w_off = risk_off_template(symbols)
+
+    if n_clusters <= 1:
+        return w_on
+
+    # Mixing parameter: 0 -> purely risk-on, 1 -> purely risk-off
+    mix = float(regime_id) / float(max(n_clusters - 1, 1))
+
+    w = (1.0 - mix) * w_on + mix * w_off
+    w = np.maximum(w, 0.0)
+    s = float(w.sum())
+    if s <= 0:
+        w = w_on
+    else:
+        w /= s
+    return w
+
+
+# ----------------------------- Portfolio Construction ----------------------------- #
+
+def build_portfolio(rets: pd.DataFrame,
+                    feats: pd.DataFrame,
+                    regime_id: pd.Series,
+                    cfg: Config) -> Dict[str, pd.Series]:
+    """
+    Construct daily portfolio using regime-dependent weights.
+    Use regime_t based on information up to t-1 (no look-ahead).
+    """
+    # Align regime IDs with returns index
+    ret_idx = rets.index
+    reg_full = regime_id.reindex(ret_idx).ffill()
+    reg_for_ret = reg_full.shift(1)  # weight_t uses regime_{t-1}
+
+    port_ret_list = []
+    eq_list = []
+    dd_list = []
+    lev_list = []  # here leverage is always 1, but kept for consistency
+    regime_used = []
+    regime_name_list = []
+    weight_rows = []
+
+    names_map = regime_names_from_ids(regime_id)
+    eq = 1.0
+    peak = 1.0
+
+    for dt in ret_idx:
+        rid = reg_for_ret.loc[dt]
+        if np.isnan(rid):
+            # Not enough history yet; skip until we get a valid regime
+            port_ret_list.append(np.nan)
+            eq_list.append(np.nan)
+            dd_list.append(np.nan)
+            lev_list.append(1.0)
+            regime_used.append(np.nan)
+            regime_name_list.append(None)
+            weight_rows.append(pd.Series(np.nan, index=list(cfg.symbols)))
+            continue
+
+        rid_int = int(rid)
+        w_t = weights_for_regime(rid_int, cfg.n_clusters, cfg.symbols)
+
+        r_vec = rets.loc[dt, w_t.index]
+        r_p = float((w_t * r_vec).sum())
+
+        eq *= (1.0 + r_p)
+        peak = max(peak, eq)
+        dd = eq / peak - 1.0
+
+        port_ret_list.append(r_p)
+        eq_list.append(eq)
+        dd_list.append(dd)
+        lev_list.append(1.0)
+        regime_used.append(rid_int)
+        regime_name_list.append(names_map.get(rid_int, f"regime_{rid_int}"))
+        weight_rows.append(w_t)
+
+    port_ret = pd.Series(port_ret_list, index=ret_idx, name="ret_port")
+    equity = pd.Series(eq_list, index=ret_idx, name="equity")
+    drawdown = pd.Series(dd_list, index=ret_idx, name="drawdown")
+    leverage = pd.Series(lev_list, index=ret_idx, name="leverage")
+    regime_used = pd.Series(regime_used, index=ret_idx, name="regime_id_used")
+    regime_name_used = pd.Series(regime_name_list, index=ret_idx, name="regime_name")
+
+    W_daily = pd.DataFrame(weight_rows, index=ret_idx)
+    W_daily.columns = [f"w_{s}" for s in cfg.symbols]
+
+    return {
+        "ret_port": port_ret,
+        "equity": equity,
+        "drawdown": drawdown,
+        "leverage": leverage,
+        "regime_id_used": regime_used,
+        "regime_name": regime_name_used,
+        "weights": W_daily,
+    }
+
+
+# ----------------------------- Metrics & I/O ----------------------------- #
+
+def summary_stats(rets: pd.Series) -> Dict[str, float]:
+    """Annualized performance stats (no RF)."""
+    rets = rets.dropna()
+    if len(rets) == 0:
+        return {"ann_ret": 0.0, "ann_vol": 0.0, "sharpe": 0.0}
+
+    mu_daily = float(rets.mean())
+    vol_daily = float(rets.std(ddof=0))
+    ann_ret = (1.0 + mu_daily) ** 252 - 1.0
+    ann_vol = vol_daily * math.sqrt(252.0)
+    sharpe = ann_ret / ann_vol if ann_vol > 0 else 0.0
+    return {"ann_ret": ann_ret, "ann_vol": ann_vol, "sharpe": sharpe}
+
+
+def regime_stats(port_rets: pd.Series,
+                 regime_used: pd.Series) -> Dict[str, Dict[str, float]]:
+    """
+    Stats per regime (based on the regime actually used for each day).
+    """
+    stats = {}
+    common_idx = port_rets.index.intersection(regime_used.index)
+    r = port_rets.loc[common_idx].dropna()
+    reg = regime_used.loc[r.index].dropna()
+    if len(r) == 0:
+        return stats
+
+    for rid in sorted(reg.dropna().unique()):
+        mask = reg == rid
+        r_sub = r[mask]
+        label = f"regime_{int(rid)}"
+        stats[label] = summary_stats(r_sub)
+        stats[label]["days"] = int(mask.sum())
+    return stats
+
+
+def save_outputs(df: pd.DataFrame,
+                 stats_all: Dict[str, float],
+                 max_dd: float,
+                 reg_stats: Dict[str, Dict[str, float]],
+                 cfg: Config) -> None:
+    os.makedirs(os.path.dirname(cfg.out_csv) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(cfg.out_json) or ".", exist_ok=True)
+
+    df.to_csv(cfg.out_csv, index=True, date_format="%Y-%m-%d")
+    print(f"[OK] Saved daily series → {cfg.out_csv}")
+
+    summary = {
+        "config": asdict(cfg),
+        "portfolio": {
+            "ann_ret": stats_all["ann_ret"],
+            "ann_vol": stats_all["ann_vol"],
+            "sharpe": stats_all["sharpe"],
+            "max_drawdown": max_dd,
+        },
+        "by_regime": reg_stats,
+    }
+
+    with open(cfg.out_json, "w") as f:
+        json.dump(summary, f, indent=2)
+    print(f"[OK] Saved summary → {cfg.out_json}")
+
+    print(
+        "Portfolio: AnnRet={:.2%}, AnnVol={:.2%}, Sharpe={:.2f}, MaxDD={:.2%}".format(
+            summary["portfolio"]["ann_ret"],
+            summary["portfolio"]["ann_vol"],
+            summary["portfolio"]["sharpe"],
+            summary["portfolio"]["max_drawdown"],
+        )
+    )
+
+
+# ----------------------------- Pipeline ----------------------------- #
+
+def run_pipeline(cfg: Config) -> None:
+    np.random.seed(cfg.seed)
+
+    print(f"[INFO] Downloading prices for {cfg.symbols} from {cfg.start} ...")
+    prices = load_prices(cfg.symbols, cfg.start)
+    rets = compute_returns(prices)
+    print(f"[INFO] Got {len(prices)} price rows, {len(rets)} return rows.")
+
+    # 1) Features and regimes
+    feats = build_features(rets, cfg)
+    print(f"[INFO] Built features from {feats.index.min().date()} to {feats.index.max().date()} "
+          f"(n={len(feats)})")
+    regime_id = cluster_regimes(feats, cfg)
+    names_map = regime_names_from_ids(regime_id)
+    print("[INFO] Regimes discovered:")
+    for k in sorted(names_map):
+        print(f"  Regime {k}: {names_map[k]}")
+
+    # 2) Build portfolio using regime-dependent weights
+    port = build_portfolio(rets, feats, regime_id, cfg)
+    ret_port = port["ret_port"]
+    eq = port["equity"]
+    dd = port["drawdown"]
+
+    # 3) Stats
+    stats_all = summary_stats(ret_port)
+    max_dd = float(dd.min(skipna=True)) if len(dd) else 0.0
+    reg_stats = regime_stats(ret_port, port["regime_id_used"])
+
+    # 4) Assemble output DataFrame
+    out_idx = rets.index
+    out = pd.DataFrame(index=out_idx)
+    out[prices.columns] = prices.reindex(out_idx)
+    out[[f"ret_{c}" for c in rets.columns]] = rets.add_prefix("ret_")
+    # Features aligned / ffilled
+    feats_aligned = feats.reindex(out_idx).ffill()
+    for col in feats_aligned.columns:
+        out[col] = feats_aligned[col]
+    out["regime_id"] = regime_id.reindex(out_idx)
+    out["regime_name"] = port["regime_name"]
+    out[port["weights"].columns] = port["weights"]
+    out["ret_port"] = ret_port
+    out["equity"] = eq
+    out["drawdown"] = dd
+    out["leverage"] = port["leverage"]
+
+    save_outputs(out, stats_all, max_dd, reg_stats, cfg)
+
+
+# ----------------------------- CLI ----------------------------- #
+
+def parse_args() -> Config:
+    p = argparse.ArgumentParser(
+        description="Level-64: KMeans regime clustering + regime-dependent multi-asset portfolio"
+    )
+    p.add_argument("--start", type=str, default="2010-01-01")
+    p.add_argument("--n-clusters", type=int, default=3)
+    p.add_argument("--min-history", type=int, default=252)
+    p.add_argument("--csv", type=str, default="level64_regime_portfolio.csv")
+    p.add_argument("--json", type=str, default="level64_regime_portfolio_summary.json")
+    p.add_argument("--seed", type=int, default=42)
+    a = p.parse_args()
+
+    return Config(
+        start=a.start,
+        n_clusters=a.n_clusters,
+        min_history=a.min_history,
+        out_csv=a.csv,
+        out_json=a.json,
+        seed=a.seed,
+    )
+
+
+def main() -> None:
+    cfg = parse_args()
+    run_pipeline(cfg)
+
+
+if __name__ == "__main__":
+    # Jupyter / IPython shim to strip kernel args like "-f kernel-xxxx.json"
+    import sys
+
+    sys.argv = [sys.argv[0]] + [
+        arg
+        for arg in sys.argv[1:]
+        if arg != "-f" and not (arg.endswith(".json") and "kernel" in arg)
+    ]
+    main()
+```
+
+Run it and send me the tail of the console output (especially the final `Portfolio: AnnRet=...` line and the `[INFO] Regimes discovered]` block), and we’ll check if the regimes look sensible (e.g., stressed regime having highest vol and worst per-regime stats).

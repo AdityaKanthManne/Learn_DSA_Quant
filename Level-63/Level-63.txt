@@ -1,0 +1,540 @@
+Perfect, Level-63 time 🚀
+This one is:
+
+> **Dynamic Drawdown-Aware Leverage Overlay on the Shrinkage Risk-Parity Portfolio**
+
+Same universe as Level-62, same shrinkage + RP core, but now we **scale exposure up/down** based on:
+
+* Realized volatility (vol targeting), and
+* Current drawdown (risk brake when underwater).
+
+Below is the **full, drop-in script** (plain ASCII, PyCharm/Jupyter ready).
+
+---
+
+```python
+# level63_dd_aware_leverage.py
+#
+# Level-63: Dynamic Drawdown-Aware Leverage Overlay
+#
+# Core idea:
+#   1) Build a shrinkage-based covariance matrix on rolling windows.
+#   2) Compute risk-parity + min-var blended weights for a multi-asset universe.
+#   3) Backtest a baseline (unlevered) portfolio.
+#   4) Apply a dynamic leverage overlay:
+#        - Vol targeting: scale exposure so that realized vol is near target_vol.
+#        - Drawdown brake: reduce leverage when drawdown exceeds thresholds.
+#
+# Universe: ("SPY", "QQQ", "IWM", "EFA", "EEM", "TLT", "LQD", "GLD")
+# Data: yfinance daily, auto-adjusted close.
+#
+# Example usage (from terminal or PyCharm "Run"):
+#   python level63_dd_aware_leverage.py
+#   python level63_dd_aware_leverage.py --start 2010-01-01 --target-vol 0.12
+#
+# Outputs:
+#   - level63_dd_leverage_series.csv  : daily prices, returns, weights, leverage, equity curves
+#   - level63_dd_leverage_summary.json: summary stats for base vs leveraged portfolio
+
+import argparse
+import json
+import math
+import os
+from dataclasses import dataclass, asdict
+from typing import Tuple, Dict
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+
+
+# ------------------------- Config ------------------------- #
+
+@dataclass
+class Config:
+    symbols: Tuple[str, ...] = (
+        "SPY", "QQQ", "IWM", "EFA", "EEM", "TLT", "LQD", "GLD"
+    )
+    start: str = "2010-01-01"
+    rebalance_freq: str = "ME"          # month-end
+    cov_lookback: int = 252            # trading days for covariance
+    min_hist: int = 252                # minimum history before first weight
+    shrink_alpha: float = 0.30         # 0=no shrink; 1=diagonal only
+    alpha_minvar: float = 0.30         # blend: w = (1-a)*RP + a*MinVar
+
+    # Vol-target + drawdown overlay
+    vol_lookback: int = 60             # days for realized vol estimate
+    target_vol: float = 0.12           # annual vol target (e.g. 12%)
+    lev_min: float = 0.3               # minimum leverage
+    lev_max: float = 2.0               # maximum leverage
+
+    dd_threshold1: float = 0.10        # drawdown level 1 (10%)
+    dd_threshold2: float = 0.25        # drawdown level 2 (25%)
+    dd_min_scale: float = 0.3          # when dd >= dd_threshold2
+
+    out_csv: str = "level63_dd_leverage_series.csv"
+    out_json: str = "level63_dd_leverage_summary.json"
+    seed: int = 42                     # for reproducibility (not heavily used)
+
+
+# ------------------------- Data Loading ------------------------- #
+
+def load_prices(symbols: Tuple[str, ...], start: str) -> pd.DataFrame:
+    """Download daily close prices per symbol as a clean wide DataFrame."""
+    frames = []
+    for s in symbols:
+        px = yf.download(s, start=start, auto_adjust=True, progress=False)
+        if px.empty:
+            raise RuntimeError(f"No data returned for symbol {s}. Check ticker or internet.")
+        if "Close" not in px.columns:
+            raise RuntimeError(f"'Close' column missing for {s}.")
+        close = px["Close"].rename(s)
+        frames.append(close)
+
+    prices = pd.concat(frames, axis=1).sort_index()
+    prices = prices.dropna(how="any")  # require all assets present each day
+    return prices
+
+
+def compute_returns(prices: pd.DataFrame) -> pd.DataFrame:
+    """Log returns for each asset."""
+    return np.log(prices).diff().dropna()
+
+
+# ------------------------- Covariance & Weights ------------------------- #
+
+def shrinkage_cov(rets: pd.DataFrame, alpha: float) -> pd.DataFrame:
+    """
+    Simple shrinkage towards diagonal:
+        Sigma_shrunk = (1-alpha)*Sigma + alpha*diag(Sigma)
+    """
+    sigma = rets.cov()
+    if alpha <= 0.0:
+        return sigma
+    diag_vals = np.diag(np.diag(sigma.values))
+    prior = pd.DataFrame(diag_vals, index=sigma.index, columns=sigma.columns)
+    shrunk = (1.0 - alpha) * sigma + alpha * prior
+    return shrunk
+
+
+def risk_parity_weights(cov: pd.DataFrame,
+                        max_iter: int = 1000,
+                        tol: float = 1e-8) -> pd.Series:
+    """
+    Approximate equal risk contribution (risk parity) weights.
+    """
+    assets = list(cov.index)
+    n = len(assets)
+    C = cov.values
+    w = np.ones(n) / n
+    b = np.ones(n) / n  # equal risk budgets
+
+    for _ in range(max_iter):
+        port_var = float(w @ C @ w)
+        if port_var <= 0:
+            break
+        mrc = C @ w                  # marginal risk contributions
+        rc = w * mrc                 # component risk contributions
+        target_rc = b * port_var
+        diff = rc - target_rc
+        if np.max(np.abs(diff)) < tol:
+            break
+        # multiplicative update, avoid division by zero
+        w *= target_rc / (rc + 1e-12)
+        w = np.maximum(w, 0.0)
+        s = w.sum()
+        if s <= 0:
+            w = np.ones(n) / n
+        else:
+            w /= s
+
+    return pd.Series(w, index=assets, name="w_rp")
+
+
+def minvar_weights(cov: pd.DataFrame) -> pd.Series:
+    """
+    Minimum variance weights under sum=1, w>=0, using pseudo-inverse (no constraints).
+    Negative weights are floored and re-normalized.
+    """
+    assets = list(cov.index)
+    C = cov.values
+    n = len(assets)
+    inv = np.linalg.pinv(C)
+    ones = np.ones((n, 1))
+    raw = inv @ ones
+    w = raw[:, 0]
+    w = np.maximum(w, 0.0)
+    s = w.sum()
+    if s <= 0:
+        w = np.ones(n) / n
+    else:
+        w /= s
+    return pd.Series(w, index=assets, name="w_minvar")
+
+
+def build_rebalance_schedule(rets: pd.DataFrame, cfg: Config) -> pd.DatetimeIndex:
+    """
+    Rebalance at freq (month-end by default).
+    """
+    freq = cfg.rebalance_freq
+    # Backwards-compat shim: treat "M" as "ME"
+    if freq.upper() == "M":
+        freq = "ME"
+
+    idx = rets.resample(freq).last().index
+    idx = idx[idx >= rets.index[0]]
+    return idx
+
+
+def compute_weight_path(rets: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+    """
+    For each rebalance date, estimate covariance on trailing window,
+    compute RP and MinVar weights, and blend.
+    Returns a DataFrame of weights indexed by rebalance dates.
+    """
+    rebals = build_rebalance_schedule(rets, cfg)
+    weight_rows = []
+
+    for dt in rebals:
+        hist = rets.loc[:dt].tail(cfg.cov_lookback)
+        if len(hist) < cfg.min_hist:
+            continue
+
+        cov = shrinkage_cov(hist, cfg.shrink_alpha)
+        w_rp = risk_parity_weights(cov)
+        w_mv = minvar_weights(cov)
+        w_mix = (1.0 - cfg.alpha_minvar) * w_rp + cfg.alpha_minvar * w_mv
+        # Clean and normalize
+        w_mix = np.maximum(w_mix, 0.0)
+        s = float(w_mix.sum())
+        if s > 0:
+            w_mix /= s
+        w_mix.name = dt
+        weight_rows.append(w_mix)
+
+    if not weight_rows:
+        raise RuntimeError("No weights computed. Check start date and cov_lookback/min_hist.")
+    W = pd.DataFrame(weight_rows)
+    return W
+
+
+def expand_weights_to_daily(W: pd.DataFrame, rets: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Forward-fill rebalance weights to daily frequency.
+    Aligns returns to the same index.
+    """
+    W_daily = W.reindex(rets.index, method="ffill")
+    # Drop any leading rows before first weight
+    first_valid = W_daily.dropna(how="all").index[0]
+    W_daily = W_daily.loc[first_valid:]
+    rets_aligned = rets.loc[W_daily.index]
+    return W_daily, rets_aligned
+
+
+# ------------------------- Portfolio & Overlay ------------------------- #
+
+def portfolio_returns(weights: pd.DataFrame, rets: pd.DataFrame) -> pd.Series:
+    """Daily portfolio returns from weights and asset returns."""
+    # Ensure aligned columns
+    cols = [c for c in weights.columns if c in rets.columns]
+    W = weights[cols]
+    R = rets[cols]
+    port_ret = (W * R).sum(axis=1)
+    port_ret.name = "ret_port_base"
+    return port_ret
+
+
+def equity_curve(rets: pd.Series, start_equity: float = 1.0) -> pd.Series:
+    """Equity curve from returns."""
+    eq = (rets + 1.0).cumprod() * float(start_equity)
+    eq.name = "equity"
+    return eq
+
+
+def drawdown_series(eq: pd.Series) -> Tuple[pd.Series, float]:
+    """Drawdown time series and max drawdown."""
+    roll_max = eq.cummax()
+    dd = eq / roll_max - 1.0
+    dd.name = "drawdown"
+    max_dd = float(dd.min())
+    return dd, max_dd
+
+
+def realized_vol_annual(rets: pd.Series, lookback: int) -> pd.Series:
+    """
+    Rolling realized annualized volatility using a simple window std.
+    """
+    vol_daily = rets.rolling(lookback).std(ddof=0)
+    vol_ann = vol_daily * math.sqrt(252.0)
+    vol_ann.name = "vol_ann"
+    return vol_ann
+
+
+def dd_scale_factor(dd: float,
+                    dd1: float,
+                    dd2: float,
+                    min_scale: float) -> float:
+    """
+    Piecewise-linear drawdown scaling:
+      - dd <= dd1         -> scale = 1
+      - dd >= dd2         -> scale = min_scale
+      - dd1 < dd < dd2    -> linear between 1 and min_scale
+    dd is a positive number like 0.12 for 12% drawdown.
+    """
+    if dd <= dd1:
+        return 1.0
+    if dd >= dd2:
+        return min_scale
+    # linear interpolation between dd1 and dd2
+    frac = (dd2 - dd) / max(dd2 - dd1, 1e-8)
+    return min_scale + (1.0 - min_scale) * frac
+
+
+def apply_dynamic_leverage(port_ret: pd.Series, cfg: Config) -> Dict[str, pd.Series]:
+    """
+    Apply leverage L_t = L_vol_t * f(drawdown_t) sequentially.
+    - L_vol_t from vol targeting.
+    - f(drawdown_t) from dd_scale_factor.
+    Returns leveraged returns, equity, leverage series, drawdown, and maximum drawdown.
+    """
+    # Vol-target component, based on unlevered returns
+    vol_ann = realized_vol_annual(port_ret, cfg.vol_lookback)
+    lev_vol = cfg.target_vol / vol_ann
+    # Bound, and handle early NaNs
+    lev_vol = lev_vol.clip(lower=cfg.lev_min, upper=cfg.lev_max)
+    lev_vol = lev_vol.replace([np.inf, -np.inf], np.nan).fillna(1.0)
+
+    lev_series = []
+    ret_lev = []
+    eq_series = []
+
+    eq = 1.0
+    peak = 1.0
+
+    for dt, r in port_ret.items():
+        # current drawdown from equity path so far
+        dd = (peak - eq) / peak if peak > 0 else 0.0
+        dd_factor = dd_scale_factor(dd, cfg.dd_threshold1, cfg.dd_threshold2, cfg.dd_min_scale)
+
+        L_vol = float(lev_vol.loc[dt]) if dt in lev_vol.index else 1.0
+        L = L_vol * dd_factor
+        L = max(cfg.lev_min, min(cfg.lev_max, L))
+
+        r_lev = L * float(r)
+        eq *= (1.0 + r_lev)
+        peak = max(peak, eq)
+
+        lev_series.append(L)
+        ret_lev.append(r_lev)
+        eq_series.append(eq)
+
+    idx = port_ret.index
+    lev_series = pd.Series(lev_series, index=idx, name="leverage")
+    ret_lev = pd.Series(ret_lev, index=idx, name="ret_port_dyn")
+    eq_series = pd.Series(eq_series, index=idx, name="equity_dyn")
+
+    dd_dyn, max_dd_dyn = drawdown_series(eq_series)
+
+    return {
+        "lev": lev_series,
+        "ret_dyn": ret_lev,
+        "eq_dyn": eq_series,
+        "dd_dyn": dd_dyn,
+        "max_dd_dyn": max_dd_dyn,
+    }
+
+
+# ------------------------- Metrics & I/O ------------------------- #
+
+def summary_stats(rets: pd.Series) -> Dict[str, float]:
+    """Simple annualized performance stats (no RF)."""
+    if len(rets) == 0:
+        return {"ann_ret": 0.0, "ann_vol": 0.0, "sharpe": 0.0}
+
+    mu_daily = float(rets.mean())
+    vol_daily = float(rets.std(ddof=0))
+    ann_ret = (1.0 + mu_daily) ** 252 - 1.0
+    ann_vol = vol_daily * math.sqrt(252.0)
+    sharpe = 0.0
+    if ann_vol > 0:
+        sharpe = ann_ret / ann_vol
+    return {
+        "ann_ret": ann_ret,
+        "ann_vol": ann_vol,
+        "sharpe": sharpe,
+    }
+
+
+def save_outputs(df: pd.DataFrame,
+                 base_stats: Dict[str, float],
+                 base_dd: float,
+                 dyn_stats: Dict[str, float],
+                 dyn_dd: float,
+                 cfg: Config) -> None:
+    os.makedirs(os.path.dirname(cfg.out_csv) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(cfg.out_json) or ".", exist_ok=True)
+
+    df.to_csv(cfg.out_csv, index=True, date_format="%Y-%m-%d")
+    print(f"[OK] Saved daily series → {cfg.out_csv}")
+
+    summary = {
+        "config": asdict(cfg),
+        "base": {
+            "ann_ret": base_stats["ann_ret"],
+            "ann_vol": base_stats["ann_vol"],
+            "sharpe": base_stats["sharpe"],
+            "max_drawdown": base_dd,
+        },
+        "dynamic": {
+            "ann_ret": dyn_stats["ann_ret"],
+            "ann_vol": dyn_stats["ann_vol"],
+            "sharpe": dyn_stats["sharpe"],
+            "max_drawdown": dyn_dd,
+        },
+    }
+    with open(cfg.out_json, "w") as f:
+        json.dump(summary, f, indent=2)
+    print(f"[OK] Saved summary → {cfg.out_json}")
+
+    print(
+        "Base   : AnnRet={:.2%}, AnnVol={:.2%}, Sharpe={:.2f}, MaxDD={:.2%}".format(
+            summary["base"]["ann_ret"],
+            summary["base"]["ann_vol"],
+            summary["base"]["sharpe"],
+            summary["base"]["max_drawdown"],
+        )
+    )
+    print(
+        "Dynamic: AnnRet={:.2%}, AnnVol={:.2%}, Sharpe={:.2f}, MaxDD={:.2%}".format(
+            summary["dynamic"]["ann_ret"],
+            summary["dynamic"]["ann_vol"],
+            summary["dynamic"]["sharpe"],
+            summary["dynamic"]["max_drawdown"],
+        )
+    )
+
+
+# ------------------------- Pipeline ------------------------- #
+
+def run_pipeline(cfg: Config) -> None:
+    np.random.seed(cfg.seed)
+
+    print(f"[INFO] Downloading prices for {cfg.symbols} from {cfg.start} ...")
+    prices = load_prices(cfg.symbols, cfg.start)
+    rets = compute_returns(prices)
+    print(f"[INFO] Got {len(prices)} price rows, {len(rets)} return rows.")
+
+    # 1) Compute rebalance weights (shrinkage + risk parity + min-var blend)
+    W_reb = compute_weight_path(rets, cfg)
+
+    # 2) Expand to daily weights and align returns
+    W_daily, rets_aligned = expand_weights_to_daily(W_reb, rets)
+
+    # 3) Baseline (unlevered) portfolio
+    port_ret_base = portfolio_returns(W_daily, rets_aligned)
+    eq_base = equity_curve(port_ret_base, start_equity=1.0)
+    dd_base, max_dd_base = drawdown_series(eq_base)
+    stats_base = summary_stats(port_ret_base)
+
+    # 4) Dynamic leverage overlay
+    dyn = apply_dynamic_leverage(port_ret_base, cfg)
+    port_ret_dyn = dyn["ret_dyn"]
+    eq_dyn = dyn["eq_dyn"]
+    dd_dyn = dyn["dd_dyn"]
+    max_dd_dyn = dyn["max_dd_dyn"]
+    stats_dyn = summary_stats(port_ret_dyn)
+
+    # 5) Assemble output DataFrame
+    out = pd.DataFrame(index=rets_aligned.index)
+    # Prices and returns
+    out[prices.columns] = prices.reindex(out.index)
+    out[[f"ret_{c}" for c in rets_aligned.columns]] = rets_aligned.add_prefix("ret_")
+    # Weights
+    out[[f"w_{c}" for c in W_daily.columns]] = W_daily.add_prefix("w_")
+    # Base portfolio
+    out["ret_port_base"] = port_ret_base
+    out["equity_base"] = eq_base
+    out["dd_base"] = dd_base
+    # Dynamic overlay
+    out["leverage"] = dyn["lev"]
+    out["ret_port_dyn"] = port_ret_dyn
+    out["equity_dyn"] = eq_dyn
+    out["dd_dyn"] = dd_dyn
+
+    save_outputs(out, stats_base, max_dd_base, stats_dyn, max_dd_dyn, cfg)
+
+
+# ------------------------- CLI ------------------------- #
+
+def parse_args() -> Config:
+    p = argparse.ArgumentParser(description="Level-63: Drawdown-aware leverage on shrinkage risk-parity portfolio")
+    p.add_argument("--start", type=str, default="2010-01-01", help="Start date for history (YYYY-MM-DD)")
+    p.add_argument("--rebalance-freq", type=str, default="ME", help="Pandas offset alias, e.g. ME for month-end")
+    p.add_argument("--cov-lookback", type=int, default=252)
+    p.add_argument("--min-hist", type=int, default=252)
+    p.add_argument("--shrink-alpha", type=float, default=0.30)
+    p.add_argument("--alpha-minvar", type=float, default=0.30)
+
+    p.add_argument("--vol-lookback", type=int, default=60)
+    p.add_argument("--target-vol", type=float, default=0.12)
+    p.add_argument("--lev-min", type=float, default=0.3)
+    p.add_argument("--lev-max", type=float, default=2.0)
+
+    p.add_argument("--dd-threshold1", type=float, default=0.10)
+    p.add_argument("--dd-threshold2", type=float, default=0.25)
+    p.add_argument("--dd-min-scale", type=float, default=0.3)
+
+    p.add_argument("--csv", type=str, default="level63_dd_leverage_series.csv")
+    p.add_argument("--json", type=str, default="level63_dd_leverage_summary.json")
+    p.add_argument("--seed", type=int, default=42)
+
+    a = p.parse_args()
+
+    return Config(
+        start=a.start,
+        rebalance_freq=a.rebalance_freq,
+        cov_lookback=a.cov_lookback,
+        min_hist=a.min_hist,
+        shrink_alpha=a.shrink_alpha,
+        alpha_minvar=a.alpha_minvar,
+        vol_lookback=a.vol_lookback,
+        target_vol=a.target_vol,
+        lev_min=a.lev_min,
+        lev_max=a.lev_max,
+        dd_threshold1=a.dd_threshold1,
+        dd_threshold2=a.dd_threshold2,
+        dd_min_scale=a.dd_min_scale,
+        out_csv=a.csv,
+        out_json=a.json,
+        seed=a.seed,
+    )
+
+
+def main() -> None:
+    cfg = parse_args()
+    run_pipeline(cfg)
+
+
+if __name__ == "__main__":
+    # Jupyter / IPython shim to ignore "-f" kernel args
+    import sys
+
+    sys.argv = [sys.argv[0]] + [
+        arg for arg in sys.argv[1:]
+        if arg != "-f" and not (arg.endswith(".json") and "kernel" in arg)
+    ]
+    main()
+```
+
+You can drop this into `level63_dd_aware_leverage.py` (or any filename), run it in PyCharm, and you should get:
+
+* `level63_dd_leverage_series.csv`
+* `level63_dd_leverage_summary.json`
+
+If you want the overlay to be more aggressive or conservative, the main knobs to play with are:
+
+* `target_vol`
+* `lev_min`, `lev_max`
+* `dd_threshold1`, `dd_threshold2`, `dd_min_scale`
+
+If you paste this in and hit any error, send me the traceback and the exact code block you used and we’ll patch it.
