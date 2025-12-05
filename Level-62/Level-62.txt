@@ -1,0 +1,480 @@
+Let’s keep climbing the ladder. Here’s **Level-62**: a **Shrinkage Minimum-Variance + Risk-Parity Blended Portfolio** with volatility targeting, using free `yfinance` data.
+
+* Universe: `SPY, QQQ, IWM, EFA, EEM, TLT, LQD, GLD`
+* At each rebalance:
+
+  * Estimate **Ledoit–Wolf shrinkage covariance**.
+  * Compute **inverse-vol risk-parity weights**.
+  * Compute **minimum-variance weights** from the shrinkage covariance.
+  * Measure average pairwise correlation; when correlations are high, lean more toward min-var; when low, lean more toward risk-parity.
+  * Scale to hit a **target vol** with **max leverage cap**.
+* Includes transaction costs and summary JSON.
+
+Paste this as `level62_shrinkage_riskparity.py` (or into a Jupyter cell).
+
+```python
+# level62_shrinkage_riskparity.py
+# Level-62: Shrinkage Min-Var + Risk-Parity Blended Portfolio (with vol targeting)
+#
+# Idea:
+#   - Multi-asset ETF universe (SPY, QQQ, IWM, EFA, EEM, TLT, LQD, GLD).
+#   - Use Ledoit–Wolf shrinkage covariance on a rolling window.
+#   - Build:
+#       * Risk-parity (inverse-vol) weights.
+#       * Minimum-variance weights from shrinkage covariance.
+#   - Blend the two based on average pairwise correlation:
+#       * Low correlation → tilt toward risk-parity.
+#       * High correlation → tilt toward min-var.
+#   - Scale the blended weights to reach a target annualized volatility
+#     with a leverage cap, and include a simple transaction cost model.
+#
+# Outputs:
+#   - level62_shrinkage_riskparity.csv
+#   - level62_shrinkage_riskparity_summary.json
+#
+# Requirements:
+#   - numpy, pandas, yfinance, scikit-learn
+
+import argparse
+import json
+from dataclasses import dataclass, asdict
+from typing import Tuple
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+from sklearn.covariance import LedoitWolf
+
+
+# ----------------------------- Config -----------------------------
+
+
+@dataclass
+class Config:
+    symbols: Tuple[str, ...] = (
+        "SPY", "QQQ", "IWM", "EFA", "EEM", "TLT", "LQD", "GLD"
+    )
+    start: str = "2010-01-01"
+    vol_lookback: int = 60       # days used for cov/vol estimation
+    rebalance_freq: str = "M"    # "M" (month-end), "W-FRI", etc.
+    vol_target: float = 0.10     # target annualized volatility
+    max_leverage: float = 2.0    # cap on leverage multiplier
+    corr_min: float = 0.1        # corr below this → almost all risk-parity
+    corr_max: float = 0.8        # corr above this → almost all min-var
+    tc_bps: float = 10.0         # round-trip transaction cost in bps
+    out_csv: str = "level62_shrinkage_riskparity.csv"
+    out_json: str = "level62_shrinkage_riskparity_summary.json"
+    seed: int = 42
+
+
+# ----------------------------- Data Loading -----------------------------
+
+
+def load_prices(cfg: Config) -> pd.DataFrame:
+    tickers = list(cfg.symbols)
+    px = yf.download(
+        tickers,
+        start=cfg.start,
+        auto_adjust=True,
+        progress=False,
+    )
+    if px.empty:
+        raise RuntimeError("No data downloaded. Check tickers or connection.")
+
+    if isinstance(px.columns, pd.MultiIndex):
+        if "Close" not in px.columns.levels[0]:
+            raise RuntimeError("Expected 'Close' in yfinance output.")
+        close = px["Close"].copy()
+    else:
+        close = px[["Close"]].copy()
+        close.columns = tickers[:1]
+
+    close = close.dropna(how="all")
+    close = close[tickers].dropna(how="any")
+    return close
+
+
+def compute_returns(close: pd.DataFrame) -> pd.DataFrame:
+    return close.pct_change().dropna()
+
+
+# ----------------------------- Helpers -----------------------------
+
+
+def annualize_vol(daily_vol: float) -> float:
+    return float(daily_vol * np.sqrt(252.0))
+
+
+def portfolio_vol(weights: np.ndarray, cov: np.ndarray) -> float:
+    return float(np.sqrt(weights @ cov @ weights))
+
+
+def inverse_vol_weights(vol_vec: pd.Series) -> pd.Series:
+    vol_vec = vol_vec.replace(0.0, np.nan)
+    inv = 1.0 / vol_vec
+    inv = inv.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    if inv.sum() <= 0:
+        return pd.Series(1.0 / len(inv), index=inv.index)
+    w = inv / inv.sum()
+    return w
+
+
+def min_var_weights_shrinkage(
+    window: pd.DataFrame,
+) -> pd.Series:
+    """
+    Minimum-variance weights using Ledoit–Wolf covariance, with a simple
+    long-only heuristic: start from w ~ Σ^{-1} 1, clip negatives to zero,
+    renormalize. If all zero, fall back to equal weights.
+    """
+    cols = window.columns
+    lw = LedoitWolf()
+    lw.fit(window.values)
+    cov = lw.covariance_
+    ones = np.ones(len(cols))
+
+    try:
+        inv_cov = np.linalg.inv(cov)
+    except np.linalg.LinAlgError:
+        # Fallback to diagonal if inversion fails
+        diag = np.diag(np.diag(cov))
+        inv_cov = np.linalg.inv(diag)
+
+    raw = inv_cov @ ones
+    if raw.sum() == 0:
+        w = np.ones_like(raw) / len(raw)
+    else:
+        w = raw / raw.sum()
+
+    # long-only heuristic
+    w = np.where(w < 0.0, 0.0, w)
+    s = w.sum()
+    if s <= 0.0:
+        w = np.ones_like(w) / len(w)
+    else:
+        w = w / s
+
+    return pd.Series(w, index=cols)
+
+
+def average_offdiag_corr(window: pd.DataFrame) -> float:
+    corr = window.corr()
+    n = corr.shape[0]
+    if n <= 1:
+        return 0.0
+    mask = ~np.eye(n, dtype=bool)
+    vals = corr.values[mask]
+    vals = vals[~np.isnan(vals)]
+    if vals.size == 0:
+        return 0.0
+    return float(vals.mean())
+
+
+def blend_weight(alpha: float, w_rp: pd.Series, w_mv: pd.Series) -> pd.Series:
+    w = (1.0 - alpha) * w_rp + alpha * w_mv
+    s = float(w.sum())
+    if s != 0.0:
+        w = w / s
+    return w
+
+
+def map_corr_to_alpha(corr: float, cmin: float, cmax: float) -> float:
+    """
+    Map average correlation into [0, 1] for blending:
+      corr <= cmin → alpha = 0 (all risk-parity)
+      corr >= cmax → alpha = 1 (all min-var)
+      linear in-between
+    """
+    if corr <= cmin:
+        return 0.0
+    if corr >= cmax:
+        return 1.0
+    return float((corr - cmin) / (cmax - cmin))
+
+
+# ----------------------------- Rebalance Schedule -----------------------------
+
+
+def build_rebalance_schedule(rets: pd.DataFrame, cfg: Config) -> pd.DatetimeIndex:
+    if cfg.rebalance_freq.upper().startswith("M"):
+        idx = rets.resample("M").last().index
+    else:
+        idx = rets.resample(cfg.rebalance_freq).last().index
+    idx = idx[idx >= rets.index[0]]
+    return idx
+
+
+# ----------------------------- Weight Construction -----------------------------
+
+
+def compute_weights(rets: pd.DataFrame, cfg: Config):
+    rebal_dates = build_rebalance_schedule(rets, cfg)
+    all_dates = rets.index
+
+    weight_records = []
+
+    for dt in rebal_dates:
+        window = rets.loc[:dt].tail(cfg.vol_lookback)
+        if window.shape[0] < cfg.vol_lookback // 2:
+            continue
+
+        vol_daily = window.std()
+        vol_ann = vol_daily * np.sqrt(252.0)
+
+        w_rp = inverse_vol_weights(vol_ann)
+        w_rp = w_rp.reindex(rets.columns).fillna(0.0)
+
+        w_mv = min_var_weights_shrinkage(window)
+        w_mv = w_mv.reindex(rets.columns).fillna(0.0)
+
+        avg_corr = average_offdiag_corr(window)
+        alpha = map_corr_to_alpha(avg_corr, cfg.corr_min, cfg.corr_max)
+
+        w_blend = blend_weight(alpha, w_rp, w_mv)
+
+        # Vol targeting via leverage
+        lw = LedoitWolf()
+        lw.fit(window.values)
+        cov_ann = lw.covariance_ * 252.0
+        w_vec = w_blend.values
+        try:
+            port_vol = portfolio_vol(w_vec, cov_ann)
+        except Exception:
+            port_vol = 0.0
+
+        if port_vol > 0:
+            lev = cfg.vol_target / port_vol
+        else:
+            lev = 0.0
+        lev = float(min(cfg.max_leverage, max(0.0, lev)))
+
+        w_final = w_blend * lev
+
+        rec = {
+            "date": dt,
+            "avg_corr": float(avg_corr),
+            "alpha_minvar": float(alpha),
+            "port_vol_ann_pre_scale": float(port_vol),
+            "leverage": float(lev),
+        }
+        for col in rets.columns:
+            rec[f"w_{col}"] = float(w_final.get(col, 0.0))
+
+        weight_records.append(rec)
+
+    if not weight_records:
+        raise RuntimeError("No weights computed. Check start date or lookback.")
+
+    weights_df = pd.DataFrame(weight_records).set_index("date")
+
+    w_cols = [c for c in weights_df.columns if c.startswith("w_")]
+    meta_cols = [c for c in weights_df.columns if c not in w_cols]
+
+    weights_daily = (
+        weights_df[w_cols]
+        .reindex(all_dates)
+        .ffill()
+        .fillna(0.0)
+    )
+    meta_daily = (
+        weights_df[meta_cols]
+        .reindex(all_dates)
+        .ffill()
+    )
+
+    return weights_daily, meta_daily
+
+
+# ----------------------------- Backtest -----------------------------
+
+
+def backtest(
+    rets: pd.DataFrame,
+    weights_daily: pd.DataFrame,
+    meta_daily: pd.DataFrame,
+    cfg: Config,
+) -> pd.DataFrame:
+    common_idx = rets.index.intersection(weights_daily.index)
+    rets = rets.loc[common_idx]
+    weights_daily = weights_daily.loc[common_idx]
+    meta_daily = meta_daily.loc[common_idx]
+
+    w_cols = [c for c in weights_daily.columns if c.startswith("w_")]
+    asset_cols = [c.replace("w_", "") for c in w_cols]
+
+    W = weights_daily[w_cols].copy()
+    W.columns = asset_cols
+    W = W.reindex(columns=rets.columns).fillna(0.0)
+
+    port_ret = (W * rets).sum(axis=1)
+
+    turnover = W.diff().abs().sum(axis=1).fillna(0.0)
+    tc_per_unit = cfg.tc_bps * 1e-4 / 2.0
+    cost = turnover * tc_per_unit
+
+    port_ret_tc = port_ret - cost
+
+    equity = (1.0 + port_ret).cumprod()
+    equity_tc = (1.0 + port_ret_tc).cumprod()
+
+    out = pd.DataFrame(index=common_idx)
+    out["port_ret"] = port_ret
+    out["port_ret_tc"] = port_ret_tc
+    out["equity"] = equity
+    out["equity_tc"] = equity_tc
+    out["turnover"] = turnover
+    out["tc_cost"] = cost
+
+    out["avg_corr"] = meta_daily["avg_corr"]
+    out["alpha_minvar"] = meta_daily["alpha_minvar"]
+    out["port_vol_ann_pre_scale"] = meta_daily["port_vol_ann_pre_scale"]
+    out["leverage"] = meta_daily["leverage"]
+
+    for col in rets.columns:
+        out[f"ret_{col}"] = rets[col]
+        out[f"w_{col}"] = W[col]
+
+    return out
+
+
+# ----------------------------- Metrics -----------------------------
+
+
+def max_drawdown(series: pd.Series) -> float:
+    run_max = series.cummax()
+    dd = series / run_max - 1.0
+    return float(dd.min())
+
+
+def summary_stats(df: pd.DataFrame, cfg: Config) -> dict:
+    port_ret = df["port_ret_tc"]
+    if port_ret.empty:
+        raise RuntimeError("No returns for summary.")
+
+    ann_ret = (1.0 + port_ret).prod() ** (252.0 / len(port_ret)) - 1.0
+    ann_vol = annualize_vol(port_ret.std())
+    sharpe = float(ann_ret / ann_vol) if ann_vol > 0 else 0.0
+
+    eq_tc = df["equity_tc"]
+    mdd = max_drawdown(eq_tc)
+
+    stats = {
+        "start": str(df.index[0].date()),
+        "end": str(df.index[-1].date()),
+        "n_days": int(len(df)),
+        "ann_return": float(ann_ret),
+        "ann_vol": float(ann_vol),
+        "sharpe": sharpe,
+        "max_drawdown": float(mdd),
+        "median_avg_corr": float(df["avg_corr"].median()),
+        "median_alpha_minvar": float(df["alpha_minvar"].median()),
+        "median_leverage": float(df["leverage"].median()),
+    }
+    return stats
+
+
+# ----------------------------- I/O -----------------------------
+
+
+def save_outputs(df: pd.DataFrame, stats: dict, cfg: Config) -> None:
+    df.to_csv(cfg.out_csv, index=True, date_format="%Y-%m-%d")
+    summary = {
+        "config": asdict(cfg),
+        "stats": stats,
+    }
+    with open(cfg.out_json, "w") as f:
+        json.dump(summary, f, indent=2)
+
+    print(f"[OK] Saved daily series → {cfg.out_csv}")
+    print(f"[OK] Saved summary → {cfg.out_json}")
+    print(
+        f"Period {stats['start']} → {stats['end']}, "
+        f"AnnRet={stats['ann_return']:.2%}, "
+        f"AnnVol={stats['ann_vol']:.2%}, "
+        f"Sharpe={stats['sharpe']:.2f}, "
+        f"MaxDD={stats['max_drawdown']:.2%}"
+    )
+    print(
+        f"Median avg_corr={stats['median_avg_corr']:.2f}, "
+        f"Median alpha_minvar={stats['median_alpha_minvar']:.2f}, "
+        f"Median leverage={stats['median_leverage']:.2f}"
+    )
+
+
+# ----------------------------- CLI -----------------------------
+
+
+def parse_args() -> Config:
+    p = argparse.ArgumentParser(
+        description="Level-62: Shrinkage Min-Var + Risk-Parity Blended Portfolio"
+    )
+    p.add_argument("--start", type=str, default="2010-01-01")
+    p.add_argument("--vol-lookback", type=int, default=60)
+    p.add_argument("--rebalance-freq", type=str, default="M")
+    p.add_argument("--vol-target", type=float, default=0.10)
+    p.add_argument("--max-leverage", type=float, default=2.0)
+    p.add_argument("--corr-min", type=float, default=0.1)
+    p.add_argument("--corr-max", type=float, default=0.8)
+    p.add_argument("--tc-bps", type=float, default=10.0)
+    p.add_argument("--csv", type=str, default="level62_shrinkage_riskparity.csv")
+    p.add_argument("--json", type=str, default="level62_shrinkage_riskparity_summary.json")
+    p.add_argument("--seed", type=int, default=42)
+    a = p.parse_args()
+
+    return Config(
+        start=a.start,
+        vol_lookback=a.vol_lookback,
+        rebalance_freq=a.rebalance_freq,
+        vol_target=a.vol_target,
+        max_leverage=a.max_leverage,
+        corr_min=a.corr_min,
+        corr_max=a.corr_max,
+        tc_bps=a.tc_bps,
+        out_csv=a.csv,
+        out_json=a.json,
+        seed=a.seed,
+    )
+
+
+# ----------------------------- Main -----------------------------
+
+
+def main():
+    cfg = parse_args()
+    np.random.seed(cfg.seed)
+
+    print(f"[INFO] Downloading prices for {cfg.symbols} from {cfg.start} ...")
+    close = load_prices(cfg)
+    rets = compute_returns(close)
+    print(f"[INFO] Got {len(close)} price rows, {len(rets)} return rows.")
+
+    weights_daily, meta_daily = compute_weights(rets, cfg)
+    print(
+        f"[INFO] Computed weights from {weights_daily.index[0].date()} "
+        f"to {weights_daily.index[-1].date()}"
+    )
+
+    out_df = backtest(rets, weights_daily, meta_daily, cfg)
+    stats = summary_stats(out_df, cfg)
+    save_outputs(out_df, stats, cfg)
+
+
+if __name__ == "__main__":
+    # Jupyter / PyCharm shim to strip kernel args like "-f kernel-xxxx.json"
+    import sys
+
+    sys.argv = [sys.argv[0]] + [
+        arg
+        for arg in sys.argv[1:]
+        if arg != "-f" and not (arg.endswith(".json") and "kernel" in arg)
+    ]
+    main()
+```
+
+You can run it straight from a cell (it will behave like a script because of the shim) or via:
+
+```bash
+python level62_shrinkage_riskparity.py --vol-target 0.12 --tc-bps 5
+```
+
+If you want Level-63 to build on this (e.g., add drawdown-aware leverage throttling or a crash-hedge overlay), we can stack that next.

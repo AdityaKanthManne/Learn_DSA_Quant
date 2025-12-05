@@ -1,0 +1,37 @@
+{
+  "config": {
+    "symbols": [
+      "SPY",
+      "QQQ",
+      "IWM",
+      "EFA",
+      "EEM",
+      "TLT",
+      "LQD",
+      "GLD"
+    ],
+    "start": "2010-01-01",
+    "vol_lookback": 60,
+    "rebalance_freq": "M",
+    "vol_target": 0.1,
+    "max_leverage": 2.0,
+    "corr_min": 0.1,
+    "corr_max": 0.8,
+    "tc_bps": 10.0,
+    "out_csv": "level62_shrinkage_riskparity.csv",
+    "out_json": "level62_shrinkage_riskparity_summary.json",
+    "seed": 42
+  },
+  "stats": {
+    "start": "2010-01-05",
+    "end": "2025-12-04",
+    "n_days": 4005,
+    "ann_return": 0.09728761357097526,
+    "ann_vol": 0.1340358292059889,
+    "sharpe": 0.7258328921997547,
+    "max_drawdown": -0.41049009760916977,
+    "median_avg_corr": 0.2949620196689991,
+    "median_alpha_minvar": 0.278517170955713,
+    "median_leverage": 1.4314850982252418
+  }
+}
