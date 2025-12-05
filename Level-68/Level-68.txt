@@ -1,0 +1,454 @@
+Let’s do it — Level-68 = **Hierarchical Risk Parity vs Risk-Parity vs Equal-Weight** on the same ETF universe.
+
+Here’s the full script, ready to drop into PyCharm or a Jupyter cell as `level68_hrp_riskparity.py`:
+
+```python
+# level68_hrp_riskparity.py
+# Hierarchical Risk Parity (HRP) vs Risk-Parity vs Equal-Weight
+# Universe: liquid ETFs (SPY, QQQ, IWM, EFA, EEM, TLT, LQD, GLD)
+# Data: free from yfinance (daily close)
+#
+# Outputs:
+#   - level68_hrp_portfolio.csv
+#   - level68_hrp_summary.json
+#
+# Rebalancing:
+#   - Month-end (ME), rolling covariance window.
+#   - Long-only, fully invested.
+
+import argparse
+import json
+from dataclasses import dataclass, asdict
+from typing import Sequence, Tuple, List, Dict
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+
+
+# --------------------------- Config ---------------------------
+
+@dataclass
+class Config:
+    symbols: Tuple[str, ...] = (
+        "SPY", "QQQ", "IWM", "EFA", "EEM", "TLT", "LQD", "GLD"
+    )
+    start: str = "2010-01-01"
+    cov_lookback: int = 252     # trading days for covariance estimation
+    min_lookback: int = 126     # minimum days before starting
+    rebalance_freq: str = "ME"  # month-end
+    out_csv: str = "level68_hrp_portfolio.csv"
+    out_json: str = "level68_hrp_summary.json"
+    seed: int = 42
+
+
+# --------------------------- Data Loader ---------------------------
+
+def load_prices(symbols: Sequence[str], start: str) -> pd.DataFrame:
+    """Download adjusted close prices for a list of symbols from yfinance."""
+    frames = []
+    for s in symbols:
+        px = yf.download(s, start=start, auto_adjust=True, progress=False)
+        if px.empty:
+            raise RuntimeError(f"No price data downloaded for {s}.")
+        if "Close" not in px.columns:
+            raise RuntimeError(f"'Close' column missing for {s}.")
+
+        close = px["Close"].copy()
+        close.name = s
+        frames.append(close)
+
+    prices = pd.concat(frames, axis=1).sort_index()
+    prices = prices.dropna(how="all")
+    prices = prices.ffill().dropna(how="any")
+    return prices
+
+
+def compute_returns(prices: pd.DataFrame) -> pd.DataFrame:
+    """Log returns of price series."""
+    rets = np.log(prices).diff()
+    rets = rets.dropna(how="all")
+    return rets
+
+
+# --------------------------- Portfolio Math ---------------------------
+
+def cov_to_corr(cov: pd.DataFrame) -> pd.DataFrame:
+    """Convert covariance matrix to correlation matrix."""
+    if not isinstance(cov, pd.DataFrame):
+        cov = pd.DataFrame(cov)
+    diag = np.diag(cov.values)
+    diag = np.where(diag <= 0, 1e-12, diag)
+    std = np.sqrt(diag)
+    denom = np.outer(std, std)
+    corr = cov.values / denom
+    corr[~np.isfinite(corr)] = 0.0
+    np.fill_diagonal(corr, 1.0)
+    return pd.DataFrame(corr, index=cov.index, columns=cov.columns)
+
+
+def risk_parity_weights(cov: pd.DataFrame, max_iter: int = 1000,
+                        tol: float = 1e-8) -> pd.Series:
+    """
+    Simple equal risk-contribution (risk-parity) solver.
+    Long-only, fully invested.
+    """
+    if not isinstance(cov, pd.DataFrame):
+        cov = pd.DataFrame(cov)
+
+    cols = cov.columns
+    C = cov.values.astype(float)
+    n = C.shape[0]
+
+    diag = np.diag(C)
+    diag = np.where(diag <= 0, 1e-6, diag)
+    w = 1.0 / diag
+    w /= w.sum()
+
+    for _ in range(max_iter):
+        port_var = float(w @ C @ w)
+        if port_var <= 0:
+            break
+
+        mrc = C @ w
+        rc = w * mrc
+        target = port_var / n
+
+        rc_safe = np.where(rc == 0.0, target, rc)
+        w_new = w * target / rc_safe
+
+        w_new = np.maximum(w_new, 0.0)
+        s = w_new.sum()
+        if s <= 0:
+            w_new = np.ones(n) / n
+        else:
+            w_new /= s
+
+        if np.max(np.abs(w_new - w)) < tol:
+            w = w_new
+            break
+        w = w_new
+
+    return pd.Series(w, index=cols)
+
+
+def equal_weight(symbols: Sequence[str]) -> pd.Series:
+    n = len(symbols)
+    w = np.ones(n) / n
+    return pd.Series(w, index=list(symbols))
+
+
+# --------------------------- HRP Helpers ---------------------------
+
+def correl_to_dist(corr: pd.DataFrame) -> pd.DataFrame:
+    """Distance matrix from correlation: d_ij = sqrt(0.5 * (1 - rho_ij))."""
+    if not isinstance(corr, pd.DataFrame):
+        corr = pd.DataFrame(corr)
+    d = np.sqrt(0.5 * (1.0 - corr.values))
+    np.fill_diagonal(d, 0.0)
+    return pd.DataFrame(d, index=corr.index, columns=corr.columns)
+
+
+def single_linkage_order(dist: pd.DataFrame) -> List[int]:
+    """
+    Naive single-linkage hierarchical clustering to produce a leaf order
+    (quasi-diagonalization) without external libraries.
+    """
+    n = dist.shape[0]
+    # Distances between leaves (0..n-1)
+    D = dist.values.astype(float)
+    np.fill_diagonal(D, np.inf)
+
+    # Each cluster id maps to list of leaf indices
+    clusters: Dict[int, List[int]] = {i: [i] for i in range(n)}
+    next_id = n
+
+    while len(clusters) > 1:
+        ids = list(clusters.keys())
+        best = None
+        best_pair = None
+
+        for i in range(len(ids)):
+            for j in range(i + 1, len(ids)):
+                ci = ids[i]
+                cj = ids[j]
+                members_i = clusters[ci]
+                members_j = clusters[cj]
+                # Single-linkage: min distance between any pair
+                sub = D[np.ix_(members_i, members_j)]
+                d_ij = float(sub.min())
+                if (best is None) or (d_ij < best):
+                    best = d_ij
+                    best_pair = (ci, cj)
+
+        if best_pair is None:
+            break
+
+        a, b = best_pair
+        new_members = clusters[a] + clusters[b]
+        del clusters[a]
+        del clusters[b]
+        clusters[next_id] = new_members
+        next_id += 1
+
+    # Remaining cluster contains the quasi-diagonal order
+    final_members = list(clusters.values())[0]
+    return final_members
+
+
+def hrp_weights(cov: pd.DataFrame) -> pd.Series:
+    """
+    Hierarchical Risk Parity weights (Lopez de Prado style), long-only.
+    """
+    if not isinstance(cov, pd.DataFrame):
+        cov = pd.DataFrame(cov)
+    cols = list(cov.columns)
+    n = len(cols)
+
+    # Correlation and distance
+    corr = cov_to_corr(cov)
+    dist = correl_to_dist(corr)
+
+    # Quasi-diagonalization via naive single-linkage
+    order = single_linkage_order(dist)
+    cov_reordered = cov.values[order][:, order]
+
+    # Recursive bisection
+    diag = np.diag(cov_reordered)
+    diag = np.where(diag <= 0, 1e-8, diag)
+    inv_var = 1.0 / diag
+
+    weights = np.ones(n)
+
+    clusters = [np.arange(n)]
+
+    while clusters:
+        cluster = clusters.pop(0)
+        if len(cluster) <= 1:
+            continue
+
+        split = len(cluster) // 2
+        left = cluster[:split]
+        right = cluster[split:]
+
+        inv_var_left = inv_var[left]
+        inv_var_right = inv_var[right]
+
+        w_left = inv_var_left / inv_var_left.sum()
+        w_right = inv_var_right / inv_var_right.sum()
+
+        cov_left = cov_reordered[np.ix_(left, left)]
+        cov_right = cov_reordered[np.ix_(right, right)]
+
+        var_left = float(w_left @ cov_left @ w_left)
+        var_right = float(w_right @ cov_right @ w_right)
+        if var_left + var_right == 0:
+            alpha = 0.5
+        else:
+            alpha = 1.0 - var_left / (var_left + var_right)
+
+        weights[left] *= alpha
+        weights[right] *= (1.0 - alpha)
+
+        clusters.append(left)
+        clusters.append(right)
+
+    # Map back to original order
+    w_final = np.zeros(n)
+    for pos, asset_idx in enumerate(order):
+        w_final[asset_idx] = weights[pos]
+
+    return pd.Series(w_final, index=cols)
+
+
+# --------------------------- Backtest Engine ---------------------------
+
+def compute_rebalance_dates(rets: pd.DataFrame, freq: str) -> pd.DatetimeIndex:
+    """Compute rebalance dates as month-end using 'ME'."""
+    if freq != "ME":
+        raise ValueError("This script expects rebalance_freq 'ME' (month-end).")
+    return rets.resample("ME").last().index
+
+
+def run_backtest(prices: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, dict]:
+    rets = compute_returns(prices)
+
+    rebal_dates = compute_rebalance_dates(rets, cfg.rebalance_freq)
+    symbols = list(cfg.symbols)
+    idx = rets.index
+
+    w_ew = pd.DataFrame(index=idx, columns=symbols, dtype=float)
+    w_rp = pd.DataFrame(index=idx, columns=symbols, dtype=float)
+    w_hrp = pd.DataFrame(index=idx, columns=symbols, dtype=float)
+
+    for d in rebal_dates:
+        window = rets.loc[:d].tail(cfg.cov_lookback)
+        if window.shape[0] < cfg.min_lookback:
+            continue
+
+        cov = window.cov()
+        if cov.isnull().any().any():
+            continue
+
+        w_ew_d = equal_weight(symbols)
+        w_rp_d = risk_parity_weights(cov)
+        w_hrp_d = hrp_weights(cov)
+
+        w_ew.loc[d] = w_ew_d
+        w_rp.loc[d] = w_rp_d
+        w_hrp.loc[d] = w_hrp_d
+
+    w_ew = w_ew.ffill().dropna()
+    w_rp = w_rp.ffill().dropna()
+    w_hrp = w_hrp.ffill().dropna()
+
+    common_idx = w_ew.index.intersection(w_rp.index).intersection(w_hrp.index)
+    rets = rets.reindex(common_idx).dropna(how="any")
+    prices = prices.reindex(common_idx)
+    w_ew = w_ew.reindex(common_idx)
+    w_rp = w_rp.reindex(common_idx)
+    w_hrp = w_hrp.reindex(common_idx)
+
+    port_ew = (w_ew * rets).sum(axis=1).rename("ret_ew")
+    port_rp = (w_rp * rets).sum(axis=1).rename("ret_rp")
+    port_hrp = (w_hrp * rets).sum(axis=1).rename("ret_hrp")
+
+    out = pd.DataFrame(index=common_idx)
+    out[symbols] = prices
+    out[[f"ret_{s}" for s in symbols]] = rets.add_prefix("ret_")
+    out[[f"w_ew_{s}" for s in symbols]] = w_ew.add_prefix("w_ew_")
+    out[[f"w_rp_{s}" for s in symbols]] = w_rp.add_prefix("w_rp_")
+    out[[f"w_hrp_{s}" for s in symbols]] = w_hrp.add_prefix("w_hrp_")
+    out[port_ew.name] = port_ew
+    out[port_rp.name] = port_rp
+    out[port_hrp.name] = port_hrp
+
+    out["eq_ew"] = (1.0 + port_ew).cumprod()
+    out["eq_rp"] = (1.0 + port_rp).cumprod()
+    out["eq_hrp"] = (1.0 + port_hrp).cumprod()
+
+    def stats_from_returns(r: pd.Series) -> dict:
+        if r.empty:
+            return dict(ann_ret=np.nan, ann_vol=np.nan,
+                        sharpe=np.nan, max_dd=np.nan)
+        daily_ret = r
+        ann_ret = (1.0 + daily_ret.mean()) ** 252 - 1.0
+        ann_vol = float(daily_ret.std() * np.sqrt(252))
+        sharpe = ann_ret / ann_vol if ann_vol > 0 else np.nan
+
+        eq = (1.0 + daily_ret).cumprod()
+        peak = eq.cummax()
+        dd = eq / peak - 1.0
+        max_dd = float(dd.min()) if not dd.empty else np.nan
+
+        return dict(
+            ann_ret=float(ann_ret),
+            ann_vol=float(ann_vol),
+            sharpe=float(sharpe),
+            max_dd=float(max_dd),
+        )
+
+    summary = {
+        "config": asdict(cfg),
+        "start_date": str(common_idx.min().date()) if len(common_idx) else None,
+        "end_date": str(common_idx.max().date()) if len(common_idx) else None,
+        "n_days": int(len(common_idx)),
+        "EW": stats_from_returns(port_ew),
+        "RiskParity": stats_from_returns(port_rp),
+        "HRP": stats_from_returns(port_hrp),
+    }
+
+    return out, summary
+
+
+# --------------------------- I/O ---------------------------
+
+def save_outputs(out: pd.DataFrame, summary: dict, cfg: Config) -> None:
+    out.to_csv(cfg.out_csv, index=True, date_format="%Y-%m-%d")
+    with open(cfg.out_json, "w") as f:
+        json.dump(summary, f, indent=2)
+
+    print(f"[OK] Saved daily series → {cfg.out_csv}")
+    print(f"[OK] Saved summary → {cfg.out_json}")
+    if summary["start_date"] and summary["end_date"]:
+        print(
+            f"Period {summary['start_date']} → {summary['end_date']}, "
+            f"n_days={summary['n_days']}"
+        )
+
+    for name in ["EW", "RiskParity", "HRP"]:
+        s = summary[name]
+        print(
+            f"{name}: AnnRet={s['ann_ret']*100:.2f}%, "
+            f"AnnVol={s['ann_vol']*100:.2f}%, "
+            f"Sharpe={s['sharpe']:.2f}, "
+            f"MaxDD={s['max_dd']*100:.2f}%"
+        )
+
+
+# --------------------------- CLI ---------------------------
+
+def parse_args() -> Config:
+    p = argparse.ArgumentParser(
+        description="Level-68: Hierarchical Risk Parity vs Risk-Parity vs Equal-Weight"
+    )
+    p.add_argument(
+        "--symbols",
+        type=str,
+        default="SPY,QQQ,IWM,EFA,EEM,TLT,LQD,GLD",
+        help="Comma-separated tickers (default: SPY,QQQ,IWM,EFA,EEM,TLT,LQD,GLD)",
+    )
+    p.add_argument("--start", type=str, default="2010-01-01")
+    p.add_argument("--cov-lookback", type=int, default=252)
+    p.add_argument("--min-lookback", type=int, default=126)
+    p.add_argument(
+        "--rebalance-freq",
+        type=str,
+        default="ME",
+        help="Rebalance frequency (use 'ME' for month-end).",
+    )
+    p.add_argument("--csv", type=str, default="level68_hrp_portfolio.csv")
+    p.add_argument("--json", type=str, default="level68_hrp_summary.json")
+    p.add_argument("--seed", type=int, default=42)
+
+    a = p.parse_args()
+    symbols = tuple(s.strip() for s in a.symbols.split(",") if s.strip())
+    return Config(
+        symbols=symbols,
+        start=a.start,
+        cov_lookback=a.cov_lookback,
+        min_lookback=a.min_lookback,
+        rebalance_freq=a.rebalance_freq,
+        out_csv=a.csv,
+        out_json=a.json,
+        seed=a.seed,
+    )
+
+
+# --------------------------- Main ---------------------------
+
+def main() -> None:
+    cfg = parse_args()
+    np.random.seed(cfg.seed)
+
+    print(f"[INFO] Downloading prices for {cfg.symbols} from {cfg.start} ...")
+    prices = load_prices(cfg.symbols, cfg.start)
+    print(f"[INFO] Got {len(prices)} price rows.")
+
+    out, summary = run_backtest(prices, cfg)
+    save_outputs(out, summary, cfg)
+
+
+if __name__ == "__main__":
+    # Jupyter/PyCharm shim to ignore kernel-related args
+    import sys
+
+    sys.argv = [sys.argv[0]] + [
+        arg
+        for arg in sys.argv[1:]
+        if arg != "-f" and not (arg.endswith(".json") and "kernel" in arg)
+    ]
+    main()
+```
+
+If you want, next step we can add a small helper that reads `level68_hrp_portfolio.csv` and prints one-liner comparisons like “HRP vs RP vs EW Sharpe and max drawdown” for your README.

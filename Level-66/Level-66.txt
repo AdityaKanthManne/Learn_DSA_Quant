@@ -1,0 +1,573 @@
+Alright, time for **Level-66** 🚀
+
+This level will be:
+
+> **Black–Litterman Tactical ETF Portfolio (Momentum Views + Shrinkage Covariance)**
+>
+> * Universe: `("SPY","QQQ","IWM","EFA","EEM","TLT","LQD","GLD")`
+> * Prior: equilibrium returns from equal-weight “market” portfolio
+> * Views: cross-sectional momentum (top & bottom assets each month)
+> * Covariance: **Ledoit–Wolf shrinkage**
+> * Rebalancing: **monthly**, views effective from **next trading day**
+> * Long-only, fully invested
+> * Free data via `yfinance`
+
+It writes:
+
+* `level66_black_litterman_portfolio.csv`
+* `level66_black_litterman_summary.json`
+
+> You’ll need: `yfinance`, `numpy`, `pandas`, `scikit-learn`
+> Install if needed:
+> `pip install yfinance pandas numpy scikit-learn`
+
+---
+
+### Full Level-66 Script
+
+```python
+# level66_black_litterman_portfolio.py
+#
+# Level-66:
+# Black–Litterman Tactical ETF Portfolio
+#  - Prior: equilibrium returns from equal-weight "market" portfolio
+#  - Views: cross-sectional momentum (top/bottom assets)
+#  - Covariance: Ledoit–Wolf shrinkage
+#  - Monthly rebalancing, views effective from next trading day
+#
+# Usage (examples):
+#   python level66_black_litterman_portfolio.py
+#   python level66_black_litterman_portfolio.py --start 2010-01-01 --lookback 252
+#
+# Outputs:
+#   - level66_black_litterman_portfolio.csv
+#   - level66_black_litterman_summary.json
+
+import argparse
+import json
+import math
+import os
+from dataclasses import dataclass, asdict
+from typing import Tuple, Dict, List
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+from sklearn.covariance import LedoitWolf
+
+
+# ----------------------------- Config ----------------------------- #
+
+@dataclass
+class Config:
+    # Asset universe
+    symbols: Tuple[str, ...] = (
+        "SPY", "QQQ", "IWM", "EFA", "EEM", "TLT", "LQD", "GLD"
+    )
+
+    # Data / rolling estimation
+    start: str = "2010-01-01"
+    lookback: int = 252           # trading days for covariance & momentum
+    rebalance_freq: str = "ME"    # 'ME' = month end (avoid 'M' FutureWarning)
+
+    # Black–Litterman parameters
+    risk_aversion: float = 3.0    # δ
+    tau: float = 0.025            # τ scaling for prior covariance of π
+    view_strength_ann: float = 0.03  # annualized view adjustment (~3% per year)
+    view_top_k: int = 2           # # of strongest winners to overweight
+    view_bottom_k: int = 2        # # of worst losers to underweight
+    omega_scale: float = 1.0      # scales Ω = diag( diag(P τΣ Pᵀ) * omega_scale )
+
+    # Output paths
+    out_csv: str = "level66_black_litterman_portfolio.csv"
+    out_json: str = "level66_black_litterman_summary.json"
+
+    # Random seed (for any randomness if added later)
+    seed: int = 42
+
+
+# ----------------------------- Data Loading ----------------------------- #
+
+def load_prices(symbols: Tuple[str, ...], start: str) -> pd.DataFrame:
+    """
+    Download daily adjusted close prices for each symbol using yfinance.
+    Handles both Series and DataFrame returns from yfinance.
+    """
+    frames: List[pd.Series] = []
+    for s in symbols:
+        px = yf.download(s, start=start, auto_adjust=True, progress=False)
+        if px.empty:
+            raise RuntimeError(f"No data returned for symbol {s}. Check ticker or internet.")
+        if "Close" not in px.columns:
+            raise RuntimeError(f"'Close' column missing for {s}.")
+
+        close_obj = px["Close"]
+        if isinstance(close_obj, pd.Series):
+            close = close_obj.rename(s)
+        else:
+            # If it's a DataFrame (multi-column), take first column
+            col0 = close_obj.columns[0]
+            close = pd.Series(close_obj[col0].values, index=close_obj.index, name=s)
+
+        frames.append(close)
+
+    prices = pd.concat(frames, axis=1).sort_index()
+    prices = prices.dropna(how="any")
+    return prices
+
+
+def compute_returns(prices: pd.DataFrame) -> pd.DataFrame:
+    """Daily log returns."""
+    return np.log(prices).diff().dropna()
+
+
+# ----------------------------- Black–Litterman Core ----------------------------- #
+
+def equilibrium_returns(cov: pd.DataFrame, risk_aversion: float) -> np.ndarray:
+    """
+    Equilibrium (implied) returns:
+        π = δ Σ w_mkt
+    Here we approximate market weights as equal-weight.
+    """
+    n = cov.shape[0]
+    w_mkt = np.ones(n) / n
+    pi = risk_aversion * cov.values @ w_mkt
+    return pi
+
+
+def build_momentum_views(
+    hist_rets: pd.DataFrame,
+    cov: pd.DataFrame,
+    cfg: Config
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Construct Black–Litterman views from cross-sectional momentum.
+
+    - Use trailing simple returns over hist_rets for momentum.
+    - Top view_top_k assets: positive view (raise expected return).
+    - Bottom view_bottom_k assets: negative view (lower expected return).
+    - Views are absolute on assets: each view is on one asset's expected return.
+
+    Returns:
+        P: (V x N) view pick matrix
+        Q: (V,) view expected returns (same units as π, i.e., daily)
+        Omega: (V x V) diagonal view covariance matrix
+
+    If no views (e.g., not enough assets), returns (None, None, None).
+    """
+    cols = hist_rets.columns.tolist()
+    n = len(cols)
+    if n == 0:
+        return None, None, None
+
+    # Trailing simple returns (momentum) over the lookback window
+    mom = (1.0 + hist_rets).prod(axis=0) - 1.0
+    mom = mom.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+    # Rank assets by momentum
+    ranked = mom.sort_values(ascending=False)
+    top_assets = ranked.index[:cfg.view_top_k].tolist()
+    bottom_assets = ranked.index[-cfg.view_bottom_k:].tolist()
+
+    assets_with_views = top_assets + bottom_assets
+    if len(assets_with_views) == 0:
+        return None, None, None
+
+    # Build P and Q
+    V = len(assets_with_views)
+    P = np.zeros((V, n))
+    Q = np.zeros(V)
+
+    # Convert annualized view strength to daily (approx.)
+    view_strength_daily = cfg.view_strength_ann / 252.0
+
+    # Use equilibrium returns as baseline (we'll pass π separately to adjust Q)
+    # Note: π will be combined later; here we only encode +/- view adjustments.
+    for idx, asset in enumerate(assets_with_views):
+        j = cols.index(asset)
+        P[idx, j] = 1.0
+        if asset in top_assets:
+            Q[idx] = view_strength_daily  # raise expected return
+        else:
+            Q[idx] = -view_strength_daily  # lower expected return
+
+    # Build Ω as scaled diag(P τΣ Pᵀ)
+    tau_cov = cfg.tau * cov.values
+    # (V x N) @ (N x N) @ (N x V) => (V x V)
+    view_cov = P @ tau_cov @ P.T
+    omega_diag = np.diag(view_cov).copy()
+    # Avoid zero variances
+    omega_diag = np.where(omega_diag <= 0, 1e-8, omega_diag)
+    omega_diag *= cfg.omega_scale
+    Omega = np.diag(omega_diag)
+
+    return P, Q, Omega
+
+
+def black_litterman_posterior(
+    cov: pd.DataFrame,
+    pi: np.ndarray,
+    P: np.ndarray,
+    Q: np.ndarray,
+    Omega: np.ndarray,
+    cfg: Config,
+) -> np.ndarray:
+    """
+    Compute posterior expected returns μ using the Black–Litterman formula:
+
+      μ = [(τΣ)^(-1) + Pᵀ Ω^(-1) P]^(-1) [ (τΣ)^(-1) π + Pᵀ Ω^(-1) Q_total ]
+
+    where:
+      - π is the prior equilibrium returns vector
+      - Q_total = π_P + Q_views (we incorporate views as deviations)
+        but here we encode Q as *deviation* from π, so we just add Q on RHS
+    """
+    tau_cov = cfg.tau * cov.values
+    inv_tau_cov = np.linalg.inv(tau_cov)
+
+    # If we treat Q as "delta over π" for assets in P, we add Pᵀ Ω^-1 Q
+    # directly to RHS (π already in first term).
+    if P is None or Q is None or Omega is None:
+        # No views => posterior equals prior
+        return pi.copy()
+
+    inv_Omega = np.linalg.inv(Omega)
+
+    # A = (τΣ)^(-1) + Pᵀ Ω^(-1) P
+    A = inv_tau_cov + P.T @ inv_Omega @ P
+    # b = (τΣ)^(-1) π + Pᵀ Ω^(-1) Q
+    b = inv_tau_cov @ pi + P.T @ inv_Omega @ Q
+
+    mu = np.linalg.solve(A, b)
+    return mu
+
+
+def bl_weights(
+    cov: pd.DataFrame,
+    mu: np.ndarray,
+    cfg: Config,
+) -> pd.Series:
+    """
+    Convert posterior expected returns μ and covariance Σ into portfolio
+    weights via mean-variance formula:
+
+      w* ∝ Σ^(-1) μ / δ
+
+    Then:
+      - enforce long-only (clip negatives to 0)
+      - renormalize to sum to 1
+    """
+    cols = cov.index.tolist()
+    Sigma = cov.values
+    n = Sigma.shape[0]
+
+    if n == 0:
+        return pd.Series(dtype=float)
+
+    # Mean-variance solution
+    w_raw = np.linalg.solve(Sigma, mu) / cfg.risk_aversion
+    w = pd.Series(w_raw, index=cols)
+
+    # Long-only, renormalized
+    w = w.clip(lower=0.0)
+    s = float(w.sum())
+    if s <= 0:
+        w = pd.Series(np.ones(n) / n, index=cols)
+    else:
+        w /= s
+
+    return w
+
+
+# ----------------------------- Rolling Construction ----------------------------- #
+
+def build_bl_weights_rolling(
+    rets: pd.DataFrame,
+    cfg: Config,
+) -> pd.DataFrame:
+    """
+    Compute Black–Litterman weights on a rolling basis with monthly rebalancing.
+
+    Steps each month-end:
+      1) Take trailing lookback window of daily returns up to month-end.
+      2) Estimate Σ via Ledoit–Wolf.
+      3) Compute equilibrium π = δ Σ w_mkt (equal-weight market).
+      4) Build momentum-based views (P, Q, Ω).
+      5) Compute posterior μ via Black–Litterman.
+      6) Convert μ, Σ into BL weights (long-only).
+      7) Weights become effective from next trading day after month-end.
+    """
+    idx = rets.index
+    cols = rets.columns.tolist()
+    n = len(cols)
+
+    # Month-end dates from returns index
+    month_ends = rets.resample(cfg.rebalance_freq).last().index
+
+    lw = LedoitWolf()
+
+    eff_dates: List[pd.Timestamp] = []
+    eff_weights: List[pd.Series] = []
+
+    for me in month_ends:
+        # Historical returns up to (and including) month-end
+        hist = rets.loc[:me].tail(cfg.lookback)
+        if hist.shape[0] < cfg.lookback:
+            # Not enough history yet
+            continue
+
+        # Ledoit–Wolf covariance
+        lw.fit(hist.values)
+        Sigma = pd.DataFrame(lw.covariance_, index=cols, columns=cols)
+
+        # Prior equilibrium returns
+        pi = equilibrium_returns(Sigma, cfg.risk_aversion)
+
+        # Build momentum views
+        P, Q, Omega = build_momentum_views(hist, Sigma, cfg)
+
+        # Posterior expected returns
+        mu = black_litterman_posterior(Sigma, pi, P, Q, Omega, cfg)
+
+        # Convert to weights
+        w_bl = bl_weights(Sigma, mu, cfg)
+
+        # Effective from next trading day after month-end
+        pos = idx.searchsorted(me, side="right")
+        if pos >= len(idx):
+            continue
+        eff_date = idx[pos]
+
+        eff_dates.append(eff_date)
+        eff_weights.append(w_bl)
+
+    if not eff_dates:
+        raise RuntimeError("No effective rebalance dates found (likely not enough history).")
+
+    weights_rebal = pd.DataFrame(eff_weights, index=pd.Index(eff_dates, name="date"))
+    weights_rebal = weights_rebal.sort_index()
+
+    # Reindex daily and forward-fill
+    weights_daily = weights_rebal.reindex(idx).ffill()
+    weights_daily = weights_daily.reindex(columns=cols)
+    return weights_daily
+
+
+def compute_turnover(weights: pd.DataFrame) -> pd.Series:
+    """
+    Daily turnover:
+      turnover_t = 0.5 * Σ_i |w_{i,t} - w_{i,t-1}|
+    """
+    W = weights.fillna(0.0)
+    diff = W.diff().abs()
+    turnover = 0.5 * diff.sum(axis=1)
+    return turnover
+
+
+def build_portfolio(
+    prices: pd.DataFrame,
+    rets: pd.DataFrame,
+    cfg: Config,
+) -> Dict[str, pd.Series]:
+    """
+    Build BL portfolio series:
+      - daily portfolio return
+      - equity curve
+      - drawdown
+      - leverage (sum of weights)
+      - turnover
+      - weights DataFrame
+    """
+    weights_daily = build_bl_weights_rolling(rets, cfg)
+
+    # Portfolio returns
+    port_ret = (weights_daily * rets).sum(axis=1)
+    port_ret.name = "ret_port"
+
+    # Equity curve
+    equity = (1.0 + port_ret).cumprod()
+    equity.name = "equity"
+
+    # Drawdown
+    peak = equity.cummax()
+    drawdown = equity / peak - 1.0
+    drawdown.name = "drawdown"
+
+    # Leverage (sum of weights, typically ~1)
+    leverage = weights_daily.sum(axis=1)
+    leverage.name = "leverage"
+
+    # Turnover
+    turnover = compute_turnover(weights_daily)
+    turnover.name = "turnover"
+
+    return {
+        "ret_port": port_ret,
+        "equity": equity,
+        "drawdown": drawdown,
+        "leverage": leverage,
+        "turnover": turnover,
+        "weights": weights_daily,
+    }
+
+
+# ----------------------------- Metrics & I/O ----------------------------- #
+
+def summary_stats(rets: pd.Series) -> Dict[str, float]:
+    """
+    Annualized return, volatility, Sharpe (rf=0).
+    """
+    r = rets.dropna()
+    if len(r) == 0:
+        return {"ann_ret": 0.0, "ann_vol": 0.0, "sharpe": 0.0}
+
+    mu_daily = float(r.mean())
+    vol_daily = float(r.std(ddof=0))
+
+    ann_ret = (1.0 + mu_daily) ** 252 - 1.0
+    ann_vol = vol_daily * math.sqrt(252.0)
+    sharpe = ann_ret / ann_vol if ann_vol > 0 else 0.0
+
+    return {"ann_ret": ann_ret, "ann_vol": ann_vol, "sharpe": sharpe}
+
+
+def save_outputs(
+    out_df: pd.DataFrame,
+    stats_all: Dict[str, float],
+    max_dd: float,
+    avg_turnover_daily: float,
+    cfg: Config,
+) -> None:
+    os.makedirs(os.path.dirname(cfg.out_csv) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(cfg.out_json) or ".", exist_ok=True)
+
+    out_df.to_csv(cfg.out_csv, index=True, date_format="%Y-%m-%d")
+    print(f"[OK] Saved daily series → {cfg.out_csv}")
+
+    summary = {
+        "config": asdict(cfg),
+        "portfolio": {
+            "ann_ret": stats_all["ann_ret"],
+            "ann_vol": stats_all["ann_vol"],
+            "sharpe": stats_all["sharpe"],
+            "max_drawdown": max_dd,
+            "avg_turnover_daily": avg_turnover_daily,
+            "avg_turnover_annualized": avg_turnover_daily * 252.0,
+        },
+    }
+
+    with open(cfg.out_json, "w") as f:
+        json.dump(summary, f, indent=2)
+    print(f"[OK] Saved summary → {cfg.out_json}")
+
+    print(
+        "BL Portfolio: AnnRet={:.2%}, AnnVol={:.2%}, Sharpe={:.2f}, "
+        "MaxDD={:.2%}, AvgDailyTurnover={:.2%}".format(
+            summary["portfolio"]["ann_ret"],
+            summary["portfolio"]["ann_vol"],
+            summary["portfolio"]["sharpe"],
+            summary["portfolio"]["max_drawdown"],
+            summary["portfolio"]["avg_turnover_daily"],
+        )
+    )
+
+
+# ----------------------------- Pipeline ----------------------------- #
+
+def run_pipeline(cfg: Config) -> None:
+    np.random.seed(cfg.seed)
+
+    print(f"[INFO] Downloading prices for {cfg.symbols} from {cfg.start} ...")
+    prices = load_prices(cfg.symbols, cfg.start)
+    rets = compute_returns(prices)
+    print(f"[INFO] Got {len(prices)} price rows, {len(rets)} return rows.")
+
+    port = build_portfolio(prices, rets, cfg)
+
+    ret_port = port["ret_port"]
+    equity = port["equity"]
+    drawdown = port["drawdown"]
+    leverage = port["leverage"]
+    turnover = port["turnover"]
+    weights = port["weights"]
+
+    stats_all = summary_stats(ret_port)
+    max_dd = float(drawdown.min(skipna=True)) if len(drawdown) else 0.0
+    avg_turnover_daily = float(turnover.dropna().mean()) if len(turnover.dropna()) else 0.0
+
+    # Build output DataFrame aligned to returns index
+    out_idx = rets.index
+    out = pd.DataFrame(index=out_idx)
+
+    # Prices and returns
+    out[cfg.symbols] = prices.reindex(out_idx)
+    out[[f"ret_{c}" for c in rets.columns]] = rets.add_prefix("ret_")
+
+    # Portfolio series
+    out["ret_port"] = ret_port
+    out["equity"] = equity
+    out["drawdown"] = drawdown
+    out["leverage"] = leverage
+    out["turnover"] = turnover
+
+    # Weights (prefixed with 'w_')
+    w_prefixed = weights.add_prefix("w_").reindex(out_idx)
+    for col in w_prefixed.columns:
+        out[col] = w_prefixed[col]
+
+    save_outputs(out, stats_all, max_dd, avg_turnover_daily, cfg)
+
+
+# ----------------------------- CLI ----------------------------- #
+
+def parse_args() -> Config:
+    p = argparse.ArgumentParser(
+        description="Level-66: Black–Litterman Tactical ETF Portfolio (Momentum Views + Shrinkage Covariance)"
+    )
+    p.add_argument("--start", type=str, default="2010-01-01")
+    p.add_argument("--lookback", type=int, default=252)
+    p.add_argument("--csv", type=str, default="level66_black_litterman_portfolio.csv")
+    p.add_argument("--json", type=str, default="level66_black_litterman_summary.json")
+    p.add_argument("--risk-aversion", type=float, default=3.0)
+    p.add_argument("--tau", type=float, default=0.025)
+    p.add_argument("--view-strength-ann", type=float, default=0.03)
+    p.add_argument("--view-top-k", type=int, default=2)
+    p.add_argument("--view-bottom-k", type=int, default=2)
+    p.add_argument("--omega-scale", type=float, default=1.0)
+    p.add_argument("--seed", type=int, default=42)
+
+    a = p.parse_args()
+
+    return Config(
+        start=a.start,
+        lookback=a.lookback,
+        out_csv=a.csv,
+        out_json=a.json,
+        risk_aversion=a.risk_aversion,
+        tau=a.tau,
+        view_strength_ann=a.view_strength_ann,
+        view_top_k=a.view_top_k,
+        view_bottom_k=a.view_bottom_k,
+        omega_scale=a.omega_scale,
+        seed=a.seed,
+    )
+
+
+def main() -> None:
+    cfg = parse_args()
+    run_pipeline(cfg)
+
+
+if __name__ == "__main__":
+    # Jupyter / IPython shim to strip kernel args like "-f kernel-xxxx.json"
+    import sys
+
+    sys.argv = [sys.argv[0]] + [
+        arg
+        for arg in sys.argv[1:]
+        if arg != "-f" and not (arg.endswith(".json") and "kernel" in arg)
+    ]
+    main()
+```
+
+Run this as a script or in a Jupyter cell, and once you get the final `BL Portfolio: ...` line, paste it here and we’ll sanity-check the performance and maybe tweak `view_strength_ann` / `tau` if needed.

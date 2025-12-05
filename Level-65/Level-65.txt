@@ -1,0 +1,443 @@
+Nice, we’re into the HRP zone now 😄
+For **Level-65**, here’s a full script that implements **Hierarchical Risk Parity (HRP)** with **Ledoit–Wolf shrinkage** and **monthly out-of-sample rebalancing** on the same ETF universe.
+
+* Universe: `("SPY", "QQQ", "IWM", "EFA", "EEM", "TLT", "LQD", "GLD")`
+* Data: free `yfinance` daily prices
+* Estimation window: default 252 trading days
+* Covariance: `LedoitWolf`
+* Weights: HRP via hierarchical clustering on correlation
+* Rebal: effective from first trading day **after** each month-end
+* Outputs:
+
+  * `level65_hrp_portfolio.csv`
+  * `level65_hrp_portfolio_summary.json`
+
+> You’ll need `yfinance`, `numpy`, `pandas`, `scikit-learn`, and `scipy` installed
+> (`pip install yfinance pandas numpy scikit-learn scipy`)
+
+```python
+# level65_hrp_portfolio.py
+#
+# Level-65: Hierarchical Risk Parity (HRP) with Ledoit–Wolf shrinkage covariance
+#           and monthly out-of-sample rebalancing on a multi-asset ETF universe.
+#
+# Usage:
+#   python level65_hrp_portfolio.py
+#   python level65_hrp_portfolio.py --start 2010-01-01 --lookback 252
+#
+# Outputs:
+#   - level65_hrp_portfolio.csv
+#   - level65_hrp_portfolio_summary.json
+
+import argparse
+import json
+import math
+import os
+from dataclasses import dataclass, asdict
+from typing import Tuple, Dict, List
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+
+from sklearn.covariance import LedoitWolf
+from scipy.cluster.hierarchy import linkage, leaves_list
+from scipy.spatial.distance import squareform
+
+
+# ----------------------------- Config ----------------------------- #
+
+@dataclass
+class Config:
+    symbols: Tuple[str, ...] = (
+        "SPY", "QQQ", "IWM", "EFA", "EEM", "TLT", "LQD", "GLD"
+    )
+    start: str = "2010-01-01"
+    lookback: int = 252           # trading days for covariance estimation
+    rebalance_freq: str = "ME"    # month-end; use 'ME' to avoid pandas 'M' warning
+
+    out_csv: str = "level65_hrp_portfolio.csv"
+    out_json: str = "level65_hrp_portfolio_summary.json"
+    seed: int = 42
+
+
+# ----------------------------- Data Loading ----------------------------- #
+
+def load_prices(symbols: Tuple[str, ...], start: str) -> pd.DataFrame:
+    """
+    Download daily adjusted close prices for each symbol.
+    Handles both Series and DataFrame returns from yfinance.
+    """
+    frames: List[pd.Series] = []
+    for s in symbols:
+        px = yf.download(s, start=start, auto_adjust=True, progress=False)
+        if px.empty:
+            raise RuntimeError(f"No data returned for symbol {s}. Check ticker or internet.")
+        if "Close" not in px.columns:
+            raise RuntimeError(f"'Close' column missing for {s}.")
+
+        close_obj = px["Close"]
+        if isinstance(close_obj, pd.Series):
+            close = close_obj.rename(s)
+        else:
+            # DataFrame (some APIs); take first column
+            col0 = close_obj.columns[0]
+            close = pd.Series(close_obj[col0].values, index=close_obj.index, name=s)
+
+        frames.append(close)
+
+    prices = pd.concat(frames, axis=1).sort_index()
+    prices = prices.dropna(how="any")
+    return prices
+
+
+def compute_returns(prices: pd.DataFrame) -> pd.DataFrame:
+    """Daily log returns."""
+    return np.log(prices).diff().dropna()
+
+
+# ----------------------------- HRP Utilities ----------------------------- #
+
+def cov_to_corr(cov: pd.DataFrame) -> pd.DataFrame:
+    """Convert covariance matrix to correlation matrix."""
+    std = np.sqrt(np.diag(cov.values))
+    denom = np.outer(std, std)
+    corr = cov.values / denom
+    corr = np.nan_to_num(corr)
+    return pd.DataFrame(corr, index=cov.index, columns=cov.columns)
+
+
+def correl_distance(corr: pd.DataFrame) -> pd.DataFrame:
+    """
+    Lopez de Prado correlation distance:
+        d_ij = sqrt(0.5 * (1 - corr_ij))
+    """
+    corr_clip = corr.clip(-1.0, 1.0)
+    dist = np.sqrt(0.5 * (1.0 - corr_clip))
+    return dist
+
+
+def get_ivp(cov_sub: np.ndarray) -> np.ndarray:
+    """
+    Inverse-variance portfolio for a covariance sub-matrix.
+    """
+    var = np.diag(cov_sub)
+    var = np.where(var <= 0, 1e-8, var)
+    inv_var = 1.0 / var
+    inv_var /= inv_var.sum()
+    return inv_var
+
+
+def get_cluster_var(cov: pd.DataFrame, cluster_items: List[str]) -> float:
+    """
+    Cluster variance: w' Σ w using inverse-variance weights within the cluster.
+    """
+    cov_ = cov.loc[cluster_items, cluster_items].values
+    w_ = get_ivp(cov_)
+    return float(w_.T @ cov_ @ w_)
+
+
+def get_quasi_diag(cov: pd.DataFrame) -> List[str]:
+    """
+    Perform hierarchical clustering on correlation distance and return
+    the ordered list of tickers (quasi-diagonalization).
+    """
+    corr = cov_to_corr(cov)
+    dist = correl_distance(corr)
+    # Condensed distance matrix for linkage
+    dist_condensed = squareform(dist.values, checks=False)
+    link = linkage(dist_condensed, method="single")
+    sort_idx = leaves_list(link)
+    ordered = corr.index[sort_idx].tolist()
+    return ordered
+
+
+def hrp_weights(cov: pd.DataFrame) -> pd.Series:
+    """
+    Hierarchical Risk Parity weights based on Lopez de Prado (2016).
+    """
+    if cov.shape[0] == 1:
+        return pd.Series([1.0], index=cov.index)
+
+    ordered_tickers = get_quasi_diag(cov)
+    cov_ord = cov.loc[ordered_tickers, ordered_tickers]
+
+    w = pd.Series(1.0, index=ordered_tickers)
+    clusters: List[List[str]] = [ordered_tickers]
+
+    while clusters:
+        new_clusters: List[List[str]] = []
+        for cluster in clusters:
+            if len(cluster) <= 1:
+                continue
+            split = len(cluster) // 2
+            c1 = cluster[:split]
+            c2 = cluster[split:]
+
+            var1 = get_cluster_var(cov_ord, c1)
+            var2 = get_cluster_var(cov_ord, c2)
+            if var1 + var2 == 0:
+                alpha1 = 0.5
+            else:
+                alpha1 = 1.0 - var1 / (var1 + var2)
+            alpha2 = 1.0 - alpha1
+
+            w[c1] *= alpha1
+            w[c2] *= alpha2
+
+            new_clusters.append(c1)
+            new_clusters.append(c2)
+
+        clusters = new_clusters
+
+    # Reindex to full covariance index
+    w = w.reindex(cov.index).fillna(0.0)
+    s = float(w.sum())
+    if s > 0:
+        w /= s
+    return w
+
+
+# ----------------------------- Portfolio Construction ----------------------------- #
+
+def build_hrp_weights_rolling(
+    rets: pd.DataFrame,
+    cfg: Config,
+) -> pd.DataFrame:
+    """
+    Compute HRP weights on a rolling basis, rebalancing at month-end.
+    Weights become effective from the first trading day *after* the
+    month-end rebal date (no look-ahead).
+    """
+    idx = rets.index
+    # Month-end dates based on returns index
+    month_ends = rets.resample(cfg.rebalance_freq).last().index
+
+    # Ledoit-Wolf estimator
+    lw = LedoitWolf()
+
+    eff_dates: List[pd.Timestamp] = []
+    eff_weights: List[pd.Series] = []
+
+    for me in month_ends:
+        # Only use data up to (and including) month-end
+        hist = rets.loc[:me].tail(cfg.lookback)
+        if len(hist) < cfg.lookback:
+            continue
+
+        # Fit Ledoit–Wolf covariance
+        lw.fit(hist.values)
+        cov = pd.DataFrame(
+            lw.covariance_,
+            index=hist.columns,
+            columns=hist.columns,
+        )
+
+        w_hrp = hrp_weights(cov)
+
+        # Effective from next trading day after month-end
+        pos = idx.searchsorted(me, side="right")
+        if pos >= len(idx):
+            continue
+        eff_date = idx[pos]
+
+        eff_dates.append(eff_date)
+        eff_weights.append(w_hrp)
+
+    if not eff_dates:
+        raise RuntimeError("No effective rebalance dates found (not enough history?).")
+
+    weights_rebal = pd.DataFrame(eff_weights, index=pd.Index(eff_dates, name="date"))
+    weights_rebal = weights_rebal.sort_index()
+
+    # Reindex daily: forward-fill from each effective date onward
+    weights_daily = weights_rebal.reindex(idx).ffill()
+    weights_daily = weights_daily.reindex(columns=list(cfg.symbols))
+    return weights_daily
+
+
+def compute_turnover(weights: pd.DataFrame) -> pd.Series:
+    """
+    Daily turnover (0.5 * sum |w_t - w_{t-1}|).
+    """
+    W = weights.fillna(0.0)
+    diff = W.diff().abs()
+    turnover = 0.5 * diff.sum(axis=1)
+    return turnover
+
+
+def build_portfolio(prices: pd.DataFrame, rets: pd.DataFrame, cfg: Config) -> Dict[str, pd.Series]:
+    """
+    Build HRP portfolio, returning daily series for:
+      - ret_port
+      - equity
+      - drawdown
+      - leverage
+      - turnover
+    plus the daily weights DataFrame.
+    """
+    weights_daily = build_hrp_weights_rolling(rets, cfg)
+
+    # Portfolio returns
+    port_ret = (weights_daily * rets).sum(axis=1)
+    port_ret.name = "ret_port"
+
+    # Equity curve
+    eq = (1.0 + port_ret).cumprod()
+    eq.name = "equity"
+
+    # Drawdown
+    peak = eq.cummax()
+    dd = eq / peak - 1.0
+    dd.name = "drawdown"
+
+    # Leverage (weights sum; should be ~1)
+    lev = weights_daily.sum(axis=1)
+    lev.name = "leverage"
+
+    # Turnover
+    turnover = compute_turnover(weights_daily)
+    turnover.name = "turnover"
+
+    return {
+        "ret_port": port_ret,
+        "equity": eq,
+        "drawdown": dd,
+        "leverage": lev,
+        "turnover": turnover,
+        "weights": weights_daily,
+    }
+
+
+# ----------------------------- Metrics & I/O ----------------------------- #
+
+def summary_stats(rets: pd.Series) -> Dict[str, float]:
+    """Annualized performance stats (no RF)."""
+    r = rets.dropna()
+    if len(r) == 0:
+        return {"ann_ret": 0.0, "ann_vol": 0.0, "sharpe": 0.0}
+
+    mu_daily = float(r.mean())
+    vol_daily = float(r.std(ddof=0))
+    ann_ret = (1.0 + mu_daily) ** 252 - 1.0
+    ann_vol = vol_daily * math.sqrt(252.0)
+    sharpe = ann_ret / ann_vol if ann_vol > 0 else 0.0
+    return {"ann_ret": ann_ret, "ann_vol": ann_vol, "sharpe": sharpe}
+
+
+def save_outputs(
+    out_df: pd.DataFrame,
+    stats_all: Dict[str, float],
+    max_dd: float,
+    avg_turnover_daily: float,
+    cfg: Config,
+) -> None:
+    os.makedirs(os.path.dirname(cfg.out_csv) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(cfg.out_json) or ".", exist_ok=True)
+
+    out_df.to_csv(cfg.out_csv, index=True, date_format="%Y-%m-%d")
+    print(f"[OK] Saved daily series → {cfg.out_csv}")
+
+    summary = {
+        "config": asdict(cfg),
+        "portfolio": {
+            "ann_ret": stats_all["ann_ret"],
+            "ann_vol": stats_all["ann_vol"],
+            "sharpe": stats_all["sharpe"],
+            "max_drawdown": max_dd,
+            "avg_turnover_daily": avg_turnover_daily,
+            "avg_turnover_annualized": avg_turnover_daily * 252.0,
+        },
+    }
+
+    with open(cfg.out_json, "w") as f:
+        json.dump(summary, f, indent=2)
+    print(f"[OK] Saved summary → {cfg.out_json}")
+
+    print(
+        "HRP Portfolio: AnnRet={:.2%}, AnnVol={:.2%}, Sharpe={:.2f}, "
+        "MaxDD={:.2%}, AvgDailyTurnover={:.2%}".format(
+            summary["portfolio"]["ann_ret"],
+            summary["portfolio"]["ann_vol"],
+            summary["portfolio"]["sharpe"],
+            summary["portfolio"]["max_drawdown"],
+            summary["portfolio"]["avg_turnover_daily"],
+        )
+    )
+
+
+# ----------------------------- Pipeline ----------------------------- #
+
+def run_pipeline(cfg: Config) -> None:
+    np.random.seed(cfg.seed)
+
+    print(f"[INFO] Downloading prices for {cfg.symbols} from {cfg.start} ...")
+    prices = load_prices(cfg.symbols, cfg.start)
+    rets = compute_returns(prices)
+    print(f"[INFO] Got {len(prices)} price rows, {len(rets)} return rows.")
+
+    port = build_portfolio(prices, rets, cfg)
+    ret_port = port["ret_port"]
+    eq = port["equity"]
+    dd = port["drawdown"]
+    lev = port["leverage"]
+    turnover = port["turnover"]
+
+    stats_all = summary_stats(ret_port)
+    max_dd = float(dd.min(skipna=True)) if len(dd) else 0.0
+    avg_turnover_daily = float(turnover.dropna().mean()) if len(turnover.dropna()) else 0.0
+
+    out_idx = rets.index
+    out = pd.DataFrame(index=out_idx)
+    out[prices.columns] = prices.reindex(out_idx)
+    out[[f"ret_{c}" for c in rets.columns]] = rets.add_prefix("ret_")
+    out["ret_port"] = ret_port
+    out["equity"] = eq
+    out["drawdown"] = dd
+    out["leverage"] = lev
+    out["turnover"] = turnover
+    out[port["weights"].columns] = port["weights"].add_prefix("w_").reindex(out_idx)
+
+    save_outputs(out, stats_all, max_dd, avg_turnover_daily, cfg)
+
+
+# ----------------------------- CLI ----------------------------- #
+
+def parse_args() -> Config:
+    p = argparse.ArgumentParser(
+        description="Level-65: Hierarchical Risk Parity (HRP) with Ledoit–Wolf and monthly rebalancing"
+    )
+    p.add_argument("--start", type=str, default="2010-01-01")
+    p.add_argument("--lookback", type=int, default=252)
+    p.add_argument("--csv", type=str, default="level65_hrp_portfolio.csv")
+    p.add_argument("--json", type=str, default="level65_hrp_portfolio_summary.json")
+    p.add_argument("--seed", type=int, default=42)
+    a = p.parse_args()
+
+    return Config(
+        start=a.start,
+        lookback=a.lookback,
+        out_csv=a.csv,
+        out_json=a.json,
+        seed=a.seed,
+    )
+
+
+def main() -> None:
+    cfg = parse_args()
+    run_pipeline(cfg)
+
+
+if __name__ == "__main__":
+    # Jupyter / IPython shim to strip kernel args like "-f kernel-xxxx.json"
+    import sys
+
+    sys.argv = [sys.argv[0]] + [
+        arg
+        for arg in sys.argv[1:]
+        if arg != "-f" and not (arg.endswith(".json") and "kernel" in arg)
+    ]
+    main()
+```
+
+Run this for Level-65 and send me the final console summary line so we can sanity-check the HRP performance and turnover.

@@ -1,0 +1,564 @@
+Nice, rolling into Level-69 😄
+
+Here’s a full Level-69 script: **Volatility-Regime Switching HRP vs Static HRP vs Equal-Weight** on the ETF universe.
+
+Idea:
+
+* Same ETFs: SPY, QQQ, IWM, EFA, EEM, TLT, LQD, GLD
+* Daily log returns from yfinance
+* Month-end rebalancing
+* Regime based on trailing volatility of SPY:
+
+  * **Low vol** → 70% growth (SPY, QQQ, IWM, EFA, EEM) + 30% defensive (TLT, LQD, GLD)
+  * **Mid vol** → 50% / 50%
+  * **High vol** → 30% growth + 70% defensive
+* Within each bucket we use **HRP weights**, then blend the two buckets.
+* Compare vs **static HRP** (full universe) and **Equal-Weight**.
+
+Save as `level69_regime_hrp.py`:
+
+```python
+# level69_regime_hrp.py
+# Volatility-Regime Switching HRP vs Static HRP vs Equal-Weight
+# Universe: SPY, QQQ, IWM, EFA, EEM, TLT, LQD, GLD
+#
+# Regimes based on trailing annualized volatility of SPY:
+#   - vol < vol_low  -> "low"  (growth-heavy: 70% growth, 30% defensive)
+#   - vol > vol_high -> "high" (defensive-heavy: 30% growth, 70% defensive)
+#   - else           -> "mid"  (balanced: 50% / 50%)
+#
+# Outputs:
+#   - level69_regime_hrp_portfolio.csv
+#   - level69_regime_hrp_summary.json
+
+import argparse
+import json
+from dataclasses import dataclass, asdict
+from typing import Sequence, Tuple, List, Dict
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+
+
+# --------------------------- Config ---------------------------
+
+@dataclass
+class Config:
+    symbols: Tuple[str, ...] = (
+        "SPY", "QQQ", "IWM", "EFA", "EEM", "TLT", "LQD", "GLD"
+    )
+    start: str = "2010-01-01"
+
+    # Covariance / rebalancing
+    cov_lookback: int = 252      # trading days for covariance estimation
+    min_lookback: int = 126      # minimum days before starting
+    rebalance_freq: str = "ME"   # month-end
+
+    # Volatility regime settings
+    vol_anchor: str = "SPY"      # which symbol's vol to use for regimes
+    vol_lookback: int = 60       # days for realized vol
+    vol_low: float = 0.12        # 12% annualized
+    vol_high: float = 0.20       # 20% annualized
+
+    # Growth vs defensive buckets
+    growth_symbols: Tuple[str, ...] = ("SPY", "QQQ", "IWM", "EFA", "EEM")
+    defensive_symbols: Tuple[str, ...] = ("TLT", "LQD", "GLD")
+
+    # Outputs
+    out_csv: str = "level69_regime_hrp_portfolio.csv"
+    out_json: str = "level69_regime_hrp_summary.json"
+
+    seed: int = 42
+
+
+# --------------------------- Data Loader ---------------------------
+
+def load_prices(symbols: Sequence[str], start: str) -> pd.DataFrame:
+    """Download adjusted close prices for a list of symbols from yfinance."""
+    frames = []
+    for s in symbols:
+        px = yf.download(s, start=start, auto_adjust=True, progress=False)
+        if px.empty:
+            raise RuntimeError(f"No price data downloaded for {s}.")
+        if "Close" not in px.columns:
+            raise RuntimeError(f"'Close' column missing for {s}.")
+
+        close = px["Close"].copy()
+        close.name = s  # avoid rename(func) issues
+        frames.append(close)
+
+    prices = pd.concat(frames, axis=1).sort_index()
+    prices = prices.dropna(how="all")
+    prices = prices.ffill().dropna(how="any")
+    return prices
+
+
+def compute_returns(prices: pd.DataFrame) -> pd.DataFrame:
+    """Log returns of price series."""
+    rets = np.log(prices).diff()
+    rets = rets.dropna(how="all")
+    return rets
+
+
+# --------------------------- Portfolio Helpers ---------------------------
+
+def equal_weight(symbols: Sequence[str]) -> pd.Series:
+    n = len(symbols)
+    w = np.ones(n) / n
+    return pd.Series(w, index=list(symbols))
+
+
+def cov_to_corr(cov: pd.DataFrame) -> pd.DataFrame:
+    """Convert covariance matrix to correlation matrix."""
+    if not isinstance(cov, pd.DataFrame):
+        cov = pd.DataFrame(cov)
+    diag = np.diag(cov.values)
+    diag = np.where(diag <= 0, 1e-12, diag)
+    std = np.sqrt(diag)
+    denom = np.outer(std, std)
+    corr = cov.values / denom
+    corr[~np.isfinite(corr)] = 0.0
+    np.fill_diagonal(corr, 1.0)
+    return pd.DataFrame(corr, index=cov.index, columns=cov.columns)
+
+
+def correl_to_dist(corr: pd.DataFrame) -> pd.DataFrame:
+    """Distance matrix from correlation: d_ij = sqrt(0.5 * (1 - rho_ij))."""
+    if not isinstance(corr, pd.DataFrame):
+        corr = pd.DataFrame(corr)
+    d = np.sqrt(0.5 * (1.0 - corr.values))
+    np.fill_diagonal(d, 0.0)
+    return pd.DataFrame(d, index=corr.index, columns=corr.columns)
+
+
+def single_linkage_order(dist: pd.DataFrame) -> List[int]:
+    """
+    Naive single-linkage hierarchical clustering to produce a leaf order
+    (quasi-diagonalization) without external libraries.
+    """
+    n = dist.shape[0]
+    D = dist.values.astype(float)
+    np.fill_diagonal(D, np.inf)
+
+    clusters: Dict[int, List[int]] = {i: [i] for i in range(n)}
+    next_id = n
+
+    while len(clusters) > 1:
+        ids = list(clusters.keys())
+        best = None
+        best_pair = None
+
+        for i in range(len(ids)):
+            for j in range(i + 1, len(ids)):
+                ci = ids[i]
+                cj = ids[j]
+                members_i = clusters[ci]
+                members_j = clusters[cj]
+                sub = D[np.ix_(members_i, members_j)]
+                d_ij = float(sub.min())
+                if (best is None) or (d_ij < best):
+                    best = d_ij
+                    best_pair = (ci, cj)
+
+        if best_pair is None:
+            break
+
+        a, b = best_pair
+        new_members = clusters[a] + clusters[b]
+        del clusters[a]
+        del clusters[b]
+        clusters[next_id] = new_members
+        next_id += 1
+
+    final_members = list(clusters.values())[0]
+    return final_members
+
+
+def hrp_weights(cov: pd.DataFrame) -> pd.Series:
+    """
+    Hierarchical Risk Parity weights (Lopez de Prado style), long-only.
+    """
+    if not isinstance(cov, pd.DataFrame):
+        cov = pd.DataFrame(cov)
+    cols = list(cov.columns)
+    n = len(cols)
+
+    corr = cov_to_corr(cov)
+    dist = correl_to_dist(corr)
+
+    order = single_linkage_order(dist)
+    cov_reordered = cov.values[order][:, order]
+
+    diag = np.diag(cov_reordered)
+    diag = np.where(diag <= 0, 1e-8, diag)
+    inv_var = 1.0 / diag
+
+    weights = np.ones(n)
+    clusters = [np.arange(n)]
+
+    while clusters:
+        cluster = clusters.pop(0)
+        if len(cluster) <= 1:
+            continue
+
+        split = len(cluster) // 2
+        left = cluster[:split]
+        right = cluster[split:]
+
+        inv_var_left = inv_var[left]
+        inv_var_right = inv_var[right]
+
+        w_left = inv_var_left / inv_var_left.sum()
+        w_right = inv_var_right / inv_var_right.sum()
+
+        cov_left = cov_reordered[np.ix_(left, left)]
+        cov_right = cov_reordered[np.ix_(right, right)]
+
+        var_left = float(w_left @ cov_left @ w_left)
+        var_right = float(w_right @ cov_right @ w_right)
+        if var_left + var_right == 0:
+            alpha = 0.5
+        else:
+            alpha = 1.0 - var_left / (var_left + var_right)
+
+        weights[left] *= alpha
+        weights[right] *= (1.0 - alpha)
+
+        clusters.append(left)
+        clusters.append(right)
+
+    w_final = np.zeros(n)
+    for pos, asset_idx in enumerate(order):
+        w_final[asset_idx] = weights[pos]
+
+    return pd.Series(w_final, index=cols)
+
+
+# --------------------------- Regime Logic ---------------------------
+
+def compute_rebalance_dates(rets: pd.DataFrame, freq: str) -> pd.DatetimeIndex:
+    """Compute rebalance dates (here: month-end using 'ME')."""
+    if freq != "ME":
+        raise ValueError("This script expects rebalance_freq 'ME' (month-end).")
+    return rets.resample("ME").last().index
+
+
+def classify_regime(
+    anchor_rets: pd.Series,
+    vol_lookback: int,
+    vol_low: float,
+    vol_high: float
+) -> Tuple[float, str]:
+    """
+    Compute trailing realized annualized volatility and classify into regime.
+    Returns (vol_annual, regime_str).
+    """
+    if anchor_rets.shape[0] < vol_lookback:
+        return np.nan, "unknown"
+
+    window = anchor_rets.tail(vol_lookback)
+    vol_daily = float(window.std())
+    vol_annual = vol_daily * np.sqrt(252.0)
+
+    if vol_annual < vol_low:
+        regime = "low"
+    elif vol_annual > vol_high:
+        regime = "high"
+    else:
+        regime = "mid"
+
+    return vol_annual, regime
+
+
+def regime_mix(regime: str) -> Tuple[float, float]:
+    """
+    Return (growth_weight, defensive_weight) based on regime.
+    """
+    if regime == "low":
+        return 0.70, 0.30
+    elif regime == "high":
+        return 0.30, 0.70
+    else:  # "mid" or unknown
+        return 0.50, 0.50
+
+
+# --------------------------- Backtest Engine ---------------------------
+
+def run_backtest(prices: pd.DataFrame, cfg: Config) -> Tuple[pd.DataFrame, dict]:
+    rets = compute_returns(prices)
+
+    symbols = list(cfg.symbols)
+    growth = list(cfg.growth_symbols)
+    defensive = list(cfg.defensive_symbols)
+
+    # safety: ensure growth+defensive ⊆ symbols
+    for s in growth + defensive:
+        if s not in symbols:
+            raise ValueError(f"{s} not in price universe.")
+
+    if cfg.vol_anchor not in symbols:
+        raise ValueError(f"vol_anchor {cfg.vol_anchor} not in symbols.")
+
+    rebal_dates = compute_rebalance_dates(rets, cfg.rebalance_freq)
+    idx = rets.index
+
+    # Weight matrices
+    w_dyn = pd.DataFrame(index=idx, columns=symbols, dtype=float)
+    w_hrp_static = pd.DataFrame(index=idx, columns=symbols, dtype=float)
+    w_ew_static = pd.DataFrame(index=idx, columns=symbols, dtype=float)
+
+    # To store regime at rebal dates
+    regime_series = pd.Series(index=idx, dtype=object)
+    vol_series = pd.Series(index=idx, dtype=float)
+
+    for d in rebal_dates:
+        # trailing windows for covariance and volatility
+        window_cov = rets.loc[:d].tail(cfg.cov_lookback)
+        if window_cov.shape[0] < cfg.min_lookback:
+            continue
+
+        cov = window_cov.cov()
+        if cov.isnull().any().any():
+            continue
+
+        # Static HRP & Equal weight at this date
+        w_hrp_d = hrp_weights(cov)
+        w_ew_d = equal_weight(symbols)
+
+        # Regime classification on anchor symbol
+        anchor_rets = rets[cfg.vol_anchor].loc[:d]
+        vol_ann, regime = classify_regime(
+            anchor_rets,
+            cfg.vol_lookback,
+            cfg.vol_low,
+            cfg.vol_high,
+        )
+
+        # HRP within growth / defensive buckets
+        cov_growth = cov.loc[growth, growth]
+        cov_def = cov.loc[defensive, defensive]
+
+        w_growth = hrp_weights(cov_growth)
+        w_def = hrp_weights(cov_def)
+
+        gw, dw = regime_mix(regime)
+
+        # Combine into full-universe weight vector
+        w_dyn_full = pd.Series(0.0, index=symbols)
+        for s in growth:
+            w_dyn_full[s] = gw * w_growth[s]
+        for s in defensive:
+            w_dyn_full[s] = dw * w_def[s]
+
+        # normalize to sum 1 in case of any numerical drift
+        ssum = float(w_dyn_full.sum())
+        if ssum <= 0:
+            w_dyn_full = equal_weight(symbols)
+        else:
+            w_dyn_full /= ssum
+
+        # assign at rebalance date
+        w_dyn.loc[d] = w_dyn_full
+        w_hrp_static.loc[d] = w_hrp_d.reindex(symbols)
+        w_ew_static.loc[d] = w_ew_d.reindex(symbols)
+
+        vol_series.loc[d] = vol_ann
+        regime_series.loc[d] = regime
+
+    # Forward-fill weights and regime to all daily dates
+    w_dyn = w_dyn.ffill().dropna()
+    w_hrp_static = w_hrp_static.ffill().dropna()
+    w_ew_static = w_ew_static.ffill().dropna()
+
+    regime_series = regime_series.ffill()
+    vol_series = vol_series.ffill()
+
+    common_idx = w_dyn.index.intersection(w_hrp_static.index).intersection(
+        w_ew_static.index
+    )
+    rets = rets.reindex(common_idx).dropna(how="any")
+    prices = prices.reindex(common_idx)
+    w_dyn = w_dyn.reindex(common_idx)
+    w_hrp_static = w_hrp_static.reindex(common_idx)
+    w_ew_static = w_ew_static.reindex(common_idx)
+    regime_series = regime_series.reindex(common_idx)
+    vol_series = vol_series.reindex(common_idx)
+
+    # Portfolio daily returns
+    ret_dyn = (w_dyn * rets).sum(axis=1).rename("ret_dyn")
+    ret_hrp = (w_hrp_static * rets).sum(axis=1).rename("ret_hrp")
+    ret_ew = (w_ew_static * rets).sum(axis=1).rename("ret_ew")
+
+    out = pd.DataFrame(index=common_idx)
+    out[symbols] = prices
+    out[[f"ret_{s}" for s in symbols]] = rets.add_prefix("ret_")
+
+    out[[f"w_dyn_{s}" for s in symbols]] = w_dyn.add_prefix("w_dyn_")
+    out[[f"w_hrp_{s}" for s in symbols]] = w_hrp_static.add_prefix("w_hrp_")
+    out[[f"w_ew_{s}" for s in symbols]] = w_ew_static.add_prefix("w_ew_")
+
+    out[ret_dyn.name] = ret_dyn
+    out[ret_hrp.name] = ret_hrp
+    out[ret_ew.name] = ret_ew
+
+    out["eq_dyn"] = (1.0 + ret_dyn).cumprod()
+    out["eq_hrp"] = (1.0 + ret_hrp).cumprod()
+    out["eq_ew"] = (1.0 + ret_ew).cumprod()
+
+    out["regime"] = regime_series
+    out["vol_ann_anchor"] = vol_series
+
+    def stats_from_returns(r: pd.Series) -> dict:
+        if r.empty:
+            return dict(ann_ret=np.nan, ann_vol=np.nan,
+                        sharpe=np.nan, max_dd=np.nan)
+        daily_ret = r
+        ann_ret = (1.0 + daily_ret.mean()) ** 252 - 1.0
+        ann_vol = float(daily_ret.std() * np.sqrt(252))
+        sharpe = ann_ret / ann_vol if ann_vol > 0 else np.nan
+
+        eq = (1.0 + daily_ret).cumprod()
+        peak = eq.cummax()
+        dd = eq / peak - 1.0
+        max_dd = float(dd.min()) if not dd.empty else np.nan
+
+        return dict(
+            ann_ret=float(ann_ret),
+            ann_vol=float(ann_vol),
+            sharpe=float(sharpe),
+            max_dd=float(max_dd),
+        )
+
+    summary = {
+        "config": asdict(cfg),
+        "start_date": str(common_idx.min().date()) if len(common_idx) else None,
+        "end_date": str(common_idx.max().date()) if len(common_idx) else None,
+        "n_days": int(len(common_idx)),
+        "DynamicRegimeHRP": stats_from_returns(ret_dyn),
+        "StaticHRP": stats_from_returns(ret_hrp),
+        "EqualWeight": stats_from_returns(ret_ew),
+    }
+
+    return out, summary
+
+
+# --------------------------- I/O ---------------------------
+
+def save_outputs(out: pd.DataFrame, summary: dict, cfg: Config) -> None:
+    out.to_csv(cfg.out_csv, index=True, date_format="%Y-%m-%d")
+    with open(cfg.out_json, "w") as f:
+        json.dump(summary, f, indent=2)
+
+    print(f"[OK] Saved daily series → {cfg.out_csv}")
+    print(f"[OK] Saved summary → {cfg.out_json}")
+    if summary["start_date"] and summary["end_date"]:
+        print(
+            f"Period {summary['start_date']} → {summary['end_date']}, "
+            f"n_days={summary['n_days']}"
+        )
+
+    for name in ["DynamicRegimeHRP", "StaticHRP", "EqualWeight"]:
+        s = summary[name]
+        print(
+            f"{name}: AnnRet={s['ann_ret']*100:.2f}%, "
+            f"AnnVol={s['ann_vol']*100:.2f}%, "
+            f"Sharpe={s['sharpe']:.2f}, "
+            f"MaxDD={s['max_dd']*100:.2f}%"
+        )
+
+
+# --------------------------- CLI ---------------------------
+
+def parse_args() -> Config:
+    p = argparse.ArgumentParser(
+        description="Level-69: Volatility-Regime Switching HRP vs Static HRP vs Equal-Weight"
+    )
+    p.add_argument(
+        "--symbols",
+        type=str,
+        default="SPY,QQQ,IWM,EFA,EEM,TLT,LQD,GLD",
+        help="Comma-separated tickers (default: SPY,QQQ,IWM,EFA,EEM,TLT,LQD,GLD)",
+    )
+    p.add_argument("--start", type=str, default="2010-01-01")
+    p.add_argument("--cov-lookback", type=int, default=252)
+    p.add_argument("--min-lookback", type=int, default=126)
+    p.add_argument(
+        "--rebalance-freq",
+        type=str,
+        default="ME",
+        help="Rebalance frequency (use 'ME' for month-end).",
+    )
+    p.add_argument("--vol-anchor", type=str, default="SPY")
+    p.add_argument("--vol-lookback", type=int, default=60)
+    p.add_argument("--vol-low", type=float, default=0.12)
+    p.add_argument("--vol-high", type=float, default=0.20)
+    p.add_argument(
+        "--growth-symbols",
+        type=str,
+        default="SPY,QQQ,IWM,EFA,EEM",
+        help="Comma-separated growth tickers.",
+    )
+    p.add_argument(
+        "--defensive-symbols",
+        type=str,
+        default="TLT,LQD,GLD",
+        help="Comma-separated defensive tickers.",
+    )
+    p.add_argument("--csv", type=str, default="level69_regime_hrp_portfolio.csv")
+    p.add_argument("--json", type=str, default="level69_regime_hrp_summary.json")
+    p.add_argument("--seed", type=int, default=42)
+
+    a = p.parse_args()
+    symbols = tuple(s.strip() for s in a.symbols.split(",") if s.strip())
+    growth = tuple(s.strip() for s in a.growth_symbols.split(",") if s.strip())
+    defensive = tuple(s.strip() for s in a.defensive_symbols.split(",") if s.strip())
+
+    return Config(
+        symbols=symbols,
+        start=a.start,
+        cov_lookback=a.cov_lookback,
+        min_lookback=a.min_lookback,
+        rebalance_freq=a.rebalance_freq,
+        vol_anchor=a.vol_anchor,
+        vol_lookback=a.vol_lookback,
+        vol_low=a.vol_low,
+        vol_high=a.vol_high,
+        growth_symbols=growth,
+        defensive_symbols=defensive,
+        out_csv=a.csv,
+        out_json=a.json,
+        seed=a.seed,
+    )
+
+
+# --------------------------- Main ---------------------------
+
+def main() -> None:
+    cfg = parse_args()
+    np.random.seed(cfg.seed)
+
+    print(f"[INFO] Downloading prices for {cfg.symbols} from {cfg.start} ...")
+    prices = load_prices(cfg.symbols, cfg.start)
+    print(f"[INFO] Got {len(prices)} price rows.")
+
+    out, summary = run_backtest(prices, cfg)
+    save_outputs(out, summary, cfg)
+
+
+if __name__ == "__main__":
+    # Jupyter/PyCharm shim to ignore kernel-related args like "-f kernel-xxx.json"
+    import sys
+
+    sys.argv = [sys.argv[0]] + [
+        arg
+        for arg in sys.argv[1:]
+        if arg != "-f" and not (arg.endswith(".json") and "kernel" in arg)
+    ]
+    main()
+```
+
+If you want, next step we can:
+
+* Add regime counts (% time in low/mid/high) to the JSON, or
+* Log a few example dates with vol + regime for README snippets.
