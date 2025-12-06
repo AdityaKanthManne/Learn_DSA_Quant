@@ -1,0 +1,514 @@
+Here’s **Level-76**: a **Cornish–Fisher adjusted parametric VaR / CVaR engine** for a multi-asset portfolio.
+
+It:
+
+* Downloads daily prices (yfinance)
+* Builds a portfolio (equal-weight or user weights)
+* Computes rolling **normal VaR / ES** and **Cornish–Fisher adjusted VaR / ES** using rolling mean, vol, skew, kurtosis
+* Saves CSV + JSON summary
+
+```python
+# level76_cornish_fisher_var.py
+# Parametric VaR / CVaR with Cornish–Fisher adjustment for skew & kurtosis.
+#
+# - Downloads adjusted close prices via yfinance
+# - Builds a portfolio (equal-weight or user-specified weights)
+# - Computes rolling normal VaR / ES and Cornish–Fisher adjusted VaR / ES
+# - Outputs CSV and JSON summary
+#
+# Usage examples:
+#   python level76_cornish_fisher_var.py
+#   python level76_cornish_fisher_var.py --symbols SPY,QQQ,TLT,GLD --weights 0.3,0.3,0.2,0.2
+#   python level76_cornish_fisher_var.py --alpha 0.99 --window 500
+#
+# All VaR/CVaR numbers are in *return space* (e.g. 0.03 = 3% loss).
+
+import argparse
+import json
+from dataclasses import dataclass, asdict
+from typing import Sequence, Tuple, Optional, List
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+
+
+# --------------------------- Config ---------------------------
+
+@dataclass
+class Config:
+    symbols: Tuple[str, ...] = (
+        "SPY", "QQQ", "IWM", "EFA", "EEM", "TLT", "LQD", "GLD"
+    )
+    start: str = "2010-01-01"
+
+    # Portfolio weights (if None → equal-weight)
+    weights: Optional[Tuple[float, ...]] = None
+
+    # VaR / CVaR settings
+    alpha: float = 0.95          # confidence level
+    window: int = 252            # rolling window length (days)
+
+    # Outputs
+    out_csv: str = "level76_cornish_var.csv"
+    out_json: str = "level76_cornish_var_summary.json"
+
+    seed: int = 42
+
+
+# --------------------------- Normal helpers ---------------------------
+
+def norm_pdf(x: float) -> float:
+    return float(np.exp(-0.5 * x * x) / np.sqrt(2.0 * np.pi))
+
+
+def norm_ppf(p: float) -> float:
+    """
+    Approximate inverse CDF (quantile) of N(0,1) using a rational approximation.
+
+    Based on Peter J. Acklam's algorithm.
+    Good enough for risk work (|error| ~ 1e-9 in (1e-9,1-1e-9)).
+    """
+    if not 0.0 < p < 1.0:
+        raise ValueError("p must be in (0,1)")
+
+    # Coefficients
+    a = [
+        -3.969683028665376e+01,
+         2.209460984245205e+02,
+        -2.759285104469687e+02,
+         1.383577518672690e+02,
+        -3.066479806614716e+01,
+         2.506628277459239e+00,
+    ]
+    b = [
+        -5.447609879822406e+01,
+         1.615858368580409e+02,
+        -1.556989798598866e+02,
+         6.680131188771972e+01,
+        -1.328068155288572e+01,
+    ]
+    c = [
+        -7.784894002430293e-03,
+        -3.223964580411365e-01,
+        -2.400758277161838e+00,
+        -2.549732539343734e+00,
+         4.374664141464968e+00,
+         2.938163982698783e+00,
+    ]
+    d = [
+         7.784695709041462e-03,
+         3.224671290700398e-01,
+         2.445134137142996e+00,
+         3.754408661907416e+00,
+    ]
+
+    plow = 0.02425
+    phigh = 1.0 - plow
+
+    if p < plow:
+        q = np.sqrt(-2.0 * np.log(p))
+        num = (((((c[0]*q + c[1])*q + c[2])*q + c[3])*q + c[4])*q + c[5])
+        den = ((((d[0]*q + d[1])*q + d[2])*q + d[3])*q + 1.0)
+        x = num / den
+    elif p > phigh:
+        q = np.sqrt(-2.0 * np.log(1.0 - p))
+        num = -(((((c[0]*q + c[1])*q + c[2])*q + c[3])*q + c[4])*q + c[5])
+        den = ((((d[0]*q + d[1])*q + d[2])*q + d[3])*q + 1.0)
+        x = num / den
+    else:
+        q = p - 0.5
+        r = q * q
+        num = (((((a[0]*r + a[1])*r + a[2])*r + a[3])*r + a[4])*r + a[5]) * q
+        den = (((((b[0]*r + b[1])*r + b[2])*r + b[3])*r + b[4])*r + 1.0)
+        x = num / den
+
+    return float(x)
+
+
+# --------------------------- Data Loader ---------------------------
+
+def _extract_close_series(px: pd.DataFrame, symbol: str) -> pd.Series:
+    """
+    Robustly extract a 1D close price Series for a symbol from a yfinance DataFrame.
+    Handles Series or DataFrame 'Close'.
+    """
+    if "Close" not in px.columns:
+        raise RuntimeError(f"'Close' column missing for {symbol}.")
+
+    close_obj = px["Close"]
+
+    if isinstance(close_obj, pd.Series):
+        close = pd.Series(close_obj.values, index=close_obj.index, name=symbol)
+    elif isinstance(close_obj, pd.DataFrame):
+        if close_obj.shape[1] < 1:
+            raise RuntimeError(f"No close data columns for {symbol}.")
+        col0 = close_obj.iloc[:, 0]
+        close = pd.Series(col0.values, index=col0.index, name=symbol)
+    else:
+        raise RuntimeError("Unexpected type for Close data.")
+
+    close = close.astype(float)
+    return close
+
+
+def load_prices(symbols: Sequence[str], start: str) -> pd.DataFrame:
+    """Download adjusted close prices for the given symbols."""
+    frames: List[pd.Series] = []
+    for s in symbols:
+        px = yf.download(s, start=start, auto_adjust=True, progress=False)
+        if px.empty:
+            raise RuntimeError(f"No price data downloaded for {s}.")
+        close = _extract_close_series(px, s)
+        frames.append(close)
+
+    prices = pd.concat(frames, axis=1).sort_index()
+    prices = prices.dropna(how="all")
+    prices = prices.ffill().dropna(how="any")
+    return prices
+
+
+def compute_returns(prices: pd.DataFrame) -> pd.DataFrame:
+    """Daily log returns."""
+    rets = np.log(prices).diff()
+    rets = rets.dropna(how="all")
+    return rets
+
+
+# --------------------------- Portfolio & Tail Risk ---------------------------
+
+def build_weights(cfg: Config, symbols: Sequence[str]) -> np.ndarray:
+    if cfg.weights is None:
+        w = np.ones(len(symbols)) / float(len(symbols))
+        return w
+
+    if len(cfg.weights) != len(symbols):
+        raise ValueError(
+            f"Length of weights ({len(cfg.weights)}) "
+            f"does not match number of symbols ({len(symbols)})."
+        )
+    w = np.array(cfg.weights, dtype=float)
+    s = float(np.sum(w))
+    if s != 0.0:
+        w = w / s
+    return w
+
+
+def portfolio_returns(rets: pd.DataFrame, weights: np.ndarray) -> pd.Series:
+    """Compute portfolio returns as weighted sum of asset returns."""
+    r = (rets * weights).sum(axis=1)
+    r.name = "ret_port"
+    return r
+
+
+def cornish_fisher_z(z: float, skew: float, ex_kurt: float) -> float:
+    """
+    Cornish–Fisher adjusted quantile.
+    z: normal quantile for the desired alpha
+    skew: sample skewness (3rd central moment / sigma^3)
+    ex_kurt: excess kurtosis (kurtosis - 3)
+    """
+    g1 = skew
+    g2 = ex_kurt
+
+    z2 = z * z
+    z3 = z2 * z
+
+    term1 = (1.0 / 6.0) * (z2 - 1.0) * g1
+    term2 = (1.0 / 24.0) * (z3 - 3.0 * z) * g2
+    term3 = -(1.0 / 36.0) * (2.0 * z3 - 5.0 * z) * (g1 ** 2)
+
+    return float(z + term1 + term2 + term3)
+
+
+def compute_rolling_tail_metrics(
+    port_ret: pd.Series, window: int, alpha: float
+) -> pd.DataFrame:
+    """
+    Compute rolling parametric normal VaR/ES and Cornish–Fisher VaR/ES.
+
+    We work on losses:
+      L_t = -ret_t  (positive = loss)
+    For each window:
+      μ_L, σ_L, skew_L, ex_kurt_L
+      z = Phi^{-1}(alpha)
+      z_cf = Cornish–Fisher adjusted
+      VaR_normal = μ_L + z * σ_L
+      ES_normal  = μ_L + σ_L * phi(z) / (1 - alpha)
+      VaR_cf     = μ_L + z_cf * σ_L
+      ES_cf      = μ_L + σ_L * phi(z_cf) / (1 - alpha)
+    """
+    r = port_ret.dropna()
+    loss = -r
+
+    # Rolling stats
+    roll_mean = loss.rolling(window=window, min_periods=window).mean()
+    roll_std = loss.rolling(window=window, min_periods=window).std(ddof=1)
+
+    # Skewness: E[(L - mean)^3] / std^3
+    def _skew(x: np.ndarray) -> float:
+        if x.size < 3:
+            return np.nan
+        m = x.mean()
+        s = x.std(ddof=1)
+        if s == 0:
+            return 0.0
+        return float(np.mean((x - m) ** 3) / (s ** 3))
+
+    # Excess kurtosis: E[(L - mean)^4]/std^4 - 3
+    def _ex_kurt(x: np.ndarray) -> float:
+        if x.size < 4:
+            return np.nan
+        m = x.mean()
+        s = x.std(ddof=1)
+        if s == 0:
+            return 0.0
+        return float(np.mean((x - m) ** 4) / (s ** 4) - 3.0)
+
+    roll_skew = loss.rolling(window=window, min_periods=window).apply(
+        lambda x: _skew(x.to_numpy()), raw=False
+    )
+    roll_exkurt = loss.rolling(window=window, min_periods=window).apply(
+        lambda x: _ex_kurt(x.to_numpy()), raw=False
+    )
+
+    z = norm_ppf(alpha)
+    phi_z = norm_pdf(z)
+
+    # VaR / ES under normal assumption
+    var_normal = roll_mean + z * roll_std
+    es_normal = roll_mean + roll_std * (phi_z / (1.0 - alpha))
+
+    # Cornish–Fisher adjusted z
+    def _cf_var(x: pd.Series) -> float:
+        mu_l = x["mean"]
+        sig_l = x["std"]
+        skew_l = x["skew"]
+        exk_l = x["exk"]
+        if np.isnan(mu_l) or sig_l <= 0 or np.isnan(skew_l) or np.isnan(exk_l):
+            return np.nan
+        z_cf = cornish_fisher_z(z, skew_l, exk_l)
+        return float(mu_l + z_cf * sig_l)
+
+    def _cf_es(x: pd.Series) -> float:
+        mu_l = x["mean"]
+        sig_l = x["std"]
+        skew_l = x["skew"]
+        exk_l = x["exk"]
+        if np.isnan(mu_l) or sig_l <= 0 or np.isnan(skew_l) or np.isnan(exk_l):
+            return np.nan
+        z_cf = cornish_fisher_z(z, skew_l, exk_l)
+        phi_zcf = norm_pdf(z_cf)
+        return float(mu_l + sig_l * (phi_zcf / (1.0 - alpha)))
+
+    stats_df = pd.DataFrame(
+        {
+            "mean": roll_mean,
+            "std": roll_std,
+            "skew": roll_skew,
+            "exk": roll_exkurt,
+        }
+    )
+
+    var_cf = stats_df.apply(_cf_var, axis=1)
+    es_cf = stats_df.apply(_cf_es, axis=1)
+
+    out = pd.DataFrame(
+        {
+            "loss": loss,
+            "VaR_normal": var_normal,
+            "ES_normal": es_normal,
+            "VaR_cf": var_cf,
+            "ES_cf": es_cf,
+            "mean_loss": roll_mean,
+            "std_loss": roll_std,
+            "skew_loss": roll_skew,
+            "exk_loss": roll_exkurt,
+        }
+    )
+    return out
+
+
+# --------------------------- Pipeline ---------------------------
+
+def run_pipeline(cfg: Config):
+    prices = load_prices(cfg.symbols, cfg.start)
+    rets = compute_returns(prices)
+    symbols = list(rets.columns)
+
+    w = build_weights(cfg, symbols)
+    port_ret = portfolio_returns(rets, w)
+
+    tail_df = compute_rolling_tail_metrics(port_ret, cfg.window, cfg.alpha)
+    tail_df["ret_port"] = port_ret.reindex(tail_df.index)
+    tail_df["equity"] = (1.0 + tail_df["ret_port"].fillna(0.0)).cumprod()
+
+    # Simple performance stats
+    r = tail_df["ret_port"].dropna()
+    mu = float(r.mean()) if not r.empty else np.nan
+    sig = float(r.std()) if not r.empty else np.nan
+    ann_ret = (1.0 + mu) ** 252 - 1.0 if not np.isnan(mu) else np.nan
+    ann_vol = sig * np.sqrt(252.0) if not np.isnan(sig) else np.nan
+    sharpe = ann_ret / ann_vol if (not np.isnan(ann_ret) and ann_vol > 0) else np.nan
+
+    eq = (1.0 + r).cumprod()
+    peak = eq.cummax()
+    dd = eq / peak - 1.0
+    max_dd = float(dd.min()) if not dd.empty else np.nan
+
+    # Aggregated VaR / ES levels
+    valid_tail = tail_df.dropna(subset=["VaR_normal", "VaR_cf"])
+    if valid_tail.empty:
+        med_var_norm = med_es_norm = med_var_cf = med_es_cf = np.nan
+        last_var_norm = last_es_norm = last_var_cf = last_es_cf = np.nan
+    else:
+        med_var_norm = float(valid_tail["VaR_normal"].median())
+        med_es_norm = float(valid_tail["ES_normal"].median())
+        med_var_cf = float(valid_tail["VaR_cf"].median())
+        med_es_cf = float(valid_tail["ES_cf"].median())
+        last_row = valid_tail.iloc[-1]
+        last_var_norm = float(last_row["VaR_normal"])
+        last_es_norm = float(last_row["ES_normal"])
+        last_var_cf = float(last_row["VaR_cf"])
+        last_es_cf = float(last_row["ES_cf"])
+
+    idx = tail_df.index
+    summary = {
+        "config": asdict(cfg),
+        "start_date": str(idx.min().date()) if len(idx) else None,
+        "end_date": str(idx.max().date()) if len(idx) else None,
+        "n_days": int(len(idx)),
+        "portfolio": {
+            "symbols": cfg.symbols,
+            "weights": w.tolist(),
+        },
+        "stats": {
+            "ann_ret": float(ann_ret) if not np.isnan(ann_ret) else np.nan,
+            "ann_vol": float(ann_vol) if not np.isnan(ann_vol) else np.nan,
+            "sharpe": float(sharpe) if not np.isnan(sharpe) else np.nan,
+            "max_dd": float(max_dd) if not np.isnan(max_dd) else np.nan,
+        },
+        "tail_risk": {
+            "alpha": cfg.alpha,
+            "window": cfg.window,
+            "median_VaR_normal": med_var_norm,
+            "median_ES_normal": med_es_norm,
+            "median_VaR_cf": med_var_cf,
+            "median_ES_cf": med_es_cf,
+            "last_VaR_normal": last_var_norm,
+            "last_ES_normal": last_es_norm,
+            "last_VaR_cf": last_var_cf,
+            "last_ES_cf": last_es_cf,
+        },
+    }
+
+    return tail_df, summary
+
+
+# --------------------------- I/O ---------------------------
+
+def save_outputs(tail_df: pd.DataFrame, summary: dict, cfg: Config) -> None:
+    tail_df.to_csv(cfg.out_csv, index=True, date_format="%Y-%m-%d")
+    with open(cfg.out_json, "w") as f:
+        json.dump(summary, f, indent=2)
+
+    print(f"[OK] Saved daily series → {cfg.out_csv}")
+    print(f"[OK] Saved summary      → {cfg.out_json}")
+
+    if summary["start_date"] and summary["end_date"]:
+        print(
+            f"Period {summary['start_date']} → {summary['end_date']}, "
+            f"n_days={summary['n_days']}"
+        )
+
+    stats = summary["stats"]
+    tail = summary["tail_risk"]
+
+    print(
+        "Portfolio: "
+        f"AnnRet={stats['ann_ret']*100:.2f}%, "
+        f"AnnVol={stats['ann_vol']*100:.2f}%, "
+        f"Sharpe={stats['sharpe']:.2f}, "
+        f"MaxDD={stats['max_dd']*100:.2f}%"
+    )
+    print(
+        f"Tail risk @ alpha={tail['alpha']:.3f}, window={tail['window']}d:"
+        f"\n  Normal VaR/ES (median): VaR={tail['median_VaR_normal']*100:.2f}%, "
+        f"ES={tail['median_ES_normal']*100:.2f}%"
+        f"\n  CF-adjusted VaR/ES (median): VaR={tail['median_VaR_cf']*100:.2f}%, "
+        f"ES={tail['median_ES_cf']*100:.2f}%"
+        f"\n  Last normal VaR/ES: VaR={tail['last_VaR_normal']*100:.2f}%, "
+        f"ES={tail['last_ES_normal']*100:.2f}%"
+        f"\n  Last CF VaR/ES: VaR={tail['last_VaR_cf']*100:.2f}%, "
+        f"ES={tail['last_ES_cf']*100:.2f}%"
+    )
+
+
+# --------------------------- CLI ---------------------------
+
+def parse_args() -> Config:
+    p = argparse.ArgumentParser(
+        description="Level-76: Parametric VaR / CVaR with Cornish–Fisher adjustment"
+    )
+    p.add_argument(
+        "--symbols",
+        type=str,
+        default="SPY,QQQ,IWM,EFA,EEM,TLT,LQD,GLD",
+        help="Comma-separated tickers",
+    )
+    p.add_argument("--start", type=str, default="2010-01-01")
+    p.add_argument("--weights", type=str, default=None,
+                   help="Comma-separated weights (same order as symbols). If omitted, equal-weight.")
+    p.add_argument("--alpha", type=float, default=0.95,
+                   help="VaR/CVaR confidence level (e.g., 0.95)")
+    p.add_argument("--window", type=int, default=252,
+                   help="Rolling window length in days")
+    p.add_argument("--csv", type=str, default="level76_cornish_var.csv")
+    p.add_argument("--json", type=str, default="level76_cornish_var_summary.json")
+    p.add_argument("--seed", type=int, default=42)
+
+    a = p.parse_args()
+    symbols = tuple(s.strip() for s in a.symbols.split(",") if s.strip())
+
+    if a.weights is not None:
+        w_list = [float(x) for x in a.weights.split(",") if x.strip() != ""]
+        weights = tuple(w_list)
+    else:
+        weights = None
+
+    return Config(
+        symbols=symbols,
+        start=a.start,
+        weights=weights,
+        alpha=a.alpha,
+        window=a.window,
+        out_csv=a.csv,
+        out_json=a.json,
+        seed=a.seed,
+    )
+
+
+# --------------------------- Main ---------------------------
+
+def main() -> None:
+    cfg = parse_args()
+    np.random.seed(cfg.seed)
+
+    print(f"[INFO] Downloading prices for {cfg.symbols} from {cfg.start} ...")
+    tail_df, summary = run_pipeline(cfg)
+    save_outputs(tail_df, summary, cfg)
+
+
+if __name__ == "__main__":
+    # Jupyter / PyCharm shim: strip kernel args
+    import sys
+
+    sys.argv = [sys.argv[0]] + [
+        arg
+        for arg in sys.argv[1:]
+        if arg != "-f" and not (arg.endswith(".json") and "kernel" in arg)
+    ]
+    main()
+```
+
+You can run it as-is; if you want this level to be “portfolio of your earlier Level-62/63 weights”, we can hard-code / plug in those same ETF weights next.
