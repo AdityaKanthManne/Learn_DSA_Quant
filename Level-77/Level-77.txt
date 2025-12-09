@@ -1,0 +1,483 @@
+Here comes **Level-77** 🧱 – a **block-bootstrap portfolio scenario engine**:
+
+* Downloads daily prices (yfinance) for a multi-asset portfolio
+* Computes daily log returns and builds a **portfolio return series** from weights
+* Uses **block bootstrap** on the portfolio returns to generate many synthetic paths
+* Computes for each path: annualized return, vol, Sharpe, max drawdown, terminal wealth
+* Saves:
+
+  * **CSV #1**: one equity curve per path (`level77_bootstrap_paths.csv`)
+  * **CSV #2**: path-level statistics (`level77_bootstrap_stats.csv`)
+  * **JSON**: overall summary + distribution quantiles (`level77_bootstrap_summary.json`)
+
+You can drop this straight into a file like `level77_block_bootstrap_scenarios.py` or a Jupyter cell.
+
+```python
+# level77_block_bootstrap_scenarios.py
+# Block-bootstrap portfolio scenario engine.
+#
+# - Loads daily prices via yfinance
+# - Builds a portfolio return series from asset returns and weights
+# - Generates N block-bootstrapped paths of fixed horizon
+# - Computes path-wise stats: ann_ret, ann_vol, Sharpe, max drawdown, terminal wealth
+# - Outputs:
+#     * level77_bootstrap_paths.csv  (equity curves for each path)
+#     * level77_bootstrap_stats.csv  (per-path statistics)
+#     * level77_bootstrap_summary.json  (overall distribution summary)
+#
+# Usage examples:
+#   python level77_block_bootstrap_scenarios.py
+#   python level77_block_bootstrap_scenarios.py --symbols SPY,QQQ,TLT,GLD --weights 0.3,0.3,0.2,0.2
+#   python level77_block_bootstrap_scenarios.py --horizon 252 --n-paths 2000 --block-len 20
+#
+# All returns are in decimal space (e.g. 0.02 = 2%).
+
+import argparse
+import json
+from dataclasses import dataclass, asdict
+from typing import Tuple, Optional, Sequence, List
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+
+
+# --------------------------- Config ---------------------------
+
+@dataclass
+class Config:
+    # Asset universe
+    symbols: Tuple[str, ...] = (
+        "SPY", "QQQ", "IWM", "EFA", "EEM", "TLT", "LQD", "GLD"
+    )
+    start: str = "2010-01-01"
+
+    # Portfolio weights (None → equal-weight)
+    weights: Optional[Tuple[float, ...]] = None
+
+    # Scenario settings
+    horizon_days: int = 252        # days per path
+    n_paths: int = 1000            # number of bootstrapped paths
+    block_len: int = 20            # block length for block bootstrap (days)
+
+    # Outputs
+    out_paths_csv: str = "level77_bootstrap_paths.csv"
+    out_stats_csv: str = "level77_bootstrap_stats.csv"
+    out_json: str = "level77_bootstrap_summary.json"
+
+    # Misc
+    seed: int = 42
+
+
+# --------------------------- Data Loader ---------------------------
+
+def _extract_close_series(px: pd.DataFrame, symbol: str) -> pd.Series:
+    """
+    Robustly extract a 1D close price Series for a symbol from a yfinance DataFrame.
+    Handles 'Close' as Series or DataFrame.
+    """
+    if "Close" not in px.columns:
+        raise RuntimeError(f"'Close' column missing for {symbol}.")
+
+    close_obj = px["Close"]
+
+    if isinstance(close_obj, pd.Series):
+        series = pd.Series(close_obj.values, index=close_obj.index, name=symbol)
+    elif isinstance(close_obj, pd.DataFrame):
+        if close_obj.shape[1] < 1:
+            raise RuntimeError(f"No close data columns for {symbol}.")
+        col0 = close_obj.iloc[:, 0]
+        series = pd.Series(col0.values, index=col0.index, name=symbol)
+    else:
+        raise RuntimeError("Unexpected type for Close data.")
+
+    return series.astype(float)
+
+
+def load_prices(symbols: Sequence[str], start: str) -> pd.DataFrame:
+    """Download adjusted close prices for the given symbols via yfinance."""
+    frames: List[pd.Series] = []
+    for s in symbols:
+        px = yf.download(s, start=start, auto_adjust=True, progress=False)
+        if px.empty:
+            raise RuntimeError(f"No price data downloaded for {s}.")
+        close = _extract_close_series(px, s)
+        frames.append(close)
+
+    prices = pd.concat(frames, axis=1).sort_index()
+    prices = prices.dropna(how="all")
+    prices = prices.ffill().dropna(how="any")
+    return prices
+
+
+def compute_returns(prices: pd.DataFrame) -> pd.DataFrame:
+    """Daily log returns from prices."""
+    rets = np.log(prices).diff()
+    rets = rets.dropna(how="all")
+    return rets
+
+
+# --------------------------- Portfolio helpers ---------------------------
+
+def build_weights(cfg: Config, symbols: Sequence[str]) -> np.ndarray:
+    """Build normalized weights."""
+    if cfg.weights is None:
+        w = np.ones(len(symbols), dtype=float)
+        w /= float(len(symbols))
+        return w
+
+    if len(cfg.weights) != len(symbols):
+        raise ValueError(
+            f"Length of weights ({len(cfg.weights)}) "
+            f"does not match number of symbols ({len(symbols)})."
+        )
+    w = np.array(cfg.weights, dtype=float)
+    total = float(np.sum(w))
+    if total != 0.0:
+        w = w / total
+    return w
+
+
+def portfolio_returns(rets: pd.DataFrame, weights: np.ndarray) -> pd.Series:
+    """Portfolio returns as weighted sum of asset log returns."""
+    r = (rets * weights).sum(axis=1)
+    r.name = "ret_port"
+    return r
+
+
+# --------------------------- Block Bootstrap ---------------------------
+
+def block_bootstrap_paths(
+    port_ret: pd.Series, horizon_days: int, n_paths: int, block_len: int
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Univariate block bootstrap on portfolio returns.
+
+    port_ret: Series of daily portfolio returns (log)
+    horizon_days: number of days per path
+    n_paths: number of simulated paths
+    block_len: length of resampled blocks in days
+
+    Returns:
+        paths_ret: (horizon_days, n_paths) array of bootstrapped returns
+        paths_eq:  (horizon_days, n_paths) array of corresponding equity curves
+                   starting from 1.0
+    """
+    r = port_ret.dropna().to_numpy()
+    T = r.shape[0]
+    if T < 2:
+        raise RuntimeError("Not enough returns for bootstrap (need at least 2 rows).")
+
+    # Adjust block_len if too large for the sample
+    B = int(block_len)
+    if B < 1:
+        B = 1
+    if B > T:
+        B = T
+
+    H = int(horizon_days)
+    nP = int(n_paths)
+
+    paths_ret = np.zeros((H, nP), dtype=float)
+    paths_eq = np.zeros((H, nP), dtype=float)
+
+    for j in range(nP):
+        idx = 0
+        cur_ret = np.zeros(H, dtype=float)
+
+        while idx < H:
+            max_start = T - B
+            if max_start <= 0:
+                start = 0
+            else:
+                start = np.random.randint(0, max_start + 1)
+
+            block = r[start:start + B]
+            remaining = H - idx
+            take = B if B <= remaining else remaining
+
+            cur_ret[idx:idx + take] = block[:take]
+            idx += take
+
+        eq = np.cumprod(1.0 + cur_ret)
+
+        paths_ret[:, j] = cur_ret
+        paths_eq[:, j] = eq
+
+    return paths_ret, paths_eq
+
+
+# --------------------------- Stats ---------------------------
+
+def path_statistics(
+    paths_ret: np.ndarray, paths_eq: np.ndarray
+) -> pd.DataFrame:
+    """
+    Compute per-path statistics from simulated paths.
+
+    paths_ret: (H, nP)
+    paths_eq:  (H, nP)
+
+    Returns DataFrame with index=path_id and columns:
+      - ann_ret
+      - ann_vol
+      - sharpe
+      - max_dd
+      - terminal_wealth
+    """
+    H, nP = paths_ret.shape
+    stats = {
+        "ann_ret": np.zeros(nP, dtype=float),
+        "ann_vol": np.zeros(nP, dtype=float),
+        "sharpe": np.zeros(nP, dtype=float),
+        "max_dd": np.zeros(nP, dtype=float),
+        "terminal_wealth": np.zeros(nP, dtype=float),
+    }
+
+    for j in range(nP):
+        r = paths_ret[:, j]
+        eq = paths_eq[:, j]
+
+        mu = float(r.mean())
+        sigma = float(r.std(ddof=1)) if H > 1 else 0.0
+
+        # Annualized stats (approx 252 trading days)
+        ann_ret = (1.0 + mu) ** 252 - 1.0
+        ann_vol = sigma * np.sqrt(252.0) if sigma > 0.0 else 0.0
+        sharpe = ann_ret / ann_vol if ann_vol > 0.0 else 0.0
+
+        # Max drawdown
+        peak = np.maximum.accumulate(eq)
+        dd = eq / peak - 1.0
+        max_dd = float(dd.min())
+
+        stats["ann_ret"][j] = ann_ret
+        stats["ann_vol"][j] = ann_vol
+        stats["sharpe"][j] = sharpe
+        stats["max_dd"][j] = max_dd
+        stats["terminal_wealth"][j] = float(eq[-1])
+
+    df_stats = pd.DataFrame(stats)
+    df_stats.index.name = "path_id"
+    return df_stats
+
+
+# --------------------------- Pipeline ---------------------------
+
+def run_pipeline(cfg: Config):
+    # 1) Load data
+    prices = load_prices(cfg.symbols, cfg.start)
+    rets = compute_returns(prices)
+    symbols = list(rets.columns)
+
+    # 2) Build portfolio
+    w = build_weights(cfg, symbols)
+    port_ret = portfolio_returns(rets, w)
+
+    # 3) Block bootstrap
+    paths_ret, paths_eq = block_bootstrap_paths(
+        port_ret,
+        horizon_days=cfg.horizon_days,
+        n_paths=cfg.n_paths,
+        block_len=cfg.block_len,
+    )
+
+    # 4) Per-path stats
+    stats_df = path_statistics(paths_ret, paths_eq)
+
+    # 5) Summary distributions
+    term = stats_df["terminal_wealth"].to_numpy()
+    max_dd = stats_df["max_dd"].to_numpy()
+    ann_ret = stats_df["ann_ret"].to_numpy()
+    ann_vol = stats_df["ann_vol"].to_numpy()
+    sharpe = stats_df["sharpe"].to_numpy()
+
+    def quantiles(arr: np.ndarray, qs):
+        return {f"q{int(q*100):02d}": float(np.quantile(arr, q)) for q in qs}
+
+    qs = [0.01, 0.05, 0.5, 0.95, 0.99]
+
+    summary = {
+        "config": asdict(cfg),
+        "portfolio": {
+            "symbols": cfg.symbols,
+            "weights": w.tolist(),
+        },
+        "sample": {
+            "n_obs": int(port_ret.dropna().shape[0]),
+            "start_date": str(port_ret.index.min().date()),
+            "end_date": str(port_ret.index.max().date()),
+        },
+        "sim": {
+            "horizon_days": cfg.horizon_days,
+            "n_paths": cfg.n_paths,
+            "block_len": cfg.block_len,
+        },
+        "distributions": {
+            "terminal_wealth": quantiles(term, qs),
+            "max_drawdown": quantiles(max_dd, qs),
+            "ann_ret": quantiles(ann_ret, qs),
+            "ann_vol": quantiles(ann_vol, qs),
+            "sharpe": quantiles(sharpe, qs),
+        },
+        "means": {
+            "terminal_wealth": float(np.mean(term)),
+            "max_drawdown": float(np.mean(max_dd)),
+            "ann_ret": float(np.mean(ann_ret)),
+            "ann_vol": float(np.mean(ann_vol)),
+            "sharpe": float(np.mean(sharpe)),
+        },
+    }
+
+    # 6) Timeseries paths as DataFrame
+    t_index = np.arange(1, cfg.horizon_days + 1, dtype=int)
+    paths_df = pd.DataFrame(
+        paths_eq,
+        index=t_index,
+        columns=[f"path_{j}" for j in range(cfg.n_paths)],
+    )
+    paths_df.index.name = "t"
+
+    return paths_df, stats_df, summary
+
+
+# --------------------------- I/O ---------------------------
+
+def save_outputs(
+    paths_df: pd.DataFrame, stats_df: pd.DataFrame, summary: dict, cfg: Config
+) -> None:
+    paths_df.to_csv(cfg.out_paths_csv, index=True)
+    stats_df.to_csv(cfg.out_stats_csv, index=True)
+    with open(cfg.out_json, "w") as f:
+        json.dump(summary, f, indent=2)
+
+    print(f"[OK] Saved bootstrap paths → {cfg.out_paths_csv}")
+    print(f"[OK] Saved path stats      → {cfg.out_stats_csv}")
+    print(f"[OK] Saved summary         → {cfg.out_json}")
+
+    sample = summary["sample"]
+    sim = summary["sim"]
+    print(
+        f"Sample {sample['start_date']} → {sample['end_date']} "
+        f"(n_obs={sample['n_obs']}), symbols={summary['portfolio']['symbols']}"
+    )
+    print(
+        f"Simulated {sim['n_paths']} paths of {sim['horizon_days']} days "
+        f"with block_len={sim['block_len']}."
+    )
+
+    means = summary["means"]
+    print(
+        f"Mean terminal wealth={means['terminal_wealth']:.3f}, "
+        f"mean max_dd={means['max_drawdown']*100:.2f}%, "
+        f"mean ann_ret={means['ann_ret']*100:.2f}%, "
+        f"mean ann_vol={means['ann_vol']*100:.2f}%, "
+        f"mean Sharpe={means['sharpe']:.2f}"
+    )
+
+
+# --------------------------- CLI ---------------------------
+
+def parse_args() -> Config:
+    p = argparse.ArgumentParser(
+        description="Level-77: Block-bootstrap portfolio scenario engine"
+    )
+    p.add_argument(
+        "--symbols",
+        type=str,
+        default="SPY,QQQ,IWM,EFA,EEM,TLT,LQD,GLD",
+        help="Comma-separated tickers",
+    )
+    p.add_argument("--start", type=str, default="2010-01-01")
+    p.add_argument(
+        "--weights",
+        type=str,
+        default=None,
+        help="Comma-separated weights (same order as symbols). If omitted, equal-weight.",
+    )
+    p.add_argument(
+        "--horizon",
+        type=int,
+        default=252,
+        help="Days per simulated path.",
+    )
+    p.add_argument(
+        "--n-paths",
+        type=int,
+        default=1000,
+        help="Number of bootstrap paths.",
+    )
+    p.add_argument(
+        "--block-len",
+        type=int,
+        default=20,
+        help="Block length in days for block bootstrap.",
+    )
+    p.add_argument(
+        "--paths-csv",
+        type=str,
+        default="level77_bootstrap_paths.csv",
+    )
+    p.add_argument(
+        "--stats-csv",
+        type=str,
+        default="level77_bootstrap_stats.csv",
+    )
+    p.add_argument(
+        "--json",
+        type=str,
+        default="level77_bootstrap_summary.json",
+    )
+    p.add_argument("--seed", type=int, default=42)
+
+    a = p.parse_args()
+
+    symbols = tuple(s.strip() for s in a.symbols.split(",") if s.strip())
+
+    if a.weights is not None:
+        w_list = [float(x) for x in a.weights.split(",") if x.strip() != ""]
+        weights = tuple(w_list)
+    else:
+        weights = None
+
+    return Config(
+        symbols=symbols,
+        start=a.start,
+        weights=weights,
+        horizon_days=a.horizon,
+        n_paths=a.n_paths,
+        block_len=a.block_len,
+        out_paths_csv=a.paths_csv,
+        out_stats_csv=a.stats_csv,
+        out_json=a.json,
+        seed=a.seed,
+    )
+
+
+# --------------------------- Main ---------------------------
+
+def main() -> None:
+    cfg = parse_args()
+    np.random.seed(cfg.seed)
+
+    print(f"[INFO] Downloading prices for {cfg.symbols} from {cfg.start} ...")
+    paths_df, stats_df, summary = run_pipeline(cfg)
+    save_outputs(paths_df, stats_df, summary, cfg)
+
+
+if __name__ == "__main__":
+    # Jupyter / PyCharm shim: strip kernel args like "-f kernel-xxxx.json"
+    import sys
+
+    sys.argv = [sys.argv[0]] + [
+        arg
+        for arg in sys.argv[1:]
+        if arg != "-f" and not (arg.endswith(".json") and "kernel" in arg)
+    ]
+    main()
+```
+
+If you want, next step we can:
+
+* Hard-code **your ETF set + weights** from Level-62/63 into this, and
+* Or extend this to **stress testing** (e.g., only resample from 2008, COVID, 2022, etc. as “crisis regime” blocks).
