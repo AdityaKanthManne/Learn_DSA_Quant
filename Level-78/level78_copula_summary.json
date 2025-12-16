@@ -1,0 +1,44 @@
+{
+  "config": {
+    "symbols": [
+      "SPY",
+      "QQQ",
+      "IWM",
+      "EFA",
+      "EEM",
+      "TLT",
+      "LQD",
+      "GLD"
+    ],
+    "start": "2010-01-01",
+    "horizon_days": 252,
+    "n_paths": 1000,
+    "out_paths_csv": "level78_copula_paths.csv",
+    "out_stats_csv": "level78_copula_stats.csv",
+    "out_summary_json": "level78_copula_summary.json",
+    "seed": 42,
+    "corr_shrink": 0.05
+  },
+  "n_paths": 1000,
+  "horizon_days": 252,
+  "final_wealth": {
+    "mean": 1.078528437594894,
+    "median": 1.066995792572418,
+    "p05": 0.9026686805853193,
+    "p25": 0.991921708480958,
+    "p75": 1.1525436147924806,
+    "p95": 1.295058681471468
+  },
+  "max_drawdown": {
+    "mean": -0.10303096979298315,
+    "median": -0.09581042229551401,
+    "p05": -0.17901745988634754,
+    "p25": -0.12591615016163507,
+    "p75": -0.07339754807648952,
+    "p95": -0.050894603842363745
+  },
+  "sharpe": {
+    "mean": 0.7020354488806835,
+    "median": 0.609350933357164
+  }
+}
