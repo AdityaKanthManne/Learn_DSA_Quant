@@ -1,0 +1,703 @@
+```python
+# level79_tcopula_stress.py
+# Level-79: Multi-Asset t-Copula + Stress Testing + VaR/CVaR (Free Data)
+# ----------------------------------------------------------------------
+# What you get:
+# 1) yfinance daily prices (auto_adjust=True) for a basket
+# 2) Empirical marginals (non-parametric) OR winsorized empirical marginals
+# 3) Student-t copula calibration:
+#       - Convert returns -> uniforms via empirical ranks
+#       - uniforms -> t-quantiles
+#       - estimate correlation of t-quantiles
+#       - choose df (nu) by a simple grid-search maximizing pseudo log-likelihood
+# 4) Scenario simulation:
+#       - draw correlated multivariate t with df=nu
+#       - map to uniforms via t-CDF
+#       - map to empirical inverse CDF per asset
+# 5) Portfolio backtest over simulated horizon (equal-weight or custom weights)
+# 6) Stress tools:
+#       - correlation shock (blend corr toward 1)
+#       - vol shock (scale returns)
+#       - crash day injection (forced shock day)
+# 7) Outputs:
+#       - CSV: simulated portfolio equity paths
+#       - CSV: per-path risk stats (VaR/CVaR/MaxDD/etc.)
+#       - JSON: summary
+#
+# Example:
+#   python level79_tcopula_stress.py ^
+#     --symbols SPY,QQQ,IWM,EFA,EEM,TLT,LQD,GLD ^
+#     --start 2010-01-01 --horizon-days 252 --n-paths 2000 ^
+#     --nu-grid 4,6,8,10,15,20 ^
+#     --corr-shock 0.15 --vol-shock 1.10 --crash-day -1 --crash-bps -400
+#
+# Notes:
+# - This is intentionally dependency-light: only numpy/pandas/yfinance.
+# - No SciPy used (t CDF/PPF implemented via numerical methods).
+# - Numerical t-PPF uses a stable bisection per point (fast enough for ~thousands paths).
+
+import os
+import json
+import math
+import argparse
+from dataclasses import dataclass, asdict
+from typing import Sequence, Tuple, Optional, List, Dict
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+
+
+# ----------------------------- Config -----------------------------
+
+@dataclass
+class Config:
+    symbols: Tuple[str, ...] = ("SPY", "QQQ", "IWM", "EFA", "EEM", "TLT", "LQD", "GLD")
+    start: str = "2010-01-01"
+    horizon_days: int = 252
+    n_paths: int = 2000
+    seed: int = 42
+
+    # Copula calibration
+    nu_grid: Tuple[int, ...] = (4, 6, 8, 10, 15, 20)
+    corr_shrink: float = 0.05  # stabilize corr matrix
+
+    # Marginals
+    winsor_p: float = 0.0      # e.g. 0.001 to winsorize tails (0 disables)
+
+    # Portfolio weights (optional)
+    weights_csv: str = ""      # optional CSV with columns: symbol, weight
+    equal_weight: bool = True
+
+    # Stress knobs
+    corr_shock: float = 0.0    # 0=no shock, 0.2 blends corr 20% toward 1's off-diagonal
+    vol_shock: float = 1.0     # scale all simulated returns (e.g., 1.2 for +20% vol)
+    crash_day: int = -9999     # set 0..H-1 to inject a crash day; -9999 disables
+    crash_bps: float = -300.0  # crash day shock in bps applied to ALL assets (e.g. -400 bps = -4%)
+
+    # Outputs
+    out_paths_csv: str = "level79_tcopula_paths.csv"
+    out_stats_csv: str = "level79_tcopula_pathstats.csv"
+    out_summary_json: str = "level79_tcopula_summary.json"
+
+
+# ----------------------------- Utilities -----------------------------
+
+def parse_symbol_string(s: str) -> Tuple[str, ...]:
+    parts = [p.strip().upper() for p in s.split(",") if p.strip()]
+    if not parts:
+        raise ValueError("No symbols parsed from --symbols.")
+    return tuple(parts)
+
+
+def ensure_pos_def_corr(corr: np.ndarray, shrink: float = 0.0) -> np.ndarray:
+    corr = np.asarray(corr, dtype=float)
+    corr = 0.5 * (corr + corr.T)
+    n = corr.shape[0]
+    if shrink > 0.0:
+        corr = (1.0 - shrink) * corr + shrink * np.eye(n)
+
+    eps = 1e-10
+    for _ in range(10):
+        try:
+            np.linalg.cholesky(corr)
+            return corr
+        except np.linalg.LinAlgError:
+            corr = corr + eps * np.eye(n)
+            eps *= 10.0
+    raise RuntimeError("Could not make correlation matrix positive definite.")
+
+
+def load_prices(symbols: Sequence[str], start: str) -> pd.DataFrame:
+    data = yf.download(list(symbols), start=start, auto_adjust=True, progress=False)
+    if data.empty:
+        raise RuntimeError("No data returned from yfinance.")
+
+    if isinstance(data.columns, pd.MultiIndex):
+        lvl0 = data.columns.get_level_values(0)
+        if "Adj Close" in lvl0:
+            px = data["Adj Close"]
+        elif "Close" in lvl0:
+            px = data["Close"]
+        else:
+            raise RuntimeError("Could not find 'Adj Close' or 'Close' in yfinance result.")
+    else:
+        if "Adj Close" in data.columns:
+            px = data["Adj Close"]
+        elif "Close" in data.columns:
+            px = data["Close"]
+        else:
+            raise RuntimeError("Could not find 'Adj Close' or 'Close' in yfinance result.")
+
+    # Ensure columns are exactly the symbols in requested order
+    missing = [s for s in symbols if s not in px.columns]
+    if missing:
+        raise RuntimeError(f"Missing symbols in downloaded prices: {missing}")
+
+    px = px[list(symbols)].ffill().dropna()
+    return px
+
+
+def compute_log_returns(prices: pd.DataFrame) -> pd.DataFrame:
+    rets = np.log(prices / prices.shift(1))
+    rets = rets.replace([np.inf, -np.inf], np.nan).dropna()
+    return rets
+
+
+def winsorize(x: np.ndarray, p: float) -> np.ndarray:
+    if p <= 0.0:
+        return x
+    lo = np.quantile(x, p)
+    hi = np.quantile(x, 1.0 - p)
+    return np.clip(x, lo, hi)
+
+
+def empirical_u(rets: np.ndarray) -> np.ndarray:
+    """
+    Convert returns (T x N) into uniforms via ranks (pseudo-observations).
+    """
+    T, N = rets.shape
+    U = np.empty_like(rets, dtype=float)
+    for j in range(N):
+        r = rets[:, j]
+        # ranks in 1..T
+        order = np.argsort(r)
+        ranks = np.empty(T, dtype=float)
+        ranks[order] = np.arange(1, T + 1, dtype=float)
+        # (ranks - 0.5)/T to avoid 0/1 exactly
+        U[:, j] = (ranks - 0.5) / T
+    return U
+
+
+def empirical_inv_cdf(sample: np.ndarray, u: np.ndarray) -> np.ndarray:
+    sample = np.asarray(sample, dtype=float)
+    u = np.asarray(u, dtype=float)
+    u = np.clip(u, 1e-6, 1.0 - 1e-6)
+    q = np.quantile(sample, u.ravel()).reshape(u.shape)
+    return q
+
+
+# ----------------------------- Student-t functions (no SciPy) -----------------------------
+# We use:
+#  - t PDF for log-likelihood (stable)
+#  - t CDF approx via numerical integration with symmetry
+#  - t PPF via bisection using the CDF
+#
+# This is intentionally simple and robust. For large-scale production,
+# you'd use SciPy.
+
+def t_log_pdf(x: np.ndarray, nu: float) -> np.ndarray:
+    """
+    log pdf of standard Student-t(df=nu)
+    """
+    x = np.asarray(x, dtype=float)
+    # log gamma((nu+1)/2) - log gamma(nu/2) - 0.5*log(nu*pi) - ((nu+1)/2)*log(1 + x^2/nu)
+    a = math.lgamma((nu + 1.0) / 2.0) - math.lgamma(nu / 2.0)
+    b = -0.5 * (math.log(nu) + math.log(math.pi))
+    c = -((nu + 1.0) / 2.0) * np.log1p((x * x) / nu)
+    return a + b + c
+
+
+def t_cdf_scalar(x: float, nu: float, n_steps: int = 600) -> float:
+    """
+    Numeric CDF via Simpson-ish composite rule on [0, |x|] using symmetry:
+        F(x) = 0.5 + sign(x) * integral_0^{|x|} f(t) dt
+    """
+    if x == 0.0:
+        return 0.5
+    sign = 1.0 if x > 0 else -1.0
+    a = 0.0
+    b = abs(x)
+
+    # composite trapezoid is ok here; keep it stable
+    xs = np.linspace(a, b, n_steps + 1)
+    # pdf values (in exp space); safe since pdf not too extreme
+    logf = t_log_pdf(xs, nu)
+    f = np.exp(logf)
+    area = np.trapz(f, xs)
+    cdf = 0.5 + sign * area
+    return float(np.clip(cdf, 1e-12, 1.0 - 1e-12))
+
+
+def t_cdf(x: np.ndarray, nu: float) -> np.ndarray:
+    x = np.asarray(x, dtype=float)
+    out = np.empty_like(x, dtype=float)
+    it = np.nditer(x, flags=["multi_index"])
+    while not it.finished:
+        out[it.multi_index] = t_cdf_scalar(float(it[0]), nu)
+        it.iternext()
+    return out
+
+
+def t_ppf_scalar(u: float, nu: float) -> float:
+    """
+    Inverse CDF by bisection.
+    """
+    u = float(np.clip(u, 1e-10, 1.0 - 1e-10))
+    # symmetric
+    if u < 0.5:
+        target = u
+        sign = -1.0
+        uu = 1.0 - u  # use symmetry F(-x)=1-F(x)
+        # invert uu on positive side, then negate
+        target_pos = uu
+    else:
+        sign = 1.0
+        target_pos = u
+
+    # bracket
+    lo, hi = 0.0, 20.0
+    # widen if needed
+    while t_cdf_scalar(hi, nu) < target_pos:
+        hi *= 2.0
+        if hi > 200.0:
+            break
+
+    # bisection
+    for _ in range(60):
+        mid = 0.5 * (lo + hi)
+        cmid = t_cdf_scalar(mid, nu)
+        if cmid < target_pos:
+            lo = mid
+        else:
+            hi = mid
+    x_pos = 0.5 * (lo + hi)
+    return float(sign * x_pos)
+
+
+def t_ppf(u: np.ndarray, nu: float) -> np.ndarray:
+    u = np.asarray(u, dtype=float)
+    out = np.empty_like(u, dtype=float)
+    it = np.nditer(u, flags=["multi_index"])
+    while not it.finished:
+        out[it.multi_index] = t_ppf_scalar(float(it[0]), nu)
+        it.iternext()
+    return out
+
+
+# ----------------------------- Copula calibration -----------------------------
+
+def pseudo_loglik_tcopula(Z: np.ndarray, corr: np.ndarray, nu: float) -> float:
+    """
+    Pseudo log-likelihood for t-copula on transformed t-quantiles Z (T x N).
+    Up to constant terms, evaluate:
+        sum_t [ log f_{t,N}(z_t; corr, nu) - sum_i log f_{t,1}(z_{t,i}; nu) ]
+    Where f_{t,N} is multivariate t density, and f_{t,1} is univariate t density.
+    """
+    T, N = Z.shape
+    corr = ensure_pos_def_corr(corr, shrink=0.0)
+    invR = np.linalg.inv(corr)
+    sign, logdet = np.linalg.slogdet(corr)
+    if sign <= 0:
+        return -np.inf
+
+    # multivariate t log-density constants:
+    # logC = lgamma((nu+N)/2)-lgamma(nu/2) - 0.5*(N*log(nu*pi) + log|R|)
+    logC = (
+        math.lgamma((nu + N) / 2.0)
+        - math.lgamma(nu / 2.0)
+        - 0.5 * (N * (math.log(nu) + math.log(math.pi)) + logdet)
+    )
+
+    # quadratic forms
+    q = np.einsum("ti,ij,tj->t", Z, invR, Z)  # length T
+    log_joint = logC - ((nu + N) / 2.0) * np.log1p(q / nu)
+
+    # sum of univariate logs
+    log_uni = np.sum(t_log_pdf(Z, nu), axis=1)  # length T
+
+    ll = float(np.sum(log_joint - log_uni))
+    return ll
+
+
+def calibrate_tcopula(rets: pd.DataFrame, nu_grid: Sequence[int], corr_shrink: float) -> Dict[str, object]:
+    """
+    Returns dict with:
+      nu_best, corr_best, chol_best
+    """
+    R = rets.values
+    T, N = R.shape
+
+    U = empirical_u(R)
+    # We will fit nu by grid: transform uniforms to t-quantiles at each nu, estimate corr, compute PLL.
+    best = {"nu": None, "pll": -np.inf, "corr": None}
+
+    for nu in nu_grid:
+        Z = t_ppf(U, float(nu))  # T x N
+        corr = np.corrcoef(Z, rowvar=False)
+        corr = ensure_pos_def_corr(corr, shrink=corr_shrink)
+
+        pll = pseudo_loglik_tcopula(Z, corr, float(nu))
+        if pll > best["pll"]:
+            best.update({"nu": int(nu), "pll": float(pll), "corr": corr})
+
+    if best["corr"] is None or best["nu"] is None:
+        raise RuntimeError("Failed to calibrate t-copula.")
+
+    chol = np.linalg.cholesky(best["corr"])
+    return {"nu": best["nu"], "pll": best["pll"], "corr": best["corr"], "chol": chol}
+
+
+# ----------------------------- Stress knobs -----------------------------
+
+def apply_corr_shock(corr: np.ndarray, shock: float) -> np.ndarray:
+    """
+    Blend off-diagonal correlation toward 1.0:
+      corr_ij' = (1-shock)*corr_ij + shock*1   for i!=j
+      diag stays 1.
+    """
+    shock = float(np.clip(shock, 0.0, 0.999))
+    if shock <= 0.0:
+        return corr
+    n = corr.shape[0]
+    out = corr.copy()
+    ones = np.ones((n, n), dtype=float)
+    out = (1.0 - shock) * out + shock * ones
+    np.fill_diagonal(out, 1.0)
+    return ensure_pos_def_corr(out, shrink=0.02)  # small stabilization
+
+
+def inject_crash(asset_ret_paths: np.ndarray, crash_day: int, crash_bps: float) -> None:
+    """
+    In-place crash day injection: add the same shock to all assets for a chosen day.
+    crash_bps: -400 => -0.04 additive log-return approx; we apply simple return shock:
+               shock_simple = crash_bps/1e4
+    """
+    H, P, N = asset_ret_paths.shape
+    if crash_day < 0 or crash_day >= H:
+        return
+    shock = float(crash_bps) / 1e4
+    asset_ret_paths[crash_day, :, :] += shock
+
+
+# ----------------------------- Simulation -----------------------------
+
+def draw_multivariate_t(H: int, P: int, chol: np.ndarray, nu: float) -> np.ndarray:
+    """
+    Draw correlated multivariate t using:
+      Z ~ N(0, R)
+      g ~ ChiSquare(nu)/nu
+      X = Z / sqrt(g)
+    Returns (H, P, N)
+    """
+    N = chol.shape[0]
+    Z = np.random.normal(size=(H * P, N)) @ chol.T
+    Z = Z.reshape(H, P, N)
+
+    # Chi-square via gamma: ChiSq(nu) ~ Gamma(k=nu/2, theta=2)
+    g = np.random.gamma(shape=nu / 2.0, scale=2.0, size=(H, P, 1))
+    g = g / nu
+    X = Z / np.sqrt(g)
+    return X
+
+
+def simulate_paths(
+    cfg: Config,
+    rets: pd.DataFrame,
+    calib: Dict[str, object],
+    weights: np.ndarray,
+) -> Tuple[np.ndarray, pd.DataFrame, Dict[str, object]]:
+    """
+    Returns:
+      equity_paths: (H, P)
+      stats_df: per-path stats
+      summary: dict
+    """
+    R = rets.values
+    T, N = R.shape
+    H, P = cfg.horizon_days, cfg.n_paths
+
+    nu = float(calib["nu"])
+    corr = np.asarray(calib["corr"], dtype=float)
+
+    # Stress: corr shock
+    corr_use = apply_corr_shock(corr, cfg.corr_shock)
+    chol = np.linalg.cholesky(corr_use)
+
+    # Draw multivariate t
+    X = draw_multivariate_t(H, P, chol, nu=nu)  # t-quantiles
+
+    # Convert to uniforms via t-CDF
+    U = t_cdf(X, nu=nu)  # (H,P,N)
+
+    # Map to empirical marginals per asset
+    asset_ret_paths = np.empty_like(U, dtype=float)
+    for j in range(N):
+        sample = R[:, j]
+        asset_ret_paths[:, :, j] = empirical_inv_cdf(sample, U[:, :, j])
+
+    # Stress: vol shock (scale returns)
+    asset_ret_paths *= float(cfg.vol_shock)
+
+    # Stress: crash day injection
+    if cfg.crash_day != -9999:
+        inject_crash(asset_ret_paths, cfg.crash_day, cfg.crash_bps)
+
+    # Portfolio simple returns: use log-returns -> convert to simple approx
+    # If your R are log-returns, then simple = exp(r)-1. We'll do that consistently.
+    asset_simple = np.expm1(asset_ret_paths)
+    port_simple = np.tensordot(asset_simple, weights, axes=([2], [0]))  # (H,P)
+
+    # Equity curves
+    equity = np.empty((H, P), dtype=float)
+    equity[0, :] = 1.0 * (1.0 + port_simple[0, :])
+    for t in range(1, H):
+        equity[t, :] = equity[t - 1, :] * (1.0 + port_simple[t, :])
+
+    # Path stats
+    stats_df = compute_path_stats(equity, port_simple, H)
+
+    # Summary
+    summary = build_summary(cfg, stats_df, nu=nu, corr=corr_use)
+    return equity, stats_df, summary
+
+
+def max_drawdown(equity: np.ndarray) -> float:
+    equity = np.asarray(equity, dtype=float)
+    roll = np.maximum.accumulate(equity)
+    dd = equity / roll - 1.0
+    return float(dd.min())
+
+
+def compute_path_stats(equity: np.ndarray, port_simple: np.ndarray, H: int) -> pd.DataFrame:
+    """
+    equity: (H,P)
+    port_simple: (H,P)
+    """
+    H2, P = equity.shape
+    assert H2 == H
+
+    out = {
+        "final_wealth": np.empty(P),
+        "ann_ret": np.empty(P),
+        "ann_vol": np.empty(P),
+        "sharpe": np.empty(P),
+        "max_dd": np.empty(P),
+        "var_95_1d": np.empty(P),
+        "cvar_95_1d": np.empty(P),
+    }
+
+    for i in range(P):
+        eq = equity[:, i]
+        r = port_simple[:, i]
+        out["final_wealth"][i] = float(eq[-1])
+        out["ann_ret"][i] = float(eq[-1] ** (252.0 / H) - 1.0)
+        out["ann_vol"][i] = float(np.std(r, ddof=1) * math.sqrt(252.0)) if H > 1 else float("nan")
+        out["sharpe"][i] = (
+            out["ann_ret"][i] / out["ann_vol"][i] if out["ann_vol"][i] > 0 else float("nan")
+        )
+        out["max_dd"][i] = max_drawdown(eq)
+
+        # 1-day VaR/CVaR at 95% on *loss* (negative return)
+        losses = -r
+        var = float(np.quantile(losses, 0.95))
+        tail = losses[losses >= var]
+        cvar = float(np.mean(tail)) if tail.size else float("nan")
+        out["var_95_1d"][i] = var
+        out["cvar_95_1d"][i] = cvar
+
+    idx = [f"path_{i}" for i in range(P)]
+    return pd.DataFrame(out, index=idx)
+
+
+def build_summary(cfg: Config, stats_df: pd.DataFrame, nu: float, corr: np.ndarray) -> Dict[str, object]:
+    fw = stats_df["final_wealth"].values
+    mdd = stats_df["max_dd"].values
+    sh = stats_df["sharpe"].values
+    var = stats_df["var_95_1d"].values
+    cvar = stats_df["cvar_95_1d"].values
+
+    def pct(x, p):
+        return float(np.percentile(x, p))
+
+    summary = {
+        "config": asdict(cfg),
+        "copula": {
+            "type": "t-copula",
+            "nu": float(nu),
+        },
+        "final_wealth": {
+            "mean": float(np.mean(fw)),
+            "median": float(np.median(fw)),
+            "p05": pct(fw, 5),
+            "p95": pct(fw, 95),
+        },
+        "max_dd": {
+            "mean": float(np.mean(mdd)),
+            "median": float(np.median(mdd)),
+            "p05": pct(mdd, 5),
+            "p95": pct(mdd, 95),
+        },
+        "sharpe": {
+            "mean": float(np.nanmean(sh)),
+            "median": float(np.nanmedian(sh)),
+        },
+        "var_95_1d": {
+            "mean": float(np.mean(var)),
+            "median": float(np.median(var)),
+        },
+        "cvar_95_1d": {
+            "mean": float(np.nanmean(cvar)),
+            "median": float(np.nanmedian(cvar)),
+        },
+        "corr_used": corr.tolist(),
+        "notes": {
+            "var_cvar_units": "simple return losses (e.g., 0.02 = 2% loss)",
+            "max_dd_units": "fraction (e.g., -0.35 = -35%)",
+        },
+    }
+    return summary
+
+
+def load_weights(cfg: Config) -> np.ndarray:
+    n = len(cfg.symbols)
+    if cfg.weights_csv.strip():
+        dfw = pd.read_csv(cfg.weights_csv)
+        if not {"symbol", "weight"}.issubset(dfw.columns):
+            raise ValueError("weights_csv must have columns: symbol, weight")
+        dfw["symbol"] = dfw["symbol"].astype(str).str.upper().str.strip()
+        w_map = {s: float(w) for s, w in zip(dfw["symbol"], dfw["weight"])}
+
+        w = np.array([w_map.get(s, 0.0) for s in cfg.symbols], dtype=float)
+        if np.allclose(w.sum(), 0.0):
+            raise ValueError("Weights sum to 0. Check your weights_csv.")
+        w = w / w.sum()
+        return w
+
+    # default equal-weight
+    return np.full(n, 1.0 / n, dtype=float)
+
+
+# ----------------------------- CLI + Pipeline -----------------------------
+
+def parse_int_list(s: str) -> Tuple[int, ...]:
+    parts = [p.strip() for p in s.split(",") if p.strip()]
+    vals = tuple(int(p) for p in parts)
+    if not vals:
+        raise ValueError("Empty --nu-grid.")
+    return vals
+
+
+def parse_args() -> Config:
+    p = argparse.ArgumentParser(description="Level-79: t-Copula Stress Scenario Engine")
+    p.add_argument("--symbols", type=str, default="SPY,QQQ,IWM,EFA,EEM,TLT,LQD,GLD")
+    p.add_argument("--start", type=str, default="2010-01-01")
+    p.add_argument("--horizon-days", type=int, default=252)
+    p.add_argument("--n-paths", type=int, default=2000)
+    p.add_argument("--seed", type=int, default=42)
+
+    p.add_argument("--nu-grid", type=str, default="4,6,8,10,15,20")
+    p.add_argument("--corr-shrink", type=float, default=0.05)
+    p.add_argument("--winsor-p", type=float, default=0.0)
+
+    p.add_argument("--weights-csv", type=str, default="")
+    p.add_argument("--corr-shock", type=float, default=0.0)
+    p.add_argument("--vol-shock", type=float, default=1.0)
+    p.add_argument("--crash-day", type=int, default=-9999)
+    p.add_argument("--crash-bps", type=float, default=-300.0)
+
+    p.add_argument("--paths-csv", type=str, default="level79_tcopula_paths.csv")
+    p.add_argument("--stats-csv", type=str, default="level79_tcopula_pathstats.csv")
+    p.add_argument("--summary-json", type=str, default="level79_tcopula_summary.json")
+
+    a = p.parse_args()
+
+    return Config(
+        symbols=parse_symbol_string(a.symbols),
+        start=a.start,
+        horizon_days=a.horizon_days,
+        n_paths=a.n_paths,
+        seed=a.seed,
+        nu_grid=parse_int_list(a.nu_grid),
+        corr_shrink=float(a.corr_shrink),
+        winsor_p=float(a.winsor_p),
+        weights_csv=str(a.weights_csv),
+        corr_shock=float(a.corr_shock),
+        vol_shock=float(a.vol_shock),
+        crash_day=int(a.crash_day),
+        crash_bps=float(a.crash_bps),
+        out_paths_csv=str(a.paths_csv),
+        out_stats_csv=str(a.stats_csv),
+        out_summary_json=str(a.summary_json),
+    )
+
+
+def save_outputs(equity: np.ndarray, stats_df: pd.DataFrame, summary: Dict[str, object], cfg: Config) -> None:
+    os.makedirs(os.path.dirname(cfg.out_paths_csv) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(cfg.out_stats_csv) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(cfg.out_summary_json) or ".", exist_ok=True)
+
+    H, P = equity.shape
+    paths_index = pd.RangeIndex(1, H + 1, name="t")
+    paths_cols = [f"path_{i}" for i in range(P)]
+    paths_df = pd.DataFrame(equity, index=paths_index, columns=paths_cols)
+
+    paths_df.to_csv(cfg.out_paths_csv)
+    stats_df.to_csv(cfg.out_stats_csv)
+
+    with open(cfg.out_summary_json, "w") as f:
+        json.dump(summary, f, indent=2)
+
+    print(f"[OK] Saved equity paths -> {cfg.out_paths_csv}")
+    print(f"[OK] Saved per-path stats -> {cfg.out_stats_csv}")
+    print(f"[OK] Saved summary -> {cfg.out_summary_json}")
+
+    print(
+        f"nu={summary['copula']['nu']:.0f} | FinalWealth median={summary['final_wealth']['median']:.3f} "
+        f"(p05={summary['final_wealth']['p05']:.3f}, p95={summary['final_wealth']['p95']:.3f})"
+    )
+    print(
+        f"MaxDD median={100*summary['max_dd']['median']:.1f}% | "
+        f"VaR95(1d) median={100*summary['var_95_1d']['median']:.2f}% | "
+        f"CVaR95(1d) median={100*summary['cvar_95_1d']['median']:.2f}%"
+    )
+
+
+def run_pipeline(cfg: Config) -> None:
+    np.random.seed(cfg.seed)
+
+    print(f"[INFO] Downloading prices for {cfg.symbols} from {cfg.start} ...")
+    prices = load_prices(cfg.symbols, cfg.start)
+    rets = compute_log_returns(prices)
+
+    # Optional winsorization for calibration stability
+    if cfg.winsor_p > 0.0:
+        R = rets.values.copy()
+        for j in range(R.shape[1]):
+            R[:, j] = winsorize(R[:, j], cfg.winsor_p)
+        rets = pd.DataFrame(R, index=rets.index, columns=rets.columns)
+
+    print(f"[INFO] Got {len(prices)} price rows, {len(rets)} return rows, assets={rets.shape[1]}")
+    print(f"[INFO] Calibrating t-copula nu over grid: {cfg.nu_grid} ...")
+
+    calib = calibrate_tcopula(rets, cfg.nu_grid, cfg.corr_shrink)
+    print(f"[INFO] Best nu={calib['nu']} (pseudo-LL={calib['pll']:.2f})")
+
+    weights = load_weights(cfg)
+    if cfg.weights_csv.strip():
+        print("[INFO] Using custom weights from CSV.")
+    else:
+        print("[INFO] Using equal-weight portfolio.")
+    print("[INFO] Stress: corr_shock=%.3f, vol_shock=%.3f, crash_day=%s, crash_bps=%.1f"
+          % (cfg.corr_shock, cfg.vol_shock, str(cfg.crash_day), cfg.crash_bps))
+
+    equity, stats_df, summary = simulate_paths(cfg, rets, calib, weights)
+    save_outputs(equity, stats_df, summary, cfg)
+
+
+def main() -> None:
+    cfg = parse_args()
+    run_pipeline(cfg)
+
+
+if __name__ == "__main__":
+    # Jupyter/PyCharm shim: remove kernel args
+    import sys
+    sys.argv = [sys.argv[0]] + [
+        arg for arg in sys.argv[1:]
+        if arg != "-f" and not (arg.endswith(".json") and "kernel" in arg)
+    ]
+    main()
+```
+
+If you tell me what **Level-79 goal** is in your roadmap (e.g., “copula VaR for multi-asset portfolio” vs “stress test engine”), I can align the outputs/metrics exactly to that spec.
