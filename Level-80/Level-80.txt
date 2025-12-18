@@ -1,0 +1,526 @@
+```python
+# level80_tcopula_var_es_fast.py
+# Level-80: FAST t-Copula Portfolio VaR/ES (SciPy optional) + Rolling Backtest
+#
+# Fixes you hit previously:
+# - No np.trapzoid typo (uses np.trapezoid if available, else np.trapz)
+# - Avoids DataFrame.rename(str) bug (uses Series.name = symbol)
+# - Robust yfinance column handling (handles MultiIndex columns safely)
+# - Avoids deprecated Pandas resample('M') usage (not needed here)
+#
+# Outputs:
+#   - level80_tcopula_panel.csv   (daily returns + pnl + rolling VaR/ES)
+#   - level80_tcopula_summary.json
+#
+# Run:
+#   python level80_tcopula_var_es_fast.py
+#   python level80_tcopula_var_es_fast.py --sims 100000 --alphas 0.95 0.99
+#   python level80_tcopula_var_es_fast.py --no-rolling
+#   python level80_tcopula_var_es_fast.py --weights 0.2 0.2 0.2 0.2 0.1 0.05 0.025 0.025
+
+import os
+import json
+import math
+import argparse
+from dataclasses import dataclass, asdict
+from typing import Tuple, List, Optional, Dict
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+
+# ----------------------------- SciPy optional -----------------------------
+try:
+    from scipy import stats  # type: ignore
+    SCIPY_OK = True
+except Exception:
+    SCIPY_OK = False
+
+
+# ----------------------------- Config -----------------------------
+@dataclass
+class Config:
+    symbols: Tuple[str, ...] = ("SPY", "QQQ", "IWM", "EFA", "EEM", "TLT", "LQD", "GLD")
+    start: str = "2010-01-01"
+
+    nu_grid: Tuple[int, ...] = (4, 6, 8, 10, 15, 20)
+    corr_shrink: float = 0.05
+
+    sims: int = 50000
+    seed: int = 42
+    alphas: Tuple[float, ...] = (0.95, 0.99)
+
+    weights: Optional[List[float]] = None
+    notional: float = 1_000_000.0
+
+    # Rolling backtest
+    rolling_window: int = 750
+    roll_step: int = 5
+    do_rolling: bool = True
+
+    out_csv: str = "level80_tcopula_panel.csv"
+    out_json: str = "level80_tcopula_summary.json"
+
+
+# ----------------------------- Numeric helpers -----------------------------
+def trapz_compat(y: np.ndarray, x: np.ndarray) -> float:
+    # numpy has trapezoid (new) and trapz (old); we support both
+    if hasattr(np, "trapezoid"):
+        return float(np.trapezoid(y, x))
+    return float(np.trapz(y, x))
+
+
+def ensure_pos_def_corr(corr: np.ndarray, shrink: float = 0.05) -> np.ndarray:
+    n = corr.shape[0]
+    corr = (1.0 - shrink) * corr + shrink * np.eye(n)
+    corr = 0.5 * (corr + corr.T)
+
+    vals, vecs = np.linalg.eigh(corr)
+    vals = np.clip(vals, 1e-8, None)
+    corr_pd = vecs @ np.diag(vals) @ vecs.T
+
+    d = np.sqrt(np.diag(corr_pd))
+    corr_pd = corr_pd / np.outer(d, d)
+    corr_pd = np.clip(corr_pd, -0.9999, 0.9999)
+    np.fill_diagonal(corr_pd, 1.0)
+    return corr_pd
+
+
+def rank_to_uniform(x: np.ndarray) -> np.ndarray:
+    n, k = x.shape
+    u = np.empty((n, k), dtype=float)
+    for j in range(k):
+        order = np.argsort(x[:, j])
+        ranks = np.empty(n, dtype=float)
+        ranks[order] = np.arange(1, n + 1, dtype=float)
+        u[:, j] = ranks / (n + 1.0)
+    return np.clip(u, 1e-12, 1.0 - 1e-12)
+
+
+# ----------------------------- Data loader (robust yfinance) -----------------------------
+def _safe_close_series(px: pd.DataFrame, symbol: str) -> pd.Series:
+    """
+    yfinance sometimes returns columns as:
+      - single-level: ['Open','High','Low','Close',...]
+      - multi-level:  (PriceField, Symbol) or (Symbol, PriceField)
+    We extract the Close series robustly.
+    """
+    if isinstance(px.columns, pd.MultiIndex):
+        # try common patterns
+        for key in [("Close", symbol), (symbol, "Close"), ("Adj Close", symbol), (symbol, "Adj Close")]:
+            if key in px.columns:
+                s = px[key].copy()
+                s.name = symbol
+                return s
+
+        # fallback: find any column whose second level matches symbol and first level contains Close
+        cols = [c for c in px.columns if (symbol in c and ("Close" in c or "Adj Close" in c))]
+        if cols:
+            s = px[cols[0]].copy()
+            s.name = symbol
+            return s
+
+        raise RuntimeError(f"Could not locate Close column for {symbol} in MultiIndex columns: {px.columns}")
+
+    # single-level
+    if "Close" in px.columns:
+        s = px["Close"].copy()
+        s.name = symbol
+        return s
+    if "Adj Close" in px.columns:
+        s = px["Adj Close"].copy()
+        s.name = symbol
+        return s
+
+    raise RuntimeError(f"'Close' column missing for {symbol}. Columns: {list(px.columns)}")
+
+
+def load_prices(symbols: Tuple[str, ...], start: str) -> pd.DataFrame:
+    frames = []
+    for s in symbols:
+        px = yf.download(s, start=start, auto_adjust=True, progress=False)
+        if px is None or px.empty:
+            raise RuntimeError(f"No data returned for symbol: {s}")
+        close = _safe_close_series(px, s)
+        frames.append(close)
+
+    prices = pd.concat(frames, axis=1).sort_index()
+    prices = prices.dropna(how="any")
+    return prices
+
+
+def compute_log_returns(prices: pd.DataFrame) -> pd.DataFrame:
+    rets = np.log(prices).diff().dropna()
+    rets = rets.replace([np.inf, -np.inf], np.nan).dropna()
+    return rets
+
+
+# ----------------------------- Student-t pdf/cdf/ppf (SciPy optional) -----------------------------
+def t_log_pdf_np(x: np.ndarray, nu: float) -> np.ndarray:
+    a = math.lgamma((nu + 1.0) / 2.0) - math.lgamma(nu / 2.0)
+    b = -0.5 * math.log(nu * math.pi)
+    c = -((nu + 1.0) / 2.0) * np.log1p((x * x) / nu)
+    return a + b + c
+
+
+def t_cdf_scalar_np(x: float, nu: float, n_steps: int = 4001) -> float:
+    if x == 0.0:
+        return 0.5
+    sign = 1.0 if x > 0 else -1.0
+    ax = abs(x)
+    xs = np.linspace(0.0, ax, int(n_steps))
+    f = np.exp(t_log_pdf_np(xs, nu))
+    area = trapz_compat(f, xs)
+    cdf = 0.5 + sign * area
+    return float(np.clip(cdf, 1e-12, 1.0 - 1e-12))
+
+
+def t_ppf_scalar_np(u: float, nu: float) -> float:
+    u = float(np.clip(u, 1e-12, 1.0 - 1e-12))
+    if u == 0.5:
+        return 0.0
+    if u < 0.5:
+        return -t_ppf_scalar_np(1.0 - u, nu)
+
+    lo, hi = 0.0, 10.0
+    while t_cdf_scalar_np(hi, nu) < u:
+        hi *= 2.0
+        if hi > 200.0:
+            break
+
+    for _ in range(80):
+        mid = 0.5 * (lo + hi)
+        cmid = t_cdf_scalar_np(mid, nu)
+        if cmid < u:
+            lo = mid
+        else:
+            hi = mid
+    return 0.5 * (lo + hi)
+
+
+def t_cdf(x: np.ndarray, nu: float) -> np.ndarray:
+    if SCIPY_OK:
+        return stats.t.cdf(x, df=nu)  # type: ignore
+    out = np.empty_like(x, dtype=float)
+    it = np.nditer(x, flags=["multi_index"])
+    while not it.finished:
+        out[it.multi_index] = t_cdf_scalar_np(float(it[0]), nu)
+        it.iternext()
+    return out
+
+
+def t_ppf(u: np.ndarray, nu: float) -> np.ndarray:
+    u = np.clip(u, 1e-12, 1.0 - 1e-12)
+    if SCIPY_OK:
+        return stats.t.ppf(u, df=nu)  # type: ignore
+    out = np.empty_like(u, dtype=float)
+    it = np.nditer(u, flags=["multi_index"])
+    while not it.finished:
+        out[it.multi_index] = t_ppf_scalar_np(float(it[0]), nu)
+        it.iternext()
+    return out
+
+
+# ----------------------------- Copula calibration -----------------------------
+def pseudo_log_likelihood_tcopula(U: np.ndarray, corr: np.ndarray, nu: float) -> float:
+    Z = t_ppf(U, nu)  # T x N
+    corr = ensure_pos_def_corr(corr, shrink=0.0)
+    try:
+        L = np.linalg.cholesky(corr)
+    except np.linalg.LinAlgError:
+        corr = ensure_pos_def_corr(corr, shrink=0.10)
+        L = np.linalg.cholesky(corr)
+
+    Y = np.linalg.solve(L, Z.T).T
+    q = np.sum(Y * Y, axis=1)
+    n = Z.shape[1]
+    logdet = 2.0 * np.sum(np.log(np.diag(L)))
+    mv_part = -0.5 * logdet - ((nu + n) / 2.0) * np.log1p(q / nu)
+
+    if SCIPY_OK:
+        uni_sum = np.sum(stats.t.logpdf(Z, df=nu), axis=1)  # type: ignore
+    else:
+        uni_sum = np.sum(t_log_pdf_np(Z, nu), axis=1)
+
+    return float(np.sum(mv_part - uni_sum))
+
+
+def calibrate_tcopula(rets: pd.DataFrame, nu_grid: Tuple[int, ...], corr_shrink: float) -> Dict:
+    X = rets.values
+    U = rank_to_uniform(X)
+
+    best = {"nu": None, "pll": -np.inf, "corr": None}
+    for nu in nu_grid:
+        Z = t_ppf(U, float(nu))
+        corr = np.corrcoef(Z, rowvar=False)
+        corr = ensure_pos_def_corr(corr, shrink=corr_shrink)
+        pll = pseudo_log_likelihood_tcopula(U, corr, float(nu))
+        if pll > best["pll"]:
+            best = {"nu": int(nu), "pll": float(pll), "corr": corr}
+    return best
+
+
+# ----------------------------- Simulation from fitted t-copula -----------------------------
+def simulate_tcopula_returns(hist_rets: pd.DataFrame, corr: np.ndarray, nu: float, sims: int, seed: int) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    n = hist_rets.shape[1]
+    corr = ensure_pos_def_corr(corr, shrink=0.0)
+    L = np.linalg.cholesky(corr)
+
+    # Empirical marginals
+    hist_sorted = np.sort(hist_rets.values, axis=0)
+    T = hist_sorted.shape[0]
+
+    # Gaussian core
+    g = rng.standard_normal(size=(sims, n))
+    z = g @ L.T
+
+    # Scale mixture for multivariate t
+    w = rng.gamma(shape=nu / 2.0, scale=2.0, size=(sims, 1))
+    y = z / np.sqrt(w / nu)
+
+    # Map to uniforms then to empirical marginals
+    U = t_cdf(y, nu)
+    idx = np.floor(U * (T - 1)).astype(int)
+    idx = np.clip(idx, 0, T - 1)
+
+    sim = np.empty_like(U, dtype=float)
+    for j in range(n):
+        sim[:, j] = hist_sorted[idx[:, j], j]
+    return sim
+
+
+# ----------------------------- Risk metrics -----------------------------
+def var_es(pnl: np.ndarray, alpha: float) -> Dict[str, float]:
+    losses = -pnl
+    v = float(np.quantile(losses, alpha))
+    tail = losses[losses >= v]
+    es = float(np.mean(tail)) if tail.size else v
+    return {"VaR": v, "ES": es}
+
+
+def kupiec_pof(exceed: np.ndarray, alpha: float) -> Dict[str, float]:
+    n = exceed.size
+    x = int(np.sum(exceed))
+    p = 1.0 - float(alpha)
+    if n == 0:
+        return {"LR": float("nan"), "p_value": float("nan"), "fail_rate": float("nan"), "fails": 0.0, "n": 0.0}
+
+    eps = 1e-12
+    phat = np.clip(x / n, eps, 1.0 - eps)
+    p = np.clip(p, eps, 1.0 - eps)
+
+    lr = -2.0 * ((n - x) * math.log((1.0 - p) / (1.0 - phat)) + x * math.log(p / phat))
+
+    if SCIPY_OK:
+        pval = 1.0 - stats.chi2.cdf(lr, df=1)  # type: ignore
+    else:
+        pval = float("nan")
+
+    return {"LR": float(lr), "p_value": float(pval), "fail_rate": float(x / n), "fails": float(x), "n": float(n)}
+
+
+# ----------------------------- Rolling backtest -----------------------------
+def rolling_backtest(cfg: Config, rets: pd.DataFrame, w: np.ndarray) -> pd.DataFrame:
+    n = len(rets)
+    if n <= cfg.rolling_window + 5:
+        raise ValueError("Not enough data for rolling backtest window.")
+
+    out = pd.DataFrame(index=rets.index)
+    out["port_ret"] = rets.values @ w
+    out["pnl"] = cfg.notional * out["port_ret"]
+
+    for a in cfg.alphas:
+        out[f"VaR_{a}"] = np.nan
+        out[f"ES_{a}"] = np.nan
+        out[f"exceed_{a}"] = False
+
+    last_fit = -10**9
+    calib_cache = None
+
+    for t in range(cfg.rolling_window, n):
+        if (t - last_fit) >= cfg.roll_step or calib_cache is None:
+            hist = rets.iloc[t - cfg.rolling_window:t]
+            calib_cache = calibrate_tcopula(hist, cfg.nu_grid, cfg.corr_shrink)
+            last_fit = t
+
+        nu_hat = float(calib_cache["nu"])
+        corr_hat = calib_cache["corr"]
+        hist = rets.iloc[t - cfg.rolling_window:t]
+
+        sim = simulate_tcopula_returns(hist, corr_hat, nu_hat, cfg.sims, cfg.seed + t)
+        pnl_sim = cfg.notional * (sim @ w)
+
+        loss_real = -float(out.iloc[t]["pnl"])
+        for a in cfg.alphas:
+            r = var_es(pnl_sim, float(a))
+            out.iloc[t, out.columns.get_loc(f"VaR_{a}")] = r["VaR"]
+            out.iloc[t, out.columns.get_loc(f"ES_{a}")] = r["ES"]
+            out.iloc[t, out.columns.get_loc(f"exceed_{a}")] = bool(loss_real > r["VaR"])
+
+    return out
+
+
+# ----------------------------- Pipeline -----------------------------
+def run_pipeline(cfg: Config) -> Tuple[pd.DataFrame, Dict]:
+    print(f"[INFO] SciPy available: {SCIPY_OK}")
+    print(f"[INFO] Downloading prices for {cfg.symbols} from {cfg.start} ...")
+    prices = load_prices(cfg.symbols, cfg.start)
+    rets = compute_log_returns(prices)
+    print(f"[INFO] Got {len(prices)} price rows, {len(rets)} return rows, assets={rets.shape[1]}")
+
+    n_assets = rets.shape[1]
+    if cfg.weights is None:
+        w = np.ones(n_assets, dtype=float) / n_assets
+    else:
+        w = np.asarray(cfg.weights, dtype=float)
+        if w.size != n_assets:
+            raise ValueError(f"--weights length must be {n_assets}, got {w.size}")
+        s = float(np.sum(w))
+        if abs(s) < 1e-12:
+            raise ValueError("weights sum to zero")
+        w = w / s
+
+    # Full-sample fit
+    print(f"[INFO] Calibrating full-sample t-copula nu over grid: {cfg.nu_grid} ...")
+    calib = calibrate_tcopula(rets, cfg.nu_grid, cfg.corr_shrink)
+    nu_hat = float(calib["nu"])
+    corr_hat = calib["corr"]
+    print(f"[INFO] Best nu={int(nu_hat)} (pseudo-LL={calib['pll']:.2f})")
+
+    # Full-sample risk via simulation
+    sim = simulate_tcopula_returns(rets, corr_hat, nu_hat, cfg.sims, cfg.seed)
+    pnl_sim = cfg.notional * (sim @ w)
+    risk_full = {str(a): var_es(pnl_sim, float(a)) for a in cfg.alphas}
+
+    # Tail dependence proxy on historical ranks (q=5%)
+    q = 0.05
+    U_hist = rank_to_uniform(rets.values)
+    tail_dep = {}
+    cols = list(rets.columns)
+    for i in range(len(cols)):
+        for j in range(i + 1, len(cols)):
+            pij = float(np.mean((U_hist[:, i] < q) & (U_hist[:, j] < q)))
+            tail_dep[f"{cols[i]}-{cols[j]}"] = pij / q if q > 0 else float("nan")
+
+    # Panel (daily)
+    panel = pd.DataFrame(index=rets.index)
+    panel[cols] = prices.reindex(panel.index)  # aligned prices
+    panel[[f"ret_{c}" for c in cols]] = rets.add_prefix("ret_")
+    panel["port_ret"] = rets.values @ w
+    panel["pnl"] = cfg.notional * panel["port_ret"]
+
+    rolling_summary = {}
+    if cfg.do_rolling:
+        print(f"[INFO] Rolling backtest window={cfg.rolling_window}, step={cfg.roll_step}, sims={cfg.sims} ...")
+        roll = rolling_backtest(cfg, rets, w)
+        for a in cfg.alphas:
+            panel[f"VaR_{a}"] = roll[f"VaR_{a}"]
+            panel[f"ES_{a}"] = roll[f"ES_{a}"]
+            panel[f"exceed_{a}"] = roll[f"exceed_{a}"]
+
+            valid = roll[f"VaR_{a}"].notna()
+            exc = roll.loc[valid, f"exceed_{a}"].values.astype(bool)
+            rolling_summary[str(a)] = {"kupiec_pof": kupiec_pof(exc, float(a))}
+
+    summary = {
+        "config": asdict(cfg),
+        "scipy_available": bool(SCIPY_OK),
+        "data_window": {
+            "start": str(rets.index.min().date()),
+            "end": str(rets.index.max().date()),
+            "n_returns": int(len(rets)),
+        },
+        "calibration": {
+            "nu": int(nu_hat),
+            "pseudo_ll": float(calib["pll"]),
+            "corr_shrink": float(cfg.corr_shrink),
+        },
+        "portfolio": {
+            "symbols": list(cfg.symbols),
+            "weights": [float(x) for x in w.tolist()],
+            "notional": float(cfg.notional),
+        },
+        "risk_fullsample": risk_full,
+        "tail_dependence_proxy_q05": tail_dep,
+        "rolling_backtest": rolling_summary,
+    }
+    return panel, summary
+
+
+def save_outputs(panel: pd.DataFrame, summary: Dict, cfg: Config) -> None:
+    os.makedirs(os.path.dirname(cfg.out_csv) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(cfg.out_json) or ".", exist_ok=True)
+
+    panel.to_csv(cfg.out_csv)
+    with open(cfg.out_json, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+
+    print(f"[OK] Saved panel → {cfg.out_csv}")
+    print(f"[OK] Saved summary → {cfg.out_json}")
+    for a, d in summary["risk_fullsample"].items():
+        print(f"alpha={a}: VaR=${d['VaR']:.2f}, ES=${d['ES']:.2f}")
+        if a in summary.get("rolling_backtest", {}):
+            kp = summary["rolling_backtest"][a]["kupiec_pof"]
+            print(f"  Kupiec fail_rate={kp['fail_rate']:.4f}, LR={kp['LR']:.3f}, p={kp['p_value']}")
+
+
+# ----------------------------- CLI -----------------------------
+def parse_args() -> Config:
+    p = argparse.ArgumentParser(description="Level-80: Fast t-Copula VaR/ES with Rolling Backtest (SciPy optional)")
+
+    p.add_argument("--start", type=str, default="2010-01-01")
+    p.add_argument("--symbols", nargs="+", default=list(Config.symbols))
+    p.add_argument("--nu-grid", nargs="+", type=int, default=list(Config.nu_grid))
+    p.add_argument("--corr-shrink", type=float, default=0.05)
+
+    p.add_argument("--sims", type=int, default=50000)
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--alphas", nargs="+", type=float, default=[0.95, 0.99])
+
+    p.add_argument("--weights", nargs="+", type=float, default=None)
+    p.add_argument("--notional", type=float, default=1_000_000.0)
+
+    p.add_argument("--rolling-window", type=int, default=750)
+    p.add_argument("--roll-step", type=int, default=5)
+    p.add_argument("--no-rolling", action="store_true")
+
+    p.add_argument("--csv", type=str, default="level80_tcopula_panel.csv")
+    p.add_argument("--json", type=str, default="level80_tcopula_summary.json")
+
+    a = p.parse_args()
+    return Config(
+        symbols=tuple(a.symbols),
+        start=a.start,
+        nu_grid=tuple(a.nu_grid),
+        corr_shrink=float(a.corr_shrink),
+        sims=int(a.sims),
+        seed=int(a.seed),
+        alphas=tuple(float(x) for x in a.alphas),
+        weights=None if a.weights is None else list(float(x) for x in a.weights),
+        notional=float(a.notional),
+        rolling_window=int(a.rolling_window),
+        roll_step=int(a.roll_step),
+        do_rolling=(not a.no_rolling),
+        out_csv=a.csv,
+        out_json=a.json,
+    )
+
+
+def main() -> None:
+    cfg = parse_args()
+    panel, summary = run_pipeline(cfg)
+    save_outputs(panel, summary, cfg)
+
+
+if __name__ == "__main__":
+    # Jupyter/PyCharm cell shim: strip "-f kernel.json" etc.
+    import sys
+    sys.argv = [sys.argv[0]] + [
+        arg for arg in sys.argv[1:]
+        if arg != "-f" and not (arg.endswith(".json") and "kernel" in arg)
+    ]
+    main()
+```
+
+If you tell me whether you **have SciPy installed** (`pip show scipy`), I can tune Level-80 for your machine (e.g., bump sims to 200k and still keep runtime reasonable).
