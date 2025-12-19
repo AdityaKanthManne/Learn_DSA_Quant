@@ -1,0 +1,527 @@
+```python
+# level81_systemic_risk_covar_tcopula.py
+# Level-81: Systemic Risk via t-Copula CoVaR / ΔCoVaR (SciPy optional)
+#
+# What you get:
+# 1) Fit a t-copula to multivariate daily log-returns (nu over a grid + corr shrink)
+# 2) Simulate joint returns from the fitted t-copula + empirical marginals
+# 3) Compute:
+#    - Unconditional portfolio VaR/ES
+#    - Asset VaR (for conditioning)
+#    - CoVaR: Portfolio VaR(alpha) conditional on asset i being in distress (loss >= VaR_beta)
+#    - CoVaR-normal: Portfolio VaR(alpha) conditional on asset i being in a "normal" state (around median)
+#    - ΔCoVaR = CoVaR_distress - CoVaR_normal
+#
+# Fixes included (same class of issues you hit before):
+# - No np.trapzoid typo (uses np.trapezoid if available, else np.trapz)
+# - Robust yfinance Close extraction (handles MultiIndex columns)
+# - No DataFrame.rename(str) misuse (Series.name = symbol)
+#
+# Outputs:
+#   - level81_covar_panel.csv          (daily prices/returns + portfolio series)
+#   - level81_covar_summary.json       (fit + VaR/ES + CoVaR tables)
+#
+# Run:
+#   python level81_systemic_risk_covar_tcopula.py
+#   python level81_systemic_risk_covar_tcopula.py --sims 200000 --alpha 0.99 --beta 0.95
+#   python level81_systemic_risk_covar_tcopula.py --weights 0.25 0.25 0.2 0.1 0.1 0.05 0.03 0.02
+
+import os
+import json
+import math
+import argparse
+from dataclasses import dataclass, asdict
+from typing import Tuple, List, Optional, Dict
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+
+# ----------------------------- SciPy optional -----------------------------
+try:
+    from scipy import stats  # type: ignore
+    SCIPY_OK = True
+except Exception:
+    SCIPY_OK = False
+
+
+# ----------------------------- Config -----------------------------
+@dataclass
+class Config:
+    symbols: Tuple[str, ...] = ("SPY", "QQQ", "IWM", "EFA", "EEM", "TLT", "LQD", "GLD")
+    start: str = "2010-01-01"
+
+    # copula calibration
+    nu_grid: Tuple[int, ...] = (4, 6, 8, 10, 15, 20)
+    corr_shrink: float = 0.05
+
+    # simulation + risk
+    sims: int = 100000
+    seed: int = 42
+    alpha: float = 0.99   # portfolio VaR/ES confidence
+    beta: float = 0.95    # distress threshold for asset conditioning (asset loss >= VaR_beta)
+
+    # "normal state" window around the asset median (filter |u-0.5| <= normal_band)
+    normal_band: float = 0.05
+
+    weights: Optional[List[float]] = None
+    notional: float = 1_000_000.0
+
+    out_csv: str = "level81_covar_panel.csv"
+    out_json: str = "level81_covar_summary.json"
+
+
+# ----------------------------- Helpers -----------------------------
+def trapz_compat(y: np.ndarray, x: np.ndarray) -> float:
+    if hasattr(np, "trapezoid"):
+        return float(np.trapezoid(y, x))
+    return float(np.trapz(y, x))
+
+
+def ensure_pos_def_corr(corr: np.ndarray, shrink: float = 0.05) -> np.ndarray:
+    n = corr.shape[0]
+    corr = (1.0 - shrink) * corr + shrink * np.eye(n)
+    corr = 0.5 * (corr + corr.T)
+
+    vals, vecs = np.linalg.eigh(corr)
+    vals = np.clip(vals, 1e-8, None)
+    corr_pd = vecs @ np.diag(vals) @ vecs.T
+
+    d = np.sqrt(np.diag(corr_pd))
+    corr_pd = corr_pd / np.outer(d, d)
+    corr_pd = np.clip(corr_pd, -0.9999, 0.9999)
+    np.fill_diagonal(corr_pd, 1.0)
+    return corr_pd
+
+
+def rank_to_uniform(x: np.ndarray) -> np.ndarray:
+    n, k = x.shape
+    u = np.empty((n, k), dtype=float)
+    for j in range(k):
+        order = np.argsort(x[:, j])
+        ranks = np.empty(n, dtype=float)
+        ranks[order] = np.arange(1, n + 1, dtype=float)
+        u[:, j] = ranks / (n + 1.0)
+    return np.clip(u, 1e-12, 1.0 - 1e-12)
+
+
+# ----------------------------- Robust yfinance loader -----------------------------
+def _safe_close_series(px: pd.DataFrame, symbol: str) -> pd.Series:
+    if isinstance(px.columns, pd.MultiIndex):
+        for key in [("Close", symbol), (symbol, "Close"), ("Adj Close", symbol), (symbol, "Adj Close")]:
+            if key in px.columns:
+                s = px[key].copy()
+                s.name = symbol
+                return s
+        cols = [c for c in px.columns if (symbol in c and ("Close" in c or "Adj Close" in c))]
+        if cols:
+            s = px[cols[0]].copy()
+            s.name = symbol
+            return s
+        raise RuntimeError(f"Could not locate Close column for {symbol} in MultiIndex columns.")
+    if "Close" in px.columns:
+        s = px["Close"].copy()
+        s.name = symbol
+        return s
+    if "Adj Close" in px.columns:
+        s = px["Adj Close"].copy()
+        s.name = symbol
+        return s
+    raise RuntimeError(f"'Close' column missing for {symbol}. Columns: {list(px.columns)}")
+
+
+def load_prices(symbols: Tuple[str, ...], start: str) -> pd.DataFrame:
+    frames = []
+    for s in symbols:
+        px = yf.download(s, start=start, auto_adjust=True, progress=False)
+        if px is None or px.empty:
+            raise RuntimeError(f"No data returned for symbol: {s}")
+        close = _safe_close_series(px, s)
+        frames.append(close)
+    prices = pd.concat(frames, axis=1).sort_index().dropna(how="any")
+    return prices
+
+
+def compute_log_returns(prices: pd.DataFrame) -> pd.DataFrame:
+    rets = np.log(prices).diff().dropna()
+    rets = rets.replace([np.inf, -np.inf], np.nan).dropna()
+    return rets
+
+
+# ----------------------------- Student-t pieces (SciPy optional) -----------------------------
+def t_log_pdf_np(x: np.ndarray, nu: float) -> np.ndarray:
+    a = math.lgamma((nu + 1.0) / 2.0) - math.lgamma(nu / 2.0)
+    b = -0.5 * math.log(nu * math.pi)
+    c = -((nu + 1.0) / 2.0) * np.log1p((x * x) / nu)
+    return a + b + c
+
+
+def t_cdf_scalar_np(x: float, nu: float, n_steps: int = 4001) -> float:
+    if x == 0.0:
+        return 0.5
+    sign = 1.0 if x > 0 else -1.0
+    ax = abs(x)
+    xs = np.linspace(0.0, ax, int(n_steps))
+    f = np.exp(t_log_pdf_np(xs, nu))
+    area = trapz_compat(f, xs)
+    cdf = 0.5 + sign * area
+    return float(np.clip(cdf, 1e-12, 1.0 - 1e-12))
+
+
+def t_ppf_scalar_np(u: float, nu: float) -> float:
+    u = float(np.clip(u, 1e-12, 1.0 - 1e-12))
+    if u == 0.5:
+        return 0.0
+    if u < 0.5:
+        return -t_ppf_scalar_np(1.0 - u, nu)
+
+    lo, hi = 0.0, 10.0
+    while t_cdf_scalar_np(hi, nu) < u:
+        hi *= 2.0
+        if hi > 200.0:
+            break
+
+    for _ in range(80):
+        mid = 0.5 * (lo + hi)
+        cmid = t_cdf_scalar_np(mid, nu)
+        if cmid < u:
+            lo = mid
+        else:
+            hi = mid
+    return 0.5 * (lo + hi)
+
+
+def t_cdf(x: np.ndarray, nu: float) -> np.ndarray:
+    if SCIPY_OK:
+        return stats.t.cdf(x, df=nu)  # type: ignore
+    out = np.empty_like(x, dtype=float)
+    it = np.nditer(x, flags=["multi_index"])
+    while not it.finished:
+        out[it.multi_index] = t_cdf_scalar_np(float(it[0]), nu)
+        it.iternext()
+    return out
+
+
+def t_ppf(u: np.ndarray, nu: float) -> np.ndarray:
+    u = np.clip(u, 1e-12, 1.0 - 1e-12)
+    if SCIPY_OK:
+        return stats.t.ppf(u, df=nu)  # type: ignore
+    out = np.empty_like(u, dtype=float)
+    it = np.nditer(u, flags=["multi_index"])
+    while not it.finished:
+        out[it.multi_index] = t_ppf_scalar_np(float(it[0]), nu)
+        it.iternext()
+    return out
+
+
+# ----------------------------- Copula calibration -----------------------------
+def pseudo_log_likelihood_tcopula(U: np.ndarray, corr: np.ndarray, nu: float) -> float:
+    Z = t_ppf(U, nu)  # T x N
+    corr = ensure_pos_def_corr(corr, shrink=0.0)
+    L = np.linalg.cholesky(ensure_pos_def_corr(corr, shrink=0.10))
+    Y = np.linalg.solve(L, Z.T).T
+    q = np.sum(Y * Y, axis=1)
+    n = Z.shape[1]
+    logdet = 2.0 * np.sum(np.log(np.diag(L)))
+    mv_part = -0.5 * logdet - ((nu + n) / 2.0) * np.log1p(q / nu)
+
+    if SCIPY_OK:
+        uni_sum = np.sum(stats.t.logpdf(Z, df=nu), axis=1)  # type: ignore
+    else:
+        uni_sum = np.sum(t_log_pdf_np(Z, nu), axis=1)
+
+    return float(np.sum(mv_part - uni_sum))
+
+
+def calibrate_tcopula(rets: pd.DataFrame, nu_grid: Tuple[int, ...], corr_shrink: float) -> Dict:
+    X = rets.values
+    U = rank_to_uniform(X)
+
+    best = {"nu": None, "pll": -np.inf, "corr": None}
+    for nu in nu_grid:
+        Z = t_ppf(U, float(nu))
+        corr = np.corrcoef(Z, rowvar=False)
+        corr = ensure_pos_def_corr(corr, shrink=corr_shrink)
+        pll = pseudo_log_likelihood_tcopula(U, corr, float(nu))
+        if pll > best["pll"]:
+            best = {"nu": int(nu), "pll": float(pll), "corr": corr}
+    return best
+
+
+# ----------------------------- Simulation -----------------------------
+def simulate_tcopula_returns(hist_rets: pd.DataFrame, corr: np.ndarray, nu: float, sims: int, seed: int) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    n = hist_rets.shape[1]
+    corr = ensure_pos_def_corr(corr, shrink=0.0)
+    L = np.linalg.cholesky(corr)
+
+    hist_sorted = np.sort(hist_rets.values, axis=0)
+    T = hist_sorted.shape[0]
+
+    g = rng.standard_normal(size=(sims, n))
+    z = g @ L.T
+
+    # scale mixture for t
+    w = rng.gamma(shape=nu / 2.0, scale=2.0, size=(sims, 1))
+    y = z / np.sqrt(w / nu)
+
+    U = t_cdf(y, nu)
+    idx = np.floor(U * (T - 1)).astype(int)
+    idx = np.clip(idx, 0, T - 1)
+
+    sim = np.empty_like(U, dtype=float)
+    for j in range(n):
+        sim[:, j] = hist_sorted[idx[:, j], j]
+    return sim
+
+
+# ----------------------------- Risk metrics -----------------------------
+def var_es_from_pnl(pnl: np.ndarray, alpha: float) -> Dict[str, float]:
+    losses = -pnl
+    v = float(np.quantile(losses, alpha))
+    tail = losses[losses >= v]
+    es = float(np.mean(tail)) if tail.size else v
+    return {"VaR": v, "ES": es}
+
+
+def asset_var_from_returns(r: np.ndarray, beta: float) -> float:
+    # asset loss = -return * notional (per $1), but for conditioning we can use return threshold directly.
+    # distress event is "loss >= VaR_beta" -> return <= q_{1-beta} (left tail)
+    return float(np.quantile(r, 1.0 - beta))
+
+
+def covar_delta(
+    sim_rets: np.ndarray,
+    w: np.ndarray,
+    notional: float,
+    alpha: float,
+    beta: float,
+    normal_band: float
+) -> Dict[str, Dict[str, float]]:
+    """
+    For each asset i:
+      distress set: r_i <= q_{1-beta}(r_i)
+      normal set: |u_i - 0.5| <= normal_band where u_i = rank(u) approx using simulated CDF via ranks
+    Return per asset: CoVaR_distress, CoES_distress, CoVaR_normal, CoES_normal, DeltaCoVaR, DeltaCoES
+    """
+    sims, n = sim_rets.shape
+    pnl_port = notional * (sim_rets @ w)
+
+    # compute simulated uniforms (rank-based) per column for "normal" conditioning
+    U_sim = rank_to_uniform(sim_rets)
+
+    out = {}
+    for j in range(n):
+        rj = sim_rets[:, j]
+        thr = asset_var_from_returns(rj, beta=beta)
+
+        distress_mask = (rj <= thr)
+        normal_mask = (np.abs(U_sim[:, j] - 0.5) <= normal_band)
+
+        # ensure we have some mass
+        if distress_mask.sum() < 100:
+            # relax slightly if too few points
+            distress_mask = (U_sim[:, j] <= (1.0 - beta) * 1.25)
+
+        if normal_mask.sum() < 100:
+            normal_mask = (np.abs(U_sim[:, j] - 0.5) <= max(normal_band, 0.10))
+
+        pnl_d = pnl_port[distress_mask]
+        pnl_n = pnl_port[normal_mask]
+
+        rd = var_es_from_pnl(pnl_d, alpha)
+        rn = var_es_from_pnl(pnl_n, alpha)
+
+        out[str(j)] = {
+            "distress_prob": float(distress_mask.mean()),
+            "normal_prob": float(normal_mask.mean()),
+            "asset_return_threshold_distress": float(thr),
+            "CoVaR_distress": float(rd["VaR"]),
+            "CoES_distress": float(rd["ES"]),
+            "CoVaR_normal": float(rn["VaR"]),
+            "CoES_normal": float(rn["ES"]),
+            "DeltaCoVaR": float(rd["VaR"] - rn["VaR"]),
+            "DeltaCoES": float(rd["ES"] - rn["ES"]),
+        }
+    return out
+
+
+# ----------------------------- Pipeline -----------------------------
+def run_pipeline(cfg: Config) -> Tuple[pd.DataFrame, Dict]:
+    print(f"[INFO] SciPy available: {SCIPY_OK}")
+    print(f"[INFO] Downloading prices for {cfg.symbols} from {cfg.start} ...")
+    prices = load_prices(cfg.symbols, cfg.start)
+    rets = compute_log_returns(prices)
+    print(f"[INFO] Got {len(prices)} price rows, {len(rets)} return rows, assets={rets.shape[1]}")
+
+    n_assets = rets.shape[1]
+    if cfg.weights is None:
+        w = np.ones(n_assets, dtype=float) / n_assets
+    else:
+        w = np.asarray(cfg.weights, dtype=float)
+        if w.size != n_assets:
+            raise ValueError(f"--weights length must be {n_assets}, got {w.size}")
+        s = float(np.sum(w))
+        if abs(s) < 1e-12:
+            raise ValueError("weights sum to zero")
+        w = w / s
+
+    print(f"[INFO] Calibrating t-copula nu over grid: {cfg.nu_grid} ...")
+    calib = calibrate_tcopula(rets, cfg.nu_grid, cfg.corr_shrink)
+    nu_hat = float(calib["nu"])
+    corr_hat = calib["corr"]
+    print(f"[INFO] Best nu={int(nu_hat)} (pseudo-LL={calib['pll']:.2f})")
+
+    print(f"[INFO] Simulating {cfg.sims} joint scenarios ...")
+    sim = simulate_tcopula_returns(rets, corr_hat, nu_hat, cfg.sims, cfg.seed)
+
+    # Unconditional portfolio risk
+    pnl_sim = cfg.notional * (sim @ w)
+    port_risk = var_es_from_pnl(pnl_sim, cfg.alpha)
+
+    # Asset VaR (return threshold)
+    asset_thr = {}
+    for j, sym in enumerate(rets.columns):
+        thr = asset_var_from_returns(sim[:, j], cfg.beta)
+        asset_thr[sym] = float(thr)
+
+    # CoVaR / ΔCoVaR
+    covar_raw = covar_delta(
+        sim_rets=sim,
+        w=w,
+        notional=cfg.notional,
+        alpha=cfg.alpha,
+        beta=cfg.beta,
+        normal_band=cfg.normal_band,
+    )
+
+    # Map index->symbol for readability
+    covar_table = {}
+    for j, sym in enumerate(rets.columns):
+        covar_table[sym] = covar_raw[str(j)]
+
+    # Panel output
+    cols = list(rets.columns)
+    panel = pd.DataFrame(index=rets.index)
+    panel[cols] = prices.reindex(panel.index)
+    panel[[f"ret_{c}" for c in cols]] = rets.add_prefix("ret_")
+    panel["port_ret"] = rets.values @ w
+    panel["pnl"] = cfg.notional * panel["port_ret"]
+
+    summary = {
+        "config": asdict(cfg),
+        "scipy_available": bool(SCIPY_OK),
+        "data_window": {
+            "start": str(rets.index.min().date()),
+            "end": str(rets.index.max().date()),
+            "n_returns": int(len(rets)),
+        },
+        "calibration": {
+            "nu": int(nu_hat),
+            "pseudo_ll": float(calib["pll"]),
+            "corr_shrink": float(cfg.corr_shrink),
+        },
+        "portfolio": {
+            "symbols": list(cfg.symbols),
+            "weights": [float(x) for x in w.tolist()],
+            "notional": float(cfg.notional),
+        },
+        "unconditional_portfolio_risk": {
+            "alpha": float(cfg.alpha),
+            "VaR": float(port_risk["VaR"]),
+            "ES": float(port_risk["ES"]),
+        },
+        "conditioning": {
+            "beta_distress": float(cfg.beta),
+            "normal_band": float(cfg.normal_band),
+            "asset_return_threshold_distress_lefttail": asset_thr,
+        },
+        "CoVaR_DeltaCoVaR": covar_table,
+    }
+
+    return panel, summary
+
+
+def save_outputs(panel: pd.DataFrame, summary: Dict, cfg: Config) -> None:
+    os.makedirs(os.path.dirname(cfg.out_csv) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(cfg.out_json) or ".", exist_ok=True)
+
+    panel.to_csv(cfg.out_csv)
+    with open(cfg.out_json, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+
+    print(f"[OK] Saved panel → {cfg.out_csv}")
+    print(f"[OK] Saved summary → {cfg.out_json}")
+
+    pr = summary["unconditional_portfolio_risk"]
+    print(f"[RISK] Portfolio alpha={pr['alpha']}: VaR=${pr['VaR']:.2f}, ES=${pr['ES']:.2f}")
+
+    # Print top systemic contributors by ΔCoVaR
+    rows = []
+    for sym, d in summary["CoVaR_DeltaCoVaR"].items():
+        rows.append((sym, d["DeltaCoVaR"], d["CoVaR_distress"], d["CoVaR_normal"], d["distress_prob"]))
+    rows.sort(key=lambda x: x[1], reverse=True)
+
+    print("[CoVaR] Top ΔCoVaR contributors (higher = more systemic impact):")
+    for sym, ddc, cd, cn, prob in rows[:8]:
+        print(f"  {sym:>4s}  ΔCoVaR=${ddc:>10.2f} | CoVaR(dist)=${cd:>10.2f} | CoVaR(norm)=${cn:>10.2f} | P(dist)={prob:.3f}")
+
+
+# ----------------------------- CLI -----------------------------
+def parse_args() -> Config:
+    p = argparse.ArgumentParser(description="Level-81: t-Copula CoVaR / ΔCoVaR (SciPy optional)")
+
+    p.add_argument("--start", type=str, default="2010-01-01")
+    p.add_argument("--symbols", nargs="+", default=list(Config.symbols))
+
+    p.add_argument("--nu-grid", nargs="+", type=int, default=list(Config.nu_grid))
+    p.add_argument("--corr-shrink", type=float, default=0.05)
+
+    p.add_argument("--sims", type=int, default=100000)
+    p.add_argument("--seed", type=int, default=42)
+
+    p.add_argument("--alpha", type=float, default=0.99)
+    p.add_argument("--beta", type=float, default=0.95)
+    p.add_argument("--normal-band", type=float, default=0.05)
+
+    p.add_argument("--weights", nargs="+", type=float, default=None)
+    p.add_argument("--notional", type=float, default=1_000_000.0)
+
+    p.add_argument("--csv", type=str, default="level81_covar_panel.csv")
+    p.add_argument("--json", type=str, default="level81_covar_summary.json")
+
+    a = p.parse_args()
+    return Config(
+        symbols=tuple(a.symbols),
+        start=a.start,
+        nu_grid=tuple(a.nu_grid),
+        corr_shrink=float(a.corr_shrink),
+        sims=int(a.sims),
+        seed=int(a.seed),
+        alpha=float(a.alpha),
+        beta=float(a.beta),
+        normal_band=float(a.normal_band),
+        weights=None if a.weights is None else list(float(x) for x in a.weights),
+        notional=float(a.notional),
+        out_csv=a.csv,
+        out_json=a.json,
+    )
+
+
+def main() -> None:
+    cfg = parse_args()
+    panel, summary = run_pipeline(cfg)
+    save_outputs(panel, summary, cfg)
+
+
+if __name__ == "__main__":
+    # Jupyter/PyCharm cell shim: strip "-f kernel.json" etc.
+    import sys
+    sys.argv = [sys.argv[0]] + [
+        arg for arg in sys.argv[1:]
+        if arg != "-f" and not (arg.endswith(".json") and "kernel" in arg)
+    ]
+    main()
+```
+
+If you want, I can make Level-81 also produce a **heatmap-ready CSV** of ΔCoVaR and tail-dependence pairs (so you can plot it directly in Tableau/Power BI).
