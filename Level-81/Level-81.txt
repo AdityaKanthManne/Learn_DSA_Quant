@@ -1,4 +1,4 @@
-```pytho
+```python
 # level81_systemic_risk_covar_tcopula.py
 # Level-81: Systemic Risk via t-Copula CoVaR / ΔCoVaR (SciPy optional)
 #
