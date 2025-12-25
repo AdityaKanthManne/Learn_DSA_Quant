@@ -523,5 +523,3 @@ if __name__ == "__main__":
     ]
     main()
 ```
-
-If you want, I can make Level-81 also produce a **heatmap-ready CSV** of ΔCoVaR and tail-dependence pairs (so you can plot it directly in Tableau/Power BI).
