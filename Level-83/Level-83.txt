@@ -1,0 +1,323 @@
+```python
+# level83_covar_delta_covar.py
+# Level-83: CoVaR / ΔCoVaR (Systemic Spillover) using Quantile Regression (free-data)
+#
+# Goal:
+# - Estimate each asset’s VaR (left tail) and how it shifts the MARKET’s VaR when the asset is in distress.
+# - Compute:
+#    VaR_i(α): asset i’s α-quantile return
+#    CoVaR_m|i(α): market α-quantile conditional on asset return (via quantile regression)
+#    CoVaR_m|i at distress: CoVaR at x = VaR_i(α)
+#    CoVaR_m|i at median:   CoVaR at x = median_i
+#    ΔCoVaR_i = CoVaR_distress - CoVaR_median   (more negative => bigger systemic spillover)
+#
+# Method:
+# - Quantile regression of market returns on asset returns:
+#       Q_α( r_m | r_i ) = a_i(α) + b_i(α) * r_i
+# - Then:
+#       CoVaR_distress = a + b * VaR_i(α)
+#       CoVaR_median   = a + b * median_i
+#       ΔCoVaR = CoVaR_distress - CoVaR_median
+#
+# Requirements:
+# - yfinance
+# - pandas, numpy
+# - scikit-learn (QuantileRegressor)  -> no statsmodels needed
+#
+# Outputs:
+#   - level83_covar_panel.csv  (returns + tail flags)
+#   - level83_covar_metrics.csv (VaR / CoVaR / ΔCoVaR table)
+#   - level83_covar_summary.json
+#
+# Run examples:
+#   python level83_covar_delta_covar.py
+#   python level83_covar_delta_covar.py --alpha 0.05 --market SPY --symbols JPM BAC GS MS AAPL
+#   python level83_covar_delta_covar.py --alpha 0.01 --l2 1e-4
+
+import os
+import json
+import math
+import argparse
+from dataclasses import dataclass, asdict
+from typing import Tuple, List, Dict
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+
+from sklearn.linear_model import QuantileRegressor
+
+
+# ----------------------------- Config -----------------------------
+@dataclass
+class Config:
+    symbols: Tuple[str, ...] = ("SPY", "QQQ", "IWM", "EFA", "EEM", "TLT", "LQD", "GLD")
+    market: str = "SPY"
+    start: str = "2010-01-01"
+
+    alpha: float = 0.05          # left-tail quantile for VaR/CoVaR
+    l2: float = 1e-4             # L2 penalty for QuantileRegressor stability
+    fit_intercept: bool = True
+
+    min_obs: int = 500           # require enough data to fit quantile regression reliably
+
+    seed: int = 42
+
+    out_panel_csv: str = "level83_covar_panel.csv"
+    out_metrics_csv: str = "level83_covar_metrics.csv"
+    out_json: str = "level83_covar_summary.json"
+
+
+# ----------------------------- Robust yfinance loader -----------------------------
+def _safe_close_series(px: pd.DataFrame, symbol: str) -> pd.Series:
+    # Handles yfinance returning MultiIndex columns in some cases.
+    if isinstance(px.columns, pd.MultiIndex):
+        for key in [("Close", symbol), (symbol, "Close"), ("Adj Close", symbol), (symbol, "Adj Close")]:
+            if key in px.columns:
+                s = px[key].copy()
+                s.name = symbol
+                return s
+        cols = [c for c in px.columns if (symbol in c and ("Close" in c or "Adj Close" in c))]
+        if cols:
+            s = px[cols[0]].copy()
+            s.name = symbol
+            return s
+        raise RuntimeError(f"Could not locate Close column for {symbol} in MultiIndex columns.")
+    if "Close" in px.columns:
+        s = px["Close"].copy()
+        s.name = symbol
+        return s
+    if "Adj Close" in px.columns:
+        s = px["Adj Close"].copy()
+        s.name = symbol
+        return s
+    raise RuntimeError(f"'Close' column missing for {symbol}. Columns: {list(px.columns)}")
+
+
+def load_prices(symbols: Tuple[str, ...], start: str) -> pd.DataFrame:
+    frames: List[pd.Series] = []
+    for s in symbols:
+        px = yf.download(s, start=start, auto_adjust=True, progress=False)
+        if px is None or px.empty:
+            raise RuntimeError(f"No data returned for symbol: {s}")
+        close = _safe_close_series(px, s)
+        frames.append(close)
+    prices = pd.concat(frames, axis=1).sort_index().dropna(how="any")
+    return prices
+
+
+def compute_log_returns(prices: pd.DataFrame) -> pd.DataFrame:
+    rets = np.log(prices).diff().dropna()
+    rets = rets.replace([np.inf, -np.inf], np.nan).dropna()
+    return rets
+
+
+# ----------------------------- CoVaR core -----------------------------
+def fit_quantile_regression(y: np.ndarray, x: np.ndarray, alpha: float, l2: float, fit_intercept: bool) -> Dict[str, float]:
+    """
+    Fit: Q_alpha(y|x) = a + b*x using sklearn QuantileRegressor.
+    """
+    x2d = x.reshape(-1, 1)
+    model = QuantileRegressor(
+        quantile=alpha,
+        alpha=l2,
+        fit_intercept=fit_intercept,
+        solver="highs"
+    )
+    model.fit(x2d, y)
+    b = float(model.coef_[0])
+    a = float(model.intercept_) if fit_intercept else 0.0
+    return {"a": a, "b": b}
+
+
+def covar_from_ab(a: float, b: float, x_val: float) -> float:
+    return float(a + b * x_val)
+
+
+# ----------------------------- Pipeline -----------------------------
+def run_pipeline(cfg: Config) -> Dict[str, object]:
+    np.random.seed(cfg.seed)
+
+    # Ensure market included
+    all_syms = tuple(dict.fromkeys(list(cfg.symbols) + [cfg.market]))
+
+    print(f"[INFO] Downloading prices for {all_syms} from {cfg.start} ...")
+    prices = load_prices(all_syms, cfg.start)
+    rets = compute_log_returns(prices)
+
+    if cfg.market not in rets.columns:
+        raise RuntimeError(f"Market symbol '{cfg.market}' not found in returns columns.")
+
+    print(f"[INFO] Got {len(prices)} price rows, {len(rets)} return rows, assets={rets.shape[1]}")
+
+    rm = rets[cfg.market].copy()
+
+    metrics_rows = []
+    for sym in cfg.symbols:
+        if sym == cfg.market:
+            # You can include/exclude market itself. Keeping it out avoids trivial self-conditioning.
+            continue
+        if sym not in rets.columns:
+            continue
+
+        ri = rets[sym].copy()
+        df = pd.concat([rm.rename("rm"), ri.rename("ri")], axis=1).dropna()
+        if len(df) < cfg.min_obs:
+            continue
+
+        # Asset VaR and median
+        var_i = float(np.quantile(df["ri"].values, cfg.alpha))
+        med_i = float(np.quantile(df["ri"].values, 0.50))
+
+        # Quantile regression for market conditional quantile
+        ab = fit_quantile_regression(
+            y=df["rm"].values,
+            x=df["ri"].values,
+            alpha=cfg.alpha,
+            l2=cfg.l2,
+            fit_intercept=cfg.fit_intercept
+        )
+
+        covar_distress = covar_from_ab(ab["a"], ab["b"], var_i)
+        covar_median = covar_from_ab(ab["a"], ab["b"], med_i)
+        delta_covar = covar_distress - covar_median  # more negative => larger systemic spillover
+
+        metrics_rows.append({
+            "symbol": sym,
+            "VaR_i": var_i,
+            "median_i": med_i,
+            "a_qr": ab["a"],
+            "b_qr": ab["b"],
+            "CoVaR_distress": covar_distress,
+            "CoVaR_median": covar_median,
+            "Delta_CoVaR": delta_covar,
+        })
+
+    metrics = pd.DataFrame(metrics_rows).set_index("symbol")
+    if metrics.empty:
+        raise RuntimeError("No metrics computed (check symbols, start date, or min_obs).")
+
+    # Rank: most systemic spillover (most negative ΔCoVaR first)
+    metrics = metrics.sort_values("Delta_CoVaR", ascending=True)
+
+    # Panel output (returns + tail flags)
+    panel = pd.DataFrame(index=rets.index)
+    panel[f"ret_{cfg.market}"] = rets[cfg.market]
+
+    q_m = float(np.quantile(panel[f"ret_{cfg.market}"].dropna().values, cfg.alpha))
+    panel["mkt_tail"] = (panel[f"ret_{cfg.market}"] <= q_m).astype(int)
+
+    for sym in cfg.symbols:
+        if sym in rets.columns:
+            panel[f"ret_{sym}"] = rets[sym]
+            q_i = float(np.quantile(rets[sym].dropna().values, cfg.alpha))
+            panel[f"{sym}_tail"] = (rets[sym] <= q_i).astype(int)
+
+    # Some market stats
+    mkt_ann_vol = float(panel[f"ret_{cfg.market}"].std(ddof=1) * math.sqrt(252.0))
+    mkt_ann_ret = float(panel[f"ret_{cfg.market}"].mean() * 252.0)
+
+    summary = {
+        "config": asdict(cfg),
+        "data_window": {
+            "start": str(rets.index.min().date()),
+            "end": str(rets.index.max().date()),
+            "n_returns": int(len(rets)),
+        },
+        "market": {
+            "symbol": cfg.market,
+            "alpha": float(cfg.alpha),
+            "tail_threshold_return": float(q_m),
+            "ann_ret": float(mkt_ann_ret),
+            "ann_vol": float(mkt_ann_vol),
+        },
+        "ranking_by_delta_covar_most_negative_first": metrics.index.tolist(),
+        "metrics": {
+            sym: {k: float(v) for k, v in metrics.loc[sym].to_dict().items()}
+            for sym in metrics.index
+        }
+    }
+
+    return {"panel": panel, "metrics": metrics, "summary": summary}
+
+
+def save_outputs(result: Dict[str, object], cfg: Config) -> None:
+    panel: pd.DataFrame = result["panel"]  # type: ignore
+    metrics: pd.DataFrame = result["metrics"]  # type: ignore
+    summary: Dict = result["summary"]  # type: ignore
+
+    os.makedirs(os.path.dirname(cfg.out_panel_csv) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(cfg.out_metrics_csv) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(cfg.out_json) or ".", exist_ok=True)
+
+    panel.to_csv(cfg.out_panel_csv)
+    metrics.to_csv(cfg.out_metrics_csv)
+
+    with open(cfg.out_json, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+
+    print(f"[OK] Saved panel → {cfg.out_panel_csv}")
+    print(f"[OK] Saved metrics → {cfg.out_metrics_csv}")
+    print(f"[OK] Saved summary → {cfg.out_json}")
+
+    print("[TOP] Most negative ΔCoVaR (largest spillover):")
+    top = metrics.head(min(10, len(metrics)))
+    for sym, r in top.iterrows():
+        print(
+            f"  {sym:>5s}  ΔCoVaR={r['Delta_CoVaR']:.5f}  "
+            f"CoVaR@VaR={r['CoVaR_distress']:.5f}  VaR_i={r['VaR_i']:.5f}  b={r['b_qr']:.3f}"
+        )
+
+
+# ----------------------------- CLI -----------------------------
+def parse_args() -> Config:
+    p = argparse.ArgumentParser(description="Level-83: CoVaR / ΔCoVaR via Quantile Regression")
+
+    p.add_argument("--start", type=str, default="2010-01-01")
+    p.add_argument("--symbols", nargs="+", default=list(Config.symbols))
+    p.add_argument("--market", type=str, default="SPY")
+
+    p.add_argument("--alpha", type=float, default=0.05)
+    p.add_argument("--l2", type=float, default=1e-4)
+    p.add_argument("--no-intercept", action="store_true")
+    p.add_argument("--min-obs", type=int, default=500)
+
+    p.add_argument("--seed", type=int, default=42)
+
+    p.add_argument("--panel-csv", type=str, default="level83_covar_panel.csv")
+    p.add_argument("--metrics-csv", type=str, default="level83_covar_metrics.csv")
+    p.add_argument("--json", type=str, default="level83_covar_summary.json")
+
+    a = p.parse_args()
+    return Config(
+        symbols=tuple(a.symbols),
+        market=a.market,
+        start=a.start,
+        alpha=float(a.alpha),
+        l2=float(a.l2),
+        fit_intercept=(not a.no_intercept),
+        min_obs=int(a.min_obs),
+        seed=int(a.seed),
+        out_panel_csv=a.panel_csv,
+        out_metrics_csv=a.metrics_csv,
+        out_json=a.json
+    )
+
+
+def main() -> None:
+    cfg = parse_args()
+    result = run_pipeline(cfg)
+    save_outputs(result, cfg)
+
+
+if __name__ == "__main__":
+    # Jupyter/PyCharm cell shim: strip "-f kernel.json" etc.
+    import sys
+    sys.argv = [sys.argv[0]] + [
+        arg for arg in sys.argv[1:]
+        if arg != "-f" and not (arg.endswith(".json") and "kernel" in arg)
+    ]
+    main()
+```
+
+If you want Level-83 to **include SPY in the ranked table** (instead of skipping `sym == market`), tell me and I’ll flip that behavior and keep the output consistent.

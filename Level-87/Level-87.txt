@@ -1,0 +1,430 @@
+Below is a **complete Level-87 script** that’s **fast**, doesn’t get stuck in long loops, and stays **100% free-data**.
+
+## Level-87: Network Spillover Index (Diebold–Yilmaz style, VAR FEVD, free-data)
+
+### What it does
+
+* Downloads daily prices for your symbols
+* Builds **returns**
+* Fits a **VAR(p)** (statsmodels)
+* Computes **Generalized FEVD** (Koop–Pesaran–Shin style, no orthogonalization needed)
+* Outputs:
+
+  * **Total Spillover Index**
+  * **Directional “TO” and “FROM” spillovers**
+  * **Net spillover**
+  * **Pairwise spillover matrix**
+  * Optional rolling version (windowed) — but default is OFF so it runs fast
+
+### Why it won’t run forever
+
+* The FEVD uses a **closed-form recursion** (moving-average representation up to horizon H)
+* No Monte Carlo, no numerical integration, no nested calibrations
+* Uses a modest default VAR lag and horizon
+
+---
+
+```python
+# level87_network_spillover_dy.py
+# Level-87: Diebold–Yilmaz Network Spillover Index (VAR + Generalized FEVD) using free-data
+#
+# Outputs:
+#   - level87_spillover_matrix.csv      (NxN normalized spillover matrix)
+#   - level87_spillover_metrics.csv     (TO/FROM/NET + totals)
+#   - level87_spillover_summary.json
+#
+# Run:
+#   python level87_network_spillover_dy.py
+#   python level87_network_spillover_dy.py --symbols SPY QQQ IWM EFA EEM TLT LQD GLD --start 2010-01-01
+#   python level87_network_spillover_dy.py --p 2 --h 10
+#   python level87_network_spillover_dy.py --rolling --window 756 --step 21
+
+import os
+import json
+import math
+import argparse
+from dataclasses import dataclass, asdict
+from typing import Tuple, Dict, List, Optional
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+
+from statsmodels.tsa.api import VAR
+
+
+# ----------------------------- Config -----------------------------
+@dataclass
+class Config:
+    symbols: Tuple[str, ...] = ("SPY", "QQQ", "IWM", "EFA", "EEM", "TLT", "LQD", "GLD")
+    start: str = "2010-01-01"
+
+    p: int = 2              # VAR lags
+    h: int = 10             # FEVD horizon
+    ridge: float = 1e-10    # tiny ridge for numerical stability on covariance inversion
+
+    min_obs: int = 800      # need enough history for stable VAR
+
+    rolling: bool = False
+    window: int = 756       # ~3y of trading days
+    step: int = 21          # monthly step
+
+    seed: int = 42
+
+    out_mat_csv: str = "level87_spillover_matrix.csv"
+    out_metrics_csv: str = "level87_spillover_metrics.csv"
+    out_json: str = "level87_spillover_summary.json"
+
+
+# ----------------------------- yfinance loader -----------------------------
+def _safe_close_series(px: pd.DataFrame, symbol: str) -> pd.Series:
+    if isinstance(px.columns, pd.MultiIndex):
+        if ("Close", symbol) in px.columns:
+            s = px[("Close", symbol)].copy()
+            s.name = symbol
+            return s
+        if ("Adj Close", symbol) in px.columns:
+            s = px[("Adj Close", symbol)].copy()
+            s.name = symbol
+            return s
+        if (symbol, "Close") in px.columns:
+            s = px[(symbol, "Close")].copy()
+            s.name = symbol
+            return s
+        if (symbol, "Adj Close") in px.columns:
+            s = px[(symbol, "Adj Close")].copy()
+            s.name = symbol
+            return s
+        candidates = [
+            c for c in px.columns
+            if isinstance(c, tuple) and (symbol in c) and ("Close" in c or "Adj Close" in c)
+        ]
+        if candidates:
+            s = px[candidates[0]].copy()
+            s.name = symbol
+            return s
+        raise RuntimeError(f"Could not locate Close/Adj Close for {symbol} in MultiIndex columns.")
+
+    if "Close" in px.columns:
+        s = px["Close"].copy()
+        s.name = symbol
+        return s
+    if "Adj Close" in px.columns:
+        s = px["Adj Close"].copy()
+        s.name = symbol
+        return s
+    raise RuntimeError(f"'Close' missing for {symbol}. Columns={list(px.columns)}")
+
+
+def load_prices(symbols: Tuple[str, ...], start: str) -> pd.DataFrame:
+    px = yf.download(
+        list(symbols),
+        start=start,
+        auto_adjust=True,
+        progress=False,
+        group_by="column",
+        threads=True,
+    )
+    if px is None or px.empty:
+        raise RuntimeError("No price data returned from yfinance.")
+    frames = [_safe_close_series(px, s) for s in symbols]
+    prices = pd.concat(frames, axis=1).sort_index().dropna(how="any")
+    return prices
+
+
+def compute_log_returns(prices: pd.DataFrame) -> pd.DataFrame:
+    rets = np.log(prices).diff().dropna()
+    rets = rets.replace([np.inf, -np.inf], np.nan).dropna(how="any")
+    return rets
+
+
+# ----------------------------- VAR -> MA (Psi) recursion -----------------------------
+def var_to_psi_mats(A: np.ndarray, h: int) -> List[np.ndarray]:
+    """
+    Convert VAR(p) coefficient matrices A (p x N x N) to MA coefficient matrices Psi[0..h-1].
+    Psi_0 = I
+    Psi_k = sum_{j=1..p} Psi_{k-j} A_j  for k>=1 with Psi_{<0}=0
+    """
+    p, N, _ = A.shape
+    Psi = [np.eye(N)]
+    for k in range(1, h):
+        acc = np.zeros((N, N))
+        for j in range(1, p + 1):
+            if k - j >= 0:
+                acc += Psi[k - j] @ A[j - 1]
+        Psi.append(acc)
+    return Psi
+
+
+# ----------------------------- Generalized FEVD (KPS) -----------------------------
+def generalized_fevd(Psi: List[np.ndarray], Sigma: np.ndarray, ridge: float = 1e-10) -> np.ndarray:
+    """
+    Generalized FEVD (Koop–Pesaran–Shin):
+      theta_ij(H) = (sigma_jj^{-1} * sum_{h=0..H-1} (e_i' Psi_h Sigma e_j)^2)
+                    / (sum_{h=0..H-1} e_i' Psi_h Sigma Psi_h' e_i)
+    Then row-normalize so rows sum to 1.
+    """
+    N = Sigma.shape[0]
+    Sigma = Sigma.copy()
+    Sigma.flat[:: N + 1] += ridge
+
+    denom = np.zeros(N)
+    for i in range(N):
+        s = 0.0
+        ei = np.zeros(N); ei[i] = 1.0
+        for Ph in Psi:
+            v = ei @ (Ph @ Sigma @ Ph.T) @ ei
+            s += float(v)
+        denom[i] = max(s, 1e-18)
+
+    theta = np.zeros((N, N))
+    sig_diag = np.clip(np.diag(Sigma), 1e-18, np.inf)
+
+    for i in range(N):
+        ei = np.zeros(N); ei[i] = 1.0
+        for j in range(N):
+            ej = np.zeros(N); ej[j] = 1.0
+            num = 0.0
+            for Ph in Psi:
+                x = ei @ (Ph @ Sigma) @ ej
+                num += float(x * x)
+            theta[i, j] = (num / sig_diag[j]) / denom[i]
+
+    row_sums = theta.sum(axis=1, keepdims=True)
+    row_sums = np.where(row_sums <= 0, 1.0, row_sums)
+    theta = theta / row_sums
+    return theta
+
+
+# ----------------------------- Spillover metrics -----------------------------
+def spillover_metrics(theta: np.ndarray, symbols: List[str]) -> pd.DataFrame:
+    """
+    Diebold–Yilmaz spillover table from normalized FEVD theta.
+    - FROM_i = sum_{j!=i} theta_{i,j}
+    - TO_i   = sum_{j!=i} theta_{j,i}
+    - NET_i  = TO_i - FROM_i
+    Total spillover index = (sum off-diagonal theta) / N * 100
+    """
+    N = theta.shape[0]
+    off = theta.copy()
+    np.fill_diagonal(off, 0.0)
+
+    from_i = off.sum(axis=1)
+    to_i = off.sum(axis=0)
+    net_i = to_i - from_i
+
+    total = off.sum() / N * 100.0
+
+    df = pd.DataFrame({
+        "FROM": from_i,
+        "TO": to_i,
+        "NET": net_i,
+    }, index=symbols)
+
+    df.loc["TOTAL_SPILLOVER_%", "FROM"] = total
+    df.loc["TOTAL_SPILLOVER_%", "TO"] = np.nan
+    df.loc["TOTAL_SPILLOVER_%", "NET"] = np.nan
+    return df
+
+
+# ----------------------------- One-shot fit -----------------------------
+def fit_spillover(rets: pd.DataFrame, cfg: Config) -> Dict[str, object]:
+    if len(rets) < cfg.min_obs:
+        raise RuntimeError(f"Not enough observations: {len(rets)} < min_obs={cfg.min_obs}")
+
+    model = VAR(rets)
+    res = model.fit(cfg.p)
+
+    # A: (p, N, N) in statsmodels order (lag1..lagp)
+    A = np.array(res.coefs)  # shape (p, N, N)
+    Sigma = np.array(res.sigma_u)  # shape (N, N)
+
+    Psi = var_to_psi_mats(A, cfg.h)
+    theta = generalized_fevd(Psi, Sigma, ridge=cfg.ridge)
+
+    symbols = list(rets.columns)
+    mat = pd.DataFrame(theta, index=symbols, columns=symbols)
+    metrics = spillover_metrics(theta, symbols)
+
+    return {
+        "theta": theta,
+        "matrix": mat,
+        "metrics": metrics,
+        "var_lags": cfg.p,
+        "fevd_h": cfg.h,
+    }
+
+
+# ----------------------------- Rolling mode -----------------------------
+def rolling_spillover(rets: pd.DataFrame, cfg: Config) -> pd.DataFrame:
+    """
+    Rolling total spillover index series.
+    """
+    idx = rets.index
+    totals = []
+    dates = []
+
+    for start_i in range(0, len(rets) - cfg.window + 1, cfg.step):
+        end_i = start_i + cfg.window
+        sub = rets.iloc[start_i:end_i]
+        out = fit_spillover(sub, cfg)
+        total = float(out["metrics"].loc["TOTAL_SPILLOVER_%", "FROM"])
+        dates.append(idx[end_i - 1])
+        totals.append(total)
+
+    return pd.DataFrame({"TOTAL_SPILLOVER_%": totals}, index=pd.DatetimeIndex(dates))
+
+
+# ----------------------------- Pipeline -----------------------------
+def run_pipeline(cfg: Config) -> Dict[str, object]:
+    np.random.seed(cfg.seed)
+
+    print(f"[INFO] Downloading prices for {cfg.symbols} from {cfg.start} ...")
+    prices = load_prices(cfg.symbols, cfg.start)
+    rets = compute_log_returns(prices)
+
+    print(f"[INFO] Got {len(prices)} price rows, {len(rets)} return rows, assets={rets.shape[1]}")
+
+    one = fit_spillover(rets, cfg)
+
+    roll_df = None
+    if cfg.rolling:
+        print(f"[INFO] Rolling spillover: window={cfg.window}, step={cfg.step} ...")
+        roll_df = rolling_spillover(rets, cfg)
+
+    summary = {
+        "config": asdict(cfg),
+        "data_window": {
+            "start": str(rets.index.min().date()),
+            "end": str(rets.index.max().date()),
+            "n_returns": int(len(rets)),
+            "assets": int(rets.shape[1]),
+        },
+        "var": {"lags": int(cfg.p)},
+        "fevd": {"horizon": int(cfg.h)},
+        "total_spillover_percent": float(one["metrics"].loc["TOTAL_SPILLOVER_%", "FROM"]),
+        "ranking_net_spillover_high_to_low": (
+            one["metrics"]
+            .drop(index="TOTAL_SPILLOVER_%", errors="ignore")
+            .sort_values("NET", ascending=False)
+            .index.tolist()
+        ),
+    }
+
+    return {
+        "returns": rets,
+        "matrix": one["matrix"],
+        "metrics": one["metrics"],
+        "summary": summary,
+        "rolling_total": roll_df,
+    }
+
+
+def save_outputs(result: Dict[str, object], cfg: Config) -> None:
+    mat: pd.DataFrame = result["matrix"]  # type: ignore
+    metrics: pd.DataFrame = result["metrics"]  # type: ignore
+    summary: Dict = result["summary"]  # type: ignore
+    roll_df = result.get("rolling_total", None)
+
+    os.makedirs(os.path.dirname(cfg.out_mat_csv) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(cfg.out_metrics_csv) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(cfg.out_json) or ".", exist_ok=True)
+
+    mat.to_csv(cfg.out_mat_csv)
+    metrics.to_csv(cfg.out_metrics_csv)
+
+    if roll_df is not None:
+        roll_path = cfg.out_mat_csv.replace(".csv", "_rolling_total.csv")
+        roll_df.to_csv(roll_path)
+        summary["rolling_total_csv"] = roll_path
+        print(f"[OK] Saved rolling total → {roll_path}")
+
+    with open(cfg.out_json, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+
+    print(f"[OK] Saved spillover matrix → {cfg.out_mat_csv}")
+    print(f"[OK] Saved metrics          → {cfg.out_metrics_csv}")
+    print(f"[OK] Saved summary          → {cfg.out_json}")
+
+    total = metrics.loc["TOTAL_SPILLOVER_%", "FROM"]
+    print(f"[RESULT] Total Spillover Index = {float(total):.2f}%")
+
+    print("[TOP] Net spillover (TO - FROM), highest emitters first:")
+    ranked = (
+        metrics.drop(index="TOTAL_SPILLOVER_%", errors="ignore")
+        .sort_values("NET", ascending=False)
+        .head(min(10, len(metrics) - 1))
+    )
+    for sym, r in ranked.iterrows():
+        print(f"  {sym:>5s}  NET={r['NET']:.4f}  TO={r['TO']:.4f}  FROM={r['FROM']:.4f}")
+
+
+# ----------------------------- CLI -----------------------------
+def parse_args() -> Config:
+    p = argparse.ArgumentParser(description="Level-87: Diebold–Yilmaz Spillover Index (VAR-GFEVD)")
+
+    p.add_argument("--start", type=str, default="2010-01-01")
+    p.add_argument("--symbols", nargs="+", default=list(Config.symbols))
+
+    p.add_argument("--p", type=int, default=2)
+    p.add_argument("--h", type=int, default=10)
+    p.add_argument("--ridge", type=float, default=1e-10)
+    p.add_argument("--min-obs", type=int, default=800)
+
+    p.add_argument("--rolling", action="store_true")
+    p.add_argument("--window", type=int, default=756)
+    p.add_argument("--step", type=int, default=21)
+
+    p.add_argument("--seed", type=int, default=42)
+
+    p.add_argument("--mat-csv", type=str, default="level87_spillover_matrix.csv")
+    p.add_argument("--metrics-csv", type=str, default="level87_spillover_metrics.csv")
+    p.add_argument("--json", type=str, default="level87_spillover_summary.json")
+
+    a = p.parse_args()
+    return Config(
+        symbols=tuple(a.symbols),
+        start=a.start,
+        p=int(a.p),
+        h=int(a.h),
+        ridge=float(a.ridge),
+        min_obs=int(a.min_obs),
+        rolling=bool(a.rolling),
+        window=int(a.window),
+        step=int(a.step),
+        seed=int(a.seed),
+        out_mat_csv=a.mat_csv,
+        out_metrics_csv=a.metrics_csv,
+        out_json=a.json
+    )
+
+
+def main() -> None:
+    cfg = parse_args()
+    result = run_pipeline(cfg)
+    save_outputs(result, cfg)
+
+
+if __name__ == "__main__":
+    # Jupyter/PyCharm shim: strip "-f kernel.json" etc.
+    import sys
+    sys.argv = [sys.argv[0]] + [
+        arg for arg in sys.argv[1:]
+        if arg != "-f" and not (arg.endswith(".json") and "kernel" in arg)
+    ]
+    main()
+```
+
+### Recommended fast run
+
+```bash
+python level87_network_spillover_dy.py --p 2 --h 10
+```
+
+### If you want **rolling spillover** (slower but still reasonable)
+
+```bash
+python level87_network_spillover_dy.py --rolling --window 756 --step 21
+```
+
+If you tell me what your **Level-87 definition** is in your roadmap (some people define it as **connectedness centrality**, others as **Granger-causality network**), I can tailor the outputs exactly to that spec.

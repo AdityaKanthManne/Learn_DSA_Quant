@@ -1,0 +1,412 @@
+# level86_srisk.py
+# Level-86: SRISK (Systemic Risk Capital Shortfall) with MES/LRMES using free-data (yfinance)
+#
+# Core:
+# 1) Compute MES_i(alpha) = E[r_i | r_m <= VaR_m(alpha)]
+# 2) Approximate LRMES via LRMES_i = 1 - exp(-h * max(0, -MES_i))
+# 3) Pull market cap E_i from yfinance info (price * shares) if available
+# 4) Pull "debt" proxy D_i from yfinance balance sheet (Total Liabilities / Total Liabilities Net Minority Interest)
+#    If unavailable, fallback uses a leverage ratio: D_i = leverage * E_i
+# 5) SRISK_i = max(0, k*(D_i + E_i) - (1-k)*(1-LRMES_i)*E_i)
+#
+# Outputs:
+#   - level86_srisk_panel.csv   (returns + market tail flag)
+#   - level86_srisk_metrics.csv (MES, LRMES, E, D, SRISK ranked)
+#   - level86_srisk_summary.json
+#
+# Run:
+#   python level86_srisk.py
+#   python level86_srisk.py --alpha 0.05 --market SPY --symbols JPM BAC GS MS AAPL
+#   python level86_srisk.py --debt-method fixed --leverage 1.0
+#   python level86_srisk.py --start 2015-01-01 --alpha 0.01 --k 0.08 --h 18
+
+import os
+import json
+import math
+import argparse
+from dataclasses import dataclass, asdict
+from typing import Tuple, Dict, List, Optional
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+
+
+# ----------------------------- Config -----------------------------
+@dataclass
+class Config:
+    symbols: Tuple[str, ...] = ("SPY", "QQQ", "IWM", "EFA", "EEM", "TLT", "LQD", "GLD")
+    market: str = "SPY"
+    start: str = "2010-01-01"
+
+    alpha: float = 0.05   # market tail probability
+    min_obs: int = 500
+
+    # SRISK parameters
+    k: float = 0.08       # required capital ratio
+    h: float = 18.0       # LRMES horizon multiplier (common shortcut)
+
+    # Debt proxy
+    debt_method: str = "yfinance"  # "yfinance" or "fixed"
+    leverage: float = 1.0          # used only if debt_method == "fixed": D = leverage * E
+
+    seed: int = 42
+
+    out_panel_csv: str = "level86_srisk_panel.csv"
+    out_metrics_csv: str = "level86_srisk_metrics.csv"
+    out_json: str = "level86_srisk_summary.json"
+
+
+# ----------------------------- Robust yfinance close loader -----------------------------
+def _safe_close_series(px: pd.DataFrame, symbol: str) -> pd.Series:
+    if isinstance(px.columns, pd.MultiIndex):
+        if ("Close", symbol) in px.columns:
+            s = px[("Close", symbol)].copy()
+            s.name = symbol
+            return s
+        if ("Adj Close", symbol) in px.columns:
+            s = px[("Adj Close", symbol)].copy()
+            s.name = symbol
+            return s
+        if (symbol, "Close") in px.columns:
+            s = px[(symbol, "Close")].copy()
+            s.name = symbol
+            return s
+        if (symbol, "Adj Close") in px.columns:
+            s = px[(symbol, "Adj Close")].copy()
+            s.name = symbol
+            return s
+        candidates = [
+            c for c in px.columns
+            if isinstance(c, tuple) and (symbol in c) and ("Close" in c or "Adj Close" in c)
+        ]
+        if candidates:
+            s = px[candidates[0]].copy()
+            s.name = symbol
+            return s
+        raise RuntimeError(f"Could not locate Close/Adj Close for {symbol} in MultiIndex columns.")
+
+    if "Close" in px.columns:
+        s = px["Close"].copy()
+        s.name = symbol
+        return s
+    if "Adj Close" in px.columns:
+        s = px["Adj Close"].copy()
+        s.name = symbol
+        return s
+    raise RuntimeError(f"'Close' missing for {symbol}. Columns={list(px.columns)}")
+
+
+def load_prices(symbols: Tuple[str, ...], start: str) -> pd.DataFrame:
+    px = yf.download(
+        list(symbols),
+        start=start,
+        auto_adjust=True,
+        progress=False,
+        group_by="column",
+        threads=True,
+    )
+    if px is None or px.empty:
+        raise RuntimeError("No price data returned from yfinance.")
+
+    frames: List[pd.Series] = []
+    for s in symbols:
+        frames.append(_safe_close_series(px, s))
+
+    prices = pd.concat(frames, axis=1).sort_index().dropna(how="any")
+    return prices
+
+
+def compute_log_returns(prices: pd.DataFrame) -> pd.DataFrame:
+    rets = np.log(prices).diff().dropna()
+    rets = rets.replace([np.inf, -np.inf], np.nan).dropna(how="any")
+    return rets
+
+
+# ----------------------------- MES / LRMES -----------------------------
+def compute_mes(rets: pd.DataFrame, market: str, alpha: float, min_obs: int) -> Dict[str, object]:
+    if market not in rets.columns:
+        raise RuntimeError(f"Market '{market}' not in returns columns.")
+    if len(rets) < min_obs:
+        raise RuntimeError(f"Not enough observations: {len(rets)} < min_obs={min_obs}")
+
+    rm = rets[market].copy()
+    var_m = float(np.quantile(rm.values, alpha))
+    tail_mask = rm <= var_m
+    n_tail = int(tail_mask.sum())
+    if n_tail < 20:
+        raise RuntimeError(f"Too few tail days ({n_tail}). Try alpha=0.05 or longer start history.")
+
+    mes = {}
+    mu = {}
+    for col in rets.columns:
+        x = rets[col].dropna()
+        # align to rm index
+        df = pd.concat([rm.rename("rm"), rets[col].rename("ri")], axis=1).dropna()
+        if len(df) < min_obs:
+            continue
+        mu[col] = float(df["ri"].mean())
+        mes[col] = float(df.loc[df["rm"] <= var_m, "ri"].mean())
+
+    return {
+        "var_m": var_m,
+        "tail_mask": tail_mask,
+        "n_tail": n_tail,
+        "mu": mu,
+        "mes": mes,
+    }
+
+
+def mes_to_lrmes(mes_i: float, h: float) -> float:
+    # mes_i is an average return on tail days (typically negative in crises).
+    # Use max(0, -mes_i) to avoid weirdness for hedges (bonds, gold) that have positive tail performance.
+    return float(1.0 - math.exp(-h * max(0.0, -mes_i)))
+
+
+# ----------------------------- Market Cap & Debt proxies -----------------------------
+def get_market_cap(symbol: str) -> Optional[float]:
+    """
+    Try to get market cap from yfinance. Returns USD market cap if available, else None.
+    """
+    try:
+        t = yf.Ticker(symbol)
+        info = getattr(t, "fast_info", None)
+        if info and isinstance(info, dict):
+            mc = info.get("marketCap", None)
+            if mc is not None and np.isfinite(mc):
+                return float(mc)
+        # fallback: info (slower)
+        info2 = getattr(t, "info", None)
+        if info2 and isinstance(info2, dict):
+            mc = info2.get("marketCap", None)
+            if mc is not None and np.isfinite(mc):
+                return float(mc)
+    except Exception:
+        return None
+    return None
+
+
+def get_debt_proxy(symbol: str) -> Optional[float]:
+    """
+    Debt proxy from yfinance balance sheet:
+      - Prefer Total Liabilities Net Minority Interest
+      - Else Total Liabilities
+    Returns USD value if available, else None.
+    """
+    try:
+        t = yf.Ticker(symbol)
+        bs = t.balance_sheet
+        if bs is None or bs.empty:
+            return None
+
+        # bs is a DataFrame: rows are line items, columns are periods
+        # take most recent column
+        col = bs.columns[0]
+
+        candidates = [
+            "Total Liabilities Net Minority Interest",
+            "Total Liab",
+            "Total Liabilities",
+        ]
+        for name in candidates:
+            if name in bs.index:
+                val = bs.loc[name, col]
+                if pd.notna(val) and np.isfinite(val):
+                    return float(val)
+
+    except Exception:
+        return None
+    return None
+
+
+# ----------------------------- Pipeline -----------------------------
+def run_pipeline(cfg: Config) -> Dict[str, object]:
+    np.random.seed(cfg.seed)
+
+    all_syms = tuple(dict.fromkeys(list(cfg.symbols) + [cfg.market]))
+    print(f"[INFO] Downloading prices for {all_syms} from {cfg.start} ...")
+    prices = load_prices(all_syms, cfg.start)
+    rets = compute_log_returns(prices)
+    print(f"[INFO] Got {len(prices)} price rows, {len(rets)} return rows, assets={rets.shape[1]}")
+
+    mes_pack = compute_mes(rets, cfg.market, cfg.alpha, cfg.min_obs)
+    var_m = float(mes_pack["var_m"])
+    tail_mask: pd.Series = mes_pack["tail_mask"]
+    n_tail = int(mes_pack["n_tail"])
+    mu: Dict[str, float] = mes_pack["mu"]
+    mes: Dict[str, float] = mes_pack["mes"]
+
+    # Panel output: returns + tail flag
+    panel = rets.add_prefix("ret_").copy()
+    panel["mkt_tail"] = tail_mask.reindex(panel.index).astype(int)
+
+    # SRISK metrics
+    rows = []
+    for s in cfg.symbols:
+        if s == cfg.market:
+            # usually SRISK for institutions/assets conditioned on market; skip market itself
+            continue
+        if s not in rets.columns:
+            continue
+        if s not in mes or s not in mu:
+            continue
+
+        mes_i = float(mes[s])
+        mu_i = float(mu[s])
+        lrmes_i = mes_to_lrmes(mes_i, cfg.h)
+
+        E = get_market_cap(s)  # equity market value
+        if E is None:
+            # Fallback: approximate E from last price * 1 share (not meaningful); better to skip
+            # But to keep pipeline robust, we mark missing.
+            E = np.nan
+
+        if cfg.debt_method.lower() == "yfinance":
+            D = get_debt_proxy(s)
+            if D is None:
+                # fallback to leverage * E if we have market cap
+                D = (cfg.leverage * E) if np.isfinite(E) else np.nan
+        elif cfg.debt_method.lower() == "fixed":
+            D = (cfg.leverage * E) if np.isfinite(E) else np.nan
+        else:
+            raise ValueError("debt_method must be 'yfinance' or 'fixed'")
+
+        # SRISK formula
+        if np.isfinite(E) and np.isfinite(D):
+            srisk = max(
+                0.0,
+                cfg.k * (D + E) - (1.0 - cfg.k) * (1.0 - lrmes_i) * E
+            )
+        else:
+            srisk = np.nan
+
+        rows.append({
+            "symbol": s,
+            "mu_i": mu_i,
+            "MES_i": mes_i,
+            "LRMES_i": lrmes_i,
+            "E_mktcap": float(E) if np.isfinite(E) else np.nan,
+            "D_proxy": float(D) if np.isfinite(D) else np.nan,
+            "SRISK": float(srisk) if np.isfinite(srisk) else np.nan,
+        })
+
+    metrics = pd.DataFrame(rows).set_index("symbol")
+    if metrics.empty:
+        raise RuntimeError("No metrics computed. Check symbols/start/min_obs.")
+
+    # Rank by SRISK descending (largest capital shortfall first)
+    metrics = metrics.sort_values("SRISK", ascending=False)
+
+    # Market stats
+    mkt_ann_ret = float(rets[cfg.market].mean() * 252.0)
+    mkt_ann_vol = float(rets[cfg.market].std(ddof=1) * math.sqrt(252.0))
+
+    summary = {
+        "config": asdict(cfg),
+        "data_window": {
+            "start": str(rets.index.min().date()),
+            "end": str(rets.index.max().date()),
+            "n_returns": int(len(rets)),
+        },
+        "market": {
+            "symbol": cfg.market,
+            "alpha": float(cfg.alpha),
+            "VaR_m": float(var_m),
+            "n_tail_days": int(n_tail),
+            "ann_ret": float(mkt_ann_ret),
+            "ann_vol": float(mkt_ann_vol),
+        },
+        "ranking_by_SRIK_largest_first": metrics.index.tolist(),
+        "metrics": {
+            sym: {k: (None if pd.isna(v) else float(v)) for k, v in metrics.loc[sym].to_dict().items()}
+            for sym in metrics.index
+        }
+    }
+
+    return {"panel": panel, "metrics": metrics, "summary": summary}
+
+
+def save_outputs(result: Dict[str, object], cfg: Config) -> None:
+    panel: pd.DataFrame = result["panel"]  # type: ignore
+    metrics: pd.DataFrame = result["metrics"]  # type: ignore
+    summary: Dict = result["summary"]  # type: ignore
+
+    os.makedirs(os.path.dirname(cfg.out_panel_csv) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(cfg.out_metrics_csv) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(cfg.out_json) or ".", exist_ok=True)
+
+    panel.to_csv(cfg.out_panel_csv)
+    metrics.to_csv(cfg.out_metrics_csv)
+
+    with open(cfg.out_json, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+
+    print(f"[OK] Saved panel   → {cfg.out_panel_csv}")
+    print(f"[OK] Saved metrics → {cfg.out_metrics_csv}")
+    print(f"[OK] Saved summary → {cfg.out_json}")
+
+    print("[TOP] Largest SRISK (capital shortfall) first:")
+    top = metrics.head(min(10, len(metrics)))
+    for sym, r in top.iterrows():
+        print(
+            f"  {sym:>6s}  SRISK={r['SRISK']:.2f}  "
+            f"LRMES={r['LRMES_i']:.3f}  MES={r['MES_i']:.5f}  "
+            f"E={r['E_mktcap']:.2f}  D={r['D_proxy']:.2f}"
+        )
+
+
+# ----------------------------- CLI -----------------------------
+def parse_args() -> Config:
+    p = argparse.ArgumentParser(description="Level-86: SRISK using MES/LRMES (free-data)")
+
+    p.add_argument("--start", type=str, default="2010-01-01")
+    p.add_argument("--symbols", nargs="+", default=list(Config.symbols))
+    p.add_argument("--market", type=str, default="SPY")
+
+    p.add_argument("--alpha", type=float, default=0.05)
+    p.add_argument("--min-obs", type=int, default=500)
+
+    p.add_argument("--k", type=float, default=0.08)
+    p.add_argument("--h", type=float, default=18.0)
+
+    p.add_argument("--debt-method", type=str, default="yfinance", choices=["yfinance", "fixed"])
+    p.add_argument("--leverage", type=float, default=1.0)
+
+    p.add_argument("--seed", type=int, default=42)
+
+    p.add_argument("--panel-csv", type=str, default="level86_srisk_panel.csv")
+    p.add_argument("--metrics-csv", type=str, default="level86_srisk_metrics.csv")
+    p.add_argument("--json", type=str, default="level86_srisk_summary.json")
+
+    a = p.parse_args()
+    return Config(
+        symbols=tuple(a.symbols),
+        market=a.market,
+        start=a.start,
+        alpha=float(a.alpha),
+        min_obs=int(a.min_obs),
+        k=float(a.k),
+        h=float(a.h),
+        debt_method=str(a.debt_method),
+        leverage=float(a.leverage),
+        seed=int(a.seed),
+        out_panel_csv=a.panel_csv,
+        out_metrics_csv=a.metrics_csv,
+        out_json=a.json
+    )
+
+
+def main() -> None:
+    cfg = parse_args()
+    result = run_pipeline(cfg)
+    save_outputs(result, cfg)
+
+
+if __name__ == "__main__":
+    # Jupyter/PyCharm shim: strip "-f kernel.json" etc.
+    import sys
+    sys.argv = [sys.argv[0]] + [
+        arg for arg in sys.argv[1:]
+        if arg != "-f" and not (arg.endswith(".json") and "kernel" in arg)
+    ]
+    main()

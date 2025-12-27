@@ -1,0 +1,494 @@
+# level85_evt_pot_var_es.py
+# Level-85: EVT (Extreme Value Theory) Peaks-Over-Threshold (POT) VaR + ES + Backtesting
+#
+# What you get (end-to-end):
+# 1) Pull daily prices from yfinance
+# 2) Build portfolio returns (equal-weight default or user weights)
+# 3) Compute rolling 1-day VaR and ES using EVT POT with GPD tail fit on LOSSES:
+#       - Choose threshold by quantile u_q (e.g., 95% => top 5% losses as exceedances)
+#       - Fit GPD to exceedances (loss - u) using MLE (scipy if available, else robust fallback)
+#       - Forecast VaR_alpha and ES_alpha for next day
+# 4) Backtest VaR breaches:
+#       - Kupiec POF (unconditional coverage)
+#       - Christoffersen independence + conditional coverage
+#
+# Outputs:
+#   - level85_evt_panel.csv
+#   - level85_evt_summary.json
+#
+# Examples:
+#   python level85_evt_pot_var_es.py
+#   python level85_evt_pot_var_es.py --symbols SPY QQQ IWM TLT GLD --weights 0.35 0.25 0.15 0.15 0.10
+#   python level85_evt_pot_var_es.py --alpha 0.01 --window 1000 --u-quantile 0.95
+#
+# Notes:
+# - Loss is defined as L = -return (positive = loss).
+# - VaR and ES are positive loss numbers (e.g., 0.02 = 2% loss).
+# - Breach if realized loss > forecast VaR.
+# - EVT POT formula is sensitive; keep a reasonably large window and not-too-high threshold.
+#
+# Dependencies:
+# - Required: numpy, pandas, yfinance
+# - Optional: scipy (for GPD MLE + chi-square p-values). Script runs without SciPy.
+
+import os
+import json
+import math
+import argparse
+from dataclasses import dataclass, asdict
+from typing import Tuple, Optional, Dict, Any
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+
+# Optional SciPy
+_HAVE_SCIPY = False
+try:
+    from scipy.stats import genpareto, chi2  # type: ignore
+    _HAVE_SCIPY = True
+except Exception:
+    _HAVE_SCIPY = False
+
+
+# ----------------------------- Config -----------------------------
+@dataclass
+class Config:
+    symbols: Tuple[str, ...] = ("SPY", "QQQ", "IWM", "EFA", "EEM", "TLT", "LQD", "GLD")
+    weights: Optional[Tuple[float, ...]] = None
+    start: str = "2010-01-01"
+
+    alpha: float = 0.01          # VaR tail probability (1% default)
+    window: int = 1000           # rolling lookback for EVT fit
+    u_quantile: float = 0.95     # threshold quantile for POT (e.g., 0.95 => exceedances are top 5% losses)
+
+    # Guardrails
+    min_exceed: int = 40         # minimum exceedances needed to trust EVT; else fallback to historical
+    xi_cap: float = 0.80         # cap shape parameter to avoid crazy moments
+    beta_floor: float = 1e-8     # floor scale param
+    seed: int = 42
+
+    out_csv: str = "level85_evt_panel.csv"
+    out_json: str = "level85_evt_summary.json"
+
+
+# ----------------------------- Data loader -----------------------------
+def load_prices(symbols: Tuple[str, ...], start: str) -> pd.DataFrame:
+    px = yf.download(list(symbols), start=start, auto_adjust=True, progress=False)
+    if px is None or len(px) == 0:
+        raise RuntimeError("No data returned from yfinance (check symbols/start).")
+
+    if isinstance(px.columns, pd.MultiIndex):
+        if "Close" not in px.columns.get_level_values(0):
+            raise RuntimeError("Expected 'Close' in yfinance MultiIndex columns.")
+        close = px["Close"].copy()
+    else:
+        if "Close" not in px.columns:
+            raise RuntimeError(f"Expected 'Close' column. Got: {list(px.columns)}")
+        close = px[["Close"]].copy()
+        close.columns = [symbols[0]]
+
+    close = close.dropna(how="any").sort_index()
+    close.columns = [str(c) for c in close.columns]
+    return close
+
+
+def compute_log_returns(prices: pd.DataFrame) -> pd.DataFrame:
+    rets = np.log(prices).diff().dropna()
+    rets = rets.replace([np.inf, -np.inf], np.nan).dropna(how="any")
+    return rets
+
+
+def normalize_weights(symbols: Tuple[str, ...], weights: Optional[Tuple[float, ...]]) -> np.ndarray:
+    n = len(symbols)
+    if weights is None:
+        return np.ones(n) / n
+    if len(weights) != n:
+        raise ValueError(f"--weights length ({len(weights)}) must match --symbols length ({n}).")
+    w = np.array(weights, dtype=float)
+    if not np.isfinite(w).all():
+        raise ValueError("Weights must be finite numbers.")
+    s = float(w.sum())
+    if abs(s) < 1e-12:
+        raise ValueError("Weights sum to ~0; cannot normalize.")
+    return w / s
+
+
+# ----------------------------- Backtests -----------------------------
+def kupiec_pof_test(breaches: np.ndarray, alpha: float) -> Dict[str, float]:
+    n = int(breaches.size)
+    x = int(breaches.sum())
+    p = float(alpha)
+    if n == 0:
+        return {"LR_pof": float("nan"), "p_value": float("nan"), "n": 0, "x": 0}
+
+    pi_hat = x / n
+
+    def _log(a: float) -> float:
+        return math.log(max(a, 1e-15))
+
+    ll0 = (n - x) * _log(1.0 - p) + x * _log(p)
+    ll1 = (n - x) * _log(1.0 - pi_hat) + x * _log(pi_hat)
+    lr = -2.0 * (ll0 - ll1)
+
+    pv = float(chi2.sf(lr, df=1)) if (_HAVE_SCIPY) else float("nan")
+    return {"LR_pof": float(lr), "p_value": pv, "n": n, "x": x, "pi_hat": float(pi_hat)}
+
+
+def christoffersen_ind_test(breaches: np.ndarray) -> Dict[str, float]:
+    b = breaches.astype(int)
+    if b.size < 2:
+        return {"LR_ind": float("nan"), "p_value": float("nan"), "n00": 0, "n01": 0, "n10": 0, "n11": 0}
+
+    b0 = b[:-1]
+    b1 = b[1:]
+
+    n00 = int(((b0 == 0) & (b1 == 0)).sum())
+    n01 = int(((b0 == 0) & (b1 == 1)).sum())
+    n10 = int(((b0 == 1) & (b1 == 0)).sum())
+    n11 = int(((b0 == 1) & (b1 == 1)).sum())
+
+    pi01 = n01 / max(n00 + n01, 1)
+    pi11 = n11 / max(n10 + n11, 1)
+    pi = (n01 + n11) / max(n00 + n01 + n10 + n11, 1)
+
+    def _log(a: float) -> float:
+        return math.log(max(a, 1e-15))
+
+    ll_ind = (n00 + n10) * _log(1.0 - pi) + (n01 + n11) * _log(pi)
+    ll_mkv = (n00) * _log(1.0 - pi01) + (n01) * _log(pi01) + (n10) * _log(1.0 - pi11) + (n11) * _log(pi11)
+
+    lr = -2.0 * (ll_ind - ll_mkv)
+    pv = float(chi2.sf(lr, df=1)) if (_HAVE_SCIPY) else float("nan")
+
+    return {
+        "LR_ind": float(lr),
+        "p_value": pv,
+        "n00": n00, "n01": n01, "n10": n10, "n11": n11,
+        "pi01": float(pi01), "pi11": float(pi11), "pi": float(pi)
+    }
+
+
+def christoffersen_cc_test(pof: Dict[str, float], ind: Dict[str, float]) -> Dict[str, float]:
+    lr_cc = float(pof.get("LR_pof", float("nan"))) + float(ind.get("LR_ind", float("nan")))
+    pv = float(chi2.sf(lr_cc, df=2)) if (_HAVE_SCIPY) else float("nan")
+    return {"LR_cc": float(lr_cc), "p_value": pv}
+
+
+# ----------------------------- EVT POT VaR/ES -----------------------------
+def _gpd_fit_exceedances(y: np.ndarray, beta_floor: float, xi_cap: float) -> Dict[str, float]:
+    """
+    Fit GPD to exceedances y = loss - u, y>=0.
+
+    Returns dict with xi (shape), beta (scale).
+    Uses SciPy genpareto.fit if available, otherwise a robust fallback.
+    """
+    y = y.astype(float)
+    y = y[np.isfinite(y)]
+    y = y[y >= 0.0]
+    if y.size < 5:
+        return {"xi": 0.0, "beta": float(max(beta_floor, y.mean() if y.size else beta_floor)), "fit_method": "fallback_too_few"}
+
+    if _HAVE_SCIPY:
+        # SciPy parameterization: c=xi, loc, scale=beta
+        # Force loc=0 for exceedances
+        c, loc, scale = genpareto.fit(y, floc=0.0)
+        xi = float(np.clip(c, -0.49, xi_cap))
+        beta = float(max(scale, beta_floor))
+        return {"xi": xi, "beta": beta, "fit_method": "scipy_mle"}
+
+    # Fallback (no SciPy):
+    # Use a simple moment-based estimate with clipping:
+    # For GPD with xi < 0.5, mean = beta/(1-xi) => beta = mean*(1-xi)
+    # We pick xi from a crude tail-index proxy using CV:
+    #   For GPD, var exists if xi<0.5 and CV^2 = 1/(1-2xi)  => xi ≈ (CV^2-1)/(2*CV^2)
+    m = float(np.mean(y))
+    v = float(np.var(y, ddof=1)) if y.size >= 2 else 0.0
+    cv2 = v / max(m * m, 1e-15)
+    xi_raw = (cv2 - 1.0) / (2.0 * max(cv2, 1e-12))
+    xi = float(np.clip(xi_raw, -0.49, min(0.49, xi_cap)))  # keep in var-exists zone
+    beta = float(max(m * (1.0 - xi), beta_floor))
+    return {"xi": xi, "beta": beta, "fit_method": "fallback_moments"}
+
+
+def evt_pot_var_es(
+    losses_window: np.ndarray,
+    alpha: float,
+    u_quantile: float,
+    min_exceed: int,
+    beta_floor: float,
+    xi_cap: float
+) -> Dict[str, float]:
+    """
+    EVT POT forecast for VaR_alpha and ES_alpha (both positive losses).
+
+    losses_window: array of losses in the lookback window
+    u = quantile(losses, u_quantile)
+    exceedances y = loss - u, loss>u
+
+    Let p_u = P(L > u) estimated by exceedance frequency = Nu / N
+
+    For target tail alpha (e.g., 0.01), VaR satisfies:
+      P(L > VaR) = alpha
+      => VaR = u + (beta/xi) * [ (alpha/p_u)^(-xi) - 1 ]   if xi != 0
+      => VaR = u + beta * log(p_u/alpha)                 if xi == 0
+
+    ES for GPD tail (requires xi < 1):
+      ES = (VaR + (beta - xi*u)) / (1 - xi)   in common derivations when fitting exceedances above u:
+      More directly (with exceedance formulation):
+        ES = (VaR + (beta - xi*u)) / (1 - xi)
+      We use a stable form:
+        ES = (VaR + (beta - xi*u)) / (1 - xi)    (xi < 1)
+      If xi close to 1, we clamp.
+    """
+    L = losses_window.astype(float)
+    L = L[np.isfinite(L)]
+    if L.size < 50:
+        # too short: fallback to historical
+        q = float(np.quantile(L, 1.0 - alpha))
+        tail = L[L >= q]
+        es = float(tail.mean()) if tail.size else float(q)
+        return {"VaR": q, "ES": es, "u": float("nan"), "p_u": float("nan"), "xi": 0.0, "beta": float("nan"), "fit_method": "hist_short"}
+
+    u = float(np.quantile(L, u_quantile))
+    exc = L[L > u] - u
+    n = int(L.size)
+    nu = int(exc.size)
+    p_u = nu / n if n > 0 else float("nan")
+
+    if nu < min_exceed or not np.isfinite(p_u) or p_u <= 0:
+        # fallback to historical (HS)
+        q = float(np.quantile(L, 1.0 - alpha))
+        tail = L[L >= q]
+        es = float(tail.mean()) if tail.size else float(q)
+        return {"VaR": q, "ES": es, "u": u, "p_u": float(p_u), "xi": 0.0, "beta": float("nan"), "fit_method": "hist_fallback"}
+
+    fit = _gpd_fit_exceedances(exc, beta_floor=beta_floor, xi_cap=xi_cap)
+    xi = float(fit["xi"])
+    beta = float(fit["beta"])
+
+    # alpha must be smaller than p_u typically (i.e., deeper tail than threshold)
+    # If not, you're asking for a quantile that isn't beyond u; fallback to HS.
+    if not (alpha < p_u):
+        q = float(np.quantile(L, 1.0 - alpha))
+        tail = L[L >= q]
+        es = float(tail.mean()) if tail.size else float(q)
+        return {"VaR": q, "ES": es, "u": u, "p_u": float(p_u), "xi": xi, "beta": beta, "fit_method": "hist_alpha_ge_pu"}
+
+    # VaR
+    if abs(xi) < 1e-8:
+        var = u + beta * math.log(p_u / alpha)
+    else:
+        # var = u + beta/xi * ((alpha/p_u)^(-xi) - 1)
+        term = (alpha / p_u) ** (-xi)
+        var = u + (beta / xi) * (term - 1.0)
+
+    var = float(max(var, 0.0))
+
+    # ES (requires xi < 1)
+    xi_es = float(min(xi, 0.99))
+    denom = (1.0 - xi_es)
+    es = (var + (beta - xi_es * u)) / max(denom, 1e-6)
+    es = float(max(es, var))  # ES should be >= VaR
+
+    return {
+        "VaR": float(var),
+        "ES": float(es),
+        "u": float(u),
+        "p_u": float(p_u),
+        "xi": float(xi),
+        "beta": float(beta),
+        "fit_method": str(fit.get("fit_method", "unknown")),
+        "n": float(n),
+        "nu": float(nu),
+    }
+
+
+# ----------------------------- Pipeline -----------------------------
+def run_pipeline(cfg: Config) -> Dict[str, Any]:
+    np.random.seed(cfg.seed)
+
+    print(f"[INFO] Downloading prices for {cfg.symbols} from {cfg.start} ...")
+    prices = load_prices(cfg.symbols, cfg.start)
+    rets = compute_log_returns(prices)
+    print(f"[INFO] Got {len(prices)} price rows, {len(rets)} return rows, assets={rets.shape[1]}")
+
+    w = normalize_weights(cfg.symbols, cfg.weights)
+    port_ret = rets.values @ w
+    port_ret = pd.Series(port_ret, index=rets.index, name="port_ret")
+
+    loss = -port_ret
+
+    out = pd.DataFrame(index=rets.index)
+    out["port_ret"] = port_ret
+    out["loss"] = loss
+
+    VaR = np.full(len(out), np.nan, dtype=float)
+    ES = np.full(len(out), np.nan, dtype=float)
+    u_arr = np.full(len(out), np.nan, dtype=float)
+    pu_arr = np.full(len(out), np.nan, dtype=float)
+    xi_arr = np.full(len(out), np.nan, dtype=float)
+    beta_arr = np.full(len(out), np.nan, dtype=float)
+
+    fit_method = [""] * len(out)
+
+    for t in range(cfg.window, len(out)):
+        Lwin = out["loss"].iloc[t - cfg.window:t].values.astype(float)
+        m = evt_pot_var_es(
+            losses_window=Lwin,
+            alpha=cfg.alpha,
+            u_quantile=cfg.u_quantile,
+            min_exceed=cfg.min_exceed,
+            beta_floor=cfg.beta_floor,
+            xi_cap=cfg.xi_cap,
+        )
+        VaR[t] = m["VaR"]
+        ES[t] = m["ES"]
+        u_arr[t] = float(m.get("u", np.nan))
+        pu_arr[t] = float(m.get("p_u", np.nan))
+        xi_arr[t] = float(m.get("xi", np.nan))
+        beta_arr[t] = float(m.get("beta", np.nan))
+        fit_method[t] = str(m.get("fit_method", ""))
+
+    out["VaR"] = VaR
+    out["ES"] = ES
+    out["u"] = u_arr
+    out["p_u"] = pu_arr
+    out["xi"] = xi_arr
+    out["beta"] = beta_arr
+    out["fit_method"] = fit_method
+
+    out["breach"] = ((out["loss"] > out["VaR"]) & out["VaR"].notna()).astype(int)
+
+    bt = out.dropna(subset=["VaR"]).copy()
+    breaches = bt["breach"].values.astype(int)
+
+    pof = kupiec_pof_test(breaches, alpha=cfg.alpha)
+    ind = christoffersen_ind_test(breaches)
+    cc = christoffersen_cc_test(pof, ind)
+
+    ann_ret = float(bt["port_ret"].mean() * 252.0)
+    ann_vol = float(bt["port_ret"].std(ddof=1) * math.sqrt(252.0))
+    sharpe = float(ann_ret / ann_vol) if ann_vol > 0 else float("nan")
+
+    summary = {
+        "config": asdict(cfg),
+        "scipy_available": bool(_HAVE_SCIPY),
+        "data_window": {
+            "start": str(rets.index.min().date()),
+            "end": str(rets.index.max().date()),
+            "n_returns": int(len(rets)),
+            "n_backtest": int(len(bt)),
+        },
+        "portfolio": {
+            "symbols": list(cfg.symbols),
+            "weights": [float(x) for x in w.tolist()],
+        },
+        "performance": {
+            "ann_ret": ann_ret,
+            "ann_vol": ann_vol,
+            "sharpe": sharpe,
+        },
+        "risk": {
+            "alpha": float(cfg.alpha),
+            "u_quantile": float(cfg.u_quantile),
+            "avg_VaR": float(bt["VaR"].mean()),
+            "avg_ES": float(bt["ES"].mean()),
+            "median_u": float(bt["u"].median()),
+            "median_p_u": float(bt["p_u"].median()),
+            "median_xi": float(bt["xi"].median()),
+            "median_beta": float(bt["beta"].median()),
+            "fit_method_counts": bt["fit_method"].value_counts().to_dict(),
+        },
+        "backtests": {
+            "kupiec_pof": pof,
+            "christoffersen_ind": ind,
+            "christoffersen_cc": cc,
+        }
+    }
+
+    return {"out": out, "summary": summary}
+
+
+def save_outputs(result: Dict[str, Any], cfg: Config) -> None:
+    out: pd.DataFrame = result["out"]
+    summary: Dict[str, Any] = result["summary"]
+
+    os.makedirs(os.path.dirname(cfg.out_csv) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(cfg.out_json) or ".", exist_ok=True)
+
+    out.to_csv(cfg.out_csv)
+    with open(cfg.out_json, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+
+    bt = out.dropna(subset=["VaR"])
+    n = int(len(bt))
+    x = int(bt["breach"].sum())
+    rate = x / n if n > 0 else float("nan")
+
+    print(f"[OK] Saved panel → {cfg.out_csv}")
+    print(f"[OK] Saved summary → {cfg.out_json}")
+    print(f"[INFO] Backtest points: {n}, Breaches: {x}, Breach rate: {rate:.4f}, Expected: {cfg.alpha:.4f}")
+    print(f"[INFO] Avg VaR={bt['VaR'].mean():.5f}  Avg ES={bt['ES'].mean():.5f}  (loss units)")
+    pof = summary["backtests"]["kupiec_pof"]
+    ind = summary["backtests"]["christoffersen_ind"]
+    cc = summary["backtests"]["christoffersen_cc"]
+    print(f"[TEST] Kupiec LR={pof['LR_pof']:.3f}  p={pof['p_value']}")
+    print(f"[TEST] Ind   LR={ind['LR_ind']:.3f}  p={ind['p_value']}")
+    print(f"[TEST] CC    LR={cc['LR_cc']:.3f}  p={cc['p_value']}")
+
+
+# ----------------------------- CLI -----------------------------
+def parse_args() -> Config:
+    p = argparse.ArgumentParser(description="Level-85: EVT POT VaR/ES + Kupiec/Christoffersen backtests")
+
+    p.add_argument("--start", type=str, default=Config.start)
+    p.add_argument("--symbols", nargs="+", default=list(Config.symbols))
+
+    p.add_argument("--weights", nargs="*", type=float, default=None)
+    p.add_argument("--alpha", type=float, default=Config.alpha)
+    p.add_argument("--window", type=int, default=Config.window)
+    p.add_argument("--u-quantile", type=float, default=Config.u_quantile)
+
+    p.add_argument("--min-exceed", type=int, default=Config.min_exceed)
+    p.add_argument("--xi-cap", type=float, default=Config.xi_cap)
+    p.add_argument("--beta-floor", type=float, default=Config.beta_floor)
+
+    p.add_argument("--seed", type=int, default=Config.seed)
+    p.add_argument("--csv", type=str, default=Config.out_csv)
+    p.add_argument("--json", type=str, default=Config.out_json)
+
+    a = p.parse_args()
+
+    weights_tuple = tuple(a.weights) if (a.weights is not None and len(a.weights) > 0) else None
+
+    return Config(
+        symbols=tuple(a.symbols),
+        weights=weights_tuple,
+        start=a.start,
+        alpha=float(a.alpha),
+        window=int(a.window),
+        u_quantile=float(a.u_quantile),
+        min_exceed=int(a.min_exceed),
+        xi_cap=float(a.xi_cap),
+        beta_floor=float(a.beta_floor),
+        seed=int(a.seed),
+        out_csv=a.csv,
+        out_json=a.json,
+    )
+
+
+def main() -> None:
+    cfg = parse_args()
+    result = run_pipeline(cfg)
+    save_outputs(result, cfg)
+
+
+if __name__ == "__main__":
+    # Jupyter/PyCharm cell shim: strip "-f kernel.json" etc.
+    import sys
+    sys.argv = [sys.argv[0]] + [
+        arg for arg in sys.argv[1:]
+        if arg != "-f" and not (arg.endswith(".json") and "kernel" in arg)
+    ]
+    main()

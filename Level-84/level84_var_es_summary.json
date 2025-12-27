@@ -1,0 +1,88 @@
+{
+  "config": {
+    "symbols": [
+      "SPY",
+      "QQQ",
+      "IWM",
+      "EFA",
+      "EEM",
+      "TLT",
+      "LQD",
+      "GLD"
+    ],
+    "weights": null,
+    "start": "2010-01-01",
+    "alpha": 0.01,
+    "window": 750,
+    "method": "fhs",
+    "ewma_lambda": 0.94,
+    "vol_floor": 1e-08,
+    "seed": 42,
+    "out_csv": "level84_var_es_panel.csv",
+    "out_json": "level84_var_es_summary.json"
+  },
+  "data_window": {
+    "start": "2010-01-05",
+    "end": "2025-12-26",
+    "n_returns": 4020,
+    "n_backtest": 3270
+  },
+  "portfolio": {
+    "symbols": [
+      "SPY",
+      "QQQ",
+      "IWM",
+      "EFA",
+      "EEM",
+      "TLT",
+      "LQD",
+      "GLD"
+    ],
+    "weights": [
+      0.125,
+      0.125,
+      0.125,
+      0.125,
+      0.125,
+      0.125,
+      0.125,
+      0.125
+    ]
+  },
+  "performance": {
+    "ann_ret": 0.07950032690380628,
+    "ann_vol": 0.11694360006936382,
+    "sharpe": 0.6798176801180358
+  },
+  "risk": {
+    "alpha": 0.01,
+    "method": "fhs",
+    "avg_VaR": 0.01934903734155067,
+    "avg_ES": 0.025184598773943898
+  },
+  "backtests": {
+    "kupiec_pof": {
+      "LR_pof": 0.8247239415712215,
+      "p_value": 0.3638026067475352,
+      "n": 3270,
+      "x": 38,
+      "pi_hat": 0.011620795107033639
+    },
+    "christoffersen_ind": {
+      "LR_ind": 11.210889894046602,
+      "p_value": 0.0008131871473722776,
+      "n00": 3197,
+      "n01": 34,
+      "n10": 34,
+      "n11": 4,
+      "pi01": 0.010523057876818322,
+      "pi11": 0.10526315789473684,
+      "pi": 0.011624349954114408
+    },
+    "christoffersen_cc": {
+      "LR_cc": 12.035613835617823,
+      "p_value": 0.0024350039072983027
+    },
+    "scipy_available_for_pvalues": true
+  }
+}
