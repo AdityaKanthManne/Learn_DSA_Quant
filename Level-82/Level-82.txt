@@ -1,0 +1,311 @@
+```python
+# level82_systemic_risk_mes_srisk.py
+# Level-82: Systemic Risk via MES / LRMES / SRISK (practical, free-data)
+#
+# What you get:
+# 1) Download prices (yfinance) for assets + a "market" proxy (default: SPY)
+# 2) Compute daily log-returns
+# 3) Compute:
+#    - MES_i(alpha): E[r_i | r_m <= q_alpha]   (tail conditional expectation)
+#    - Beta_i: OLS beta vs market
+#    - LRMES_i: long-run MES proxy from MES (simple exponential approximation)
+#    - SRISK_i (proxy): capital shortfall score using LRMES + leverage + capital ratio
+#
+# Notes:
+# - True SRISK needs firm balance sheet (debt, market cap). Here we provide a "proxy SRISK"
+#   that is still useful for ranking tail-risk contribution across assets.
+# - Works well for equities/ETFs. For banks/financials, you can plug real leverage + equity values.
+#
+# Outputs:
+#   - level82_mes_panel.csv
+#   - level82_mes_summary.json
+#
+# Run:
+#   python level82_systemic_risk_mes_srisk.py
+#   python level82_systemic_risk_mes_srisk.py --alpha 0.05 --horizon-days 126 --kappa 0.08 --leverage 6
+#   python level82_systemic_risk_mes_srisk.py --market SPY --symbols AAPL MSFT JPM GS BAC
+
+import os
+import json
+import math
+import argparse
+from dataclasses import dataclass, asdict
+from typing import Tuple, Optional, Dict, List
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+
+
+# ----------------------------- Config -----------------------------
+@dataclass
+class Config:
+    symbols: Tuple[str, ...] = ("SPY", "QQQ", "IWM", "EFA", "EEM", "TLT", "LQD", "GLD")
+    market: str = "SPY"
+    start: str = "2010-01-01"
+
+    alpha: float = 0.05            # market tail prob for MES (5% left tail)
+    horizon_days: int = 126        # 6 months of trading days (approx)
+    lrm_multiplier: float = 18.0   # standard rough scaling for 6m crash mapping (proxy)
+
+    # SRISK proxy assumptions
+    kappa: float = 0.08            # required capital ratio (8%)
+    leverage: float = 6.0          # D/E proxy (debt-to-equity). Use realistic values for stocks/banks.
+    equity_scale: float = 1.0      # scales SRISK to dollars if you set equity_scale = market cap (in $)
+
+    seed: int = 42
+
+    out_csv: str = "level82_mes_panel.csv"
+    out_json: str = "level82_mes_summary.json"
+
+
+# ----------------------------- Robust yfinance loader -----------------------------
+def _safe_close_series(px: pd.DataFrame, symbol: str) -> pd.Series:
+    if isinstance(px.columns, pd.MultiIndex):
+        for key in [("Close", symbol), (symbol, "Close"), ("Adj Close", symbol), (symbol, "Adj Close")]:
+            if key in px.columns:
+                s = px[key].copy()
+                s.name = symbol
+                return s
+        cols = [c for c in px.columns if (symbol in c and ("Close" in c or "Adj Close" in c))]
+        if cols:
+            s = px[cols[0]].copy()
+            s.name = symbol
+            return s
+        raise RuntimeError(f"Could not locate Close column for {symbol} in MultiIndex columns.")
+    if "Close" in px.columns:
+        s = px["Close"].copy()
+        s.name = symbol
+        return s
+    if "Adj Close" in px.columns:
+        s = px["Adj Close"].copy()
+        s.name = symbol
+        return s
+    raise RuntimeError(f"'Close' column missing for {symbol}. Columns: {list(px.columns)}")
+
+
+def load_prices(symbols: Tuple[str, ...], start: str) -> pd.DataFrame:
+    frames: List[pd.Series] = []
+    for s in symbols:
+        px = yf.download(s, start=start, auto_adjust=True, progress=False)
+        if px is None or px.empty:
+            raise RuntimeError(f"No data returned for symbol: {s}")
+        close = _safe_close_series(px, s)
+        frames.append(close)
+    prices = pd.concat(frames, axis=1).sort_index().dropna(how="any")
+    return prices
+
+
+def compute_log_returns(prices: pd.DataFrame) -> pd.DataFrame:
+    rets = np.log(prices).diff().dropna()
+    rets = rets.replace([np.inf, -np.inf], np.nan).dropna()
+    return rets
+
+
+# ----------------------------- Core metrics -----------------------------
+def ols_beta(y: np.ndarray, x: np.ndarray) -> float:
+    # beta = cov(y,x)/var(x)
+    vx = float(np.var(x, ddof=1))
+    if vx <= 1e-18:
+        return float("nan")
+    cov = float(np.cov(y, x, ddof=1)[0, 1])
+    return cov / vx
+
+
+def mes(y: np.ndarray, x_market: np.ndarray, alpha: float) -> float:
+    q = float(np.quantile(x_market, alpha))
+    mask = x_market <= q
+    if mask.sum() < 50:
+        # if too few, expand slightly
+        q = float(np.quantile(x_market, min(alpha * 1.5, 0.20)))
+        mask = x_market <= q
+    if mask.sum() == 0:
+        return float("nan")
+    return float(np.mean(y[mask]))
+
+
+def lrmes_from_mes(mes_val: float, multiplier: float) -> float:
+    # Simple proxy used in practice: LRMES = 1 - exp(multiplier * MES)
+    # MES is typically negative in market stress, so multiplier*MES < 0 => exp < 1 => LRMES in (0,1)
+    if not np.isfinite(mes_val):
+        return float("nan")
+    return float(1.0 - math.exp(multiplier * mes_val))
+
+
+def srisk_proxy(lrmes_val: float, kappa: float, leverage: float, equity_scale: float) -> float:
+    # Proxy SRISK (capital shortfall) using:
+    # Equity E = equity_scale (user-defined), Debt D = leverage * E
+    # Post-crash equity approx = (1 - LRMES) * E
+    # Required capital = kappa * (D + post_equity)
+    # Capital shortfall = Required - post_equity
+    # => SRISK = max(0, kappa*(D + postE) - postE)
+    if not np.isfinite(lrmes_val):
+        return float("nan")
+    E = float(equity_scale)
+    D = float(leverage) * E
+    postE = (1.0 - float(lrmes_val)) * E
+    required = float(kappa) * (D + postE)
+    shortfall = required - postE
+    return float(max(0.0, shortfall))
+
+
+# ----------------------------- Pipeline -----------------------------
+def run_pipeline(cfg: Config) -> Tuple[pd.DataFrame, Dict]:
+    np.random.seed(cfg.seed)
+
+    all_syms = tuple(dict.fromkeys(list(cfg.symbols) + [cfg.market]))
+    print(f"[INFO] Downloading prices for {all_syms} from {cfg.start} ...")
+    prices = load_prices(all_syms, cfg.start)
+    rets = compute_log_returns(prices)
+    print(f"[INFO] Got {len(prices)} price rows, {len(rets)} return rows, assets={rets.shape[1]}")
+
+    if cfg.market not in rets.columns:
+        raise RuntimeError(f"Market symbol '{cfg.market}' not found in downloaded returns columns.")
+
+    m = rets[cfg.market].values
+
+    rows = []
+    for sym in cfg.symbols:
+        if sym not in rets.columns:
+            continue
+        ri = rets[sym].values
+
+        b = ols_beta(ri, m)
+        mes_i = mes(ri, m, cfg.alpha)
+        lrmes_i = lrmes_from_mes(mes_i, cfg.lrm_multiplier)
+        srisk_i = srisk_proxy(lrmes_i, cfg.kappa, cfg.leverage, cfg.equity_scale)
+
+        rows.append({
+            "symbol": sym,
+            "beta": float(b),
+            "MES": float(mes_i),
+            "LRMES": float(lrmes_i),
+            "SRISK_proxy": float(srisk_i),
+        })
+
+    metrics = pd.DataFrame(rows).set_index("symbol").sort_values("SRISK_proxy", ascending=False)
+
+    # Panel for CSV (prices + returns + market tail flag)
+    panel = pd.DataFrame(index=rets.index)
+    for c in cfg.symbols:
+        if c in prices.columns:
+            panel[f"px_{c}"] = prices[c].reindex(panel.index)
+        if c in rets.columns:
+            panel[f"ret_{c}"] = rets[c].reindex(panel.index)
+    panel[f"px_{cfg.market}"] = prices[cfg.market].reindex(panel.index)
+    panel[f"ret_{cfg.market}"] = rets[cfg.market].reindex(panel.index)
+
+    q = float(np.quantile(panel[f"ret_{cfg.market}"].dropna().values, cfg.alpha))
+    panel["mkt_tail"] = (panel[f"ret_{cfg.market}"] <= q).astype(int)
+
+    # Summary stats
+    mkt_ann_vol = float(panel[f"ret_{cfg.market}"].std(ddof=1) * math.sqrt(252.0))
+    mkt_ann_ret = float(panel[f"ret_{cfg.market}"].mean() * 252.0)
+
+    summary = {
+        "config": asdict(cfg),
+        "data_window": {
+            "start": str(rets.index.min().date()),
+            "end": str(rets.index.max().date()),
+            "n_returns": int(len(rets)),
+        },
+        "market": {
+            "symbol": cfg.market,
+            "alpha_tail": float(cfg.alpha),
+            "tail_threshold_return": float(q),
+            "ann_ret": float(mkt_ann_ret),
+            "ann_vol": float(mkt_ann_vol),
+        },
+        "metrics": {
+            sym: {k: float(v) for k, v in metrics.loc[sym].to_dict().items()}
+            for sym in metrics.index
+        },
+        "ranking_by_srisk_proxy": metrics.index.tolist(),
+    }
+
+    # merge metrics into panel header-friendly format (single row repeated not needed; keep JSON)
+    return panel, metrics, summary
+
+
+def save_outputs(panel: pd.DataFrame, metrics: pd.DataFrame, summary: Dict, cfg: Config) -> None:
+    os.makedirs(os.path.dirname(cfg.out_csv) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(cfg.out_json) or ".", exist_ok=True)
+
+    # Save panel + metrics as separate sections in CSV by writing metrics to the bottom with blank lines
+    panel.to_csv(cfg.out_csv)
+
+    # Also save a dedicated metrics CSV beside the panel for convenience
+    metrics_csv = os.path.splitext(cfg.out_csv)[0] + "_metrics.csv"
+    metrics.to_csv(metrics_csv)
+
+    with open(cfg.out_json, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+
+    print(f"[OK] Saved panel → {cfg.out_csv}")
+    print(f"[OK] Saved metrics → {metrics_csv}")
+    print(f"[OK] Saved summary → {cfg.out_json}")
+
+    print("[TOP] By SRISK_proxy:")
+    top = metrics.head(min(10, len(metrics)))
+    for sym, r in top.iterrows():
+        print(
+            f"  {sym:>4s}  SRISK={r['SRISK_proxy']:.4f}  "
+            f"LRMES={r['LRMES']:.4f}  MES={r['MES']:.5f}  beta={r['beta']:.3f}"
+        )
+
+
+# ----------------------------- CLI -----------------------------
+def parse_args() -> Config:
+    p = argparse.ArgumentParser(description="Level-82: MES / LRMES / SRISK (proxy)")
+
+    p.add_argument("--start", type=str, default="2010-01-01")
+    p.add_argument("--symbols", nargs="+", default=list(Config.symbols))
+    p.add_argument("--market", type=str, default="SPY")
+
+    p.add_argument("--alpha", type=float, default=0.05)
+    p.add_argument("--horizon-days", type=int, default=126)
+    p.add_argument("--lrm-multiplier", type=float, default=18.0)
+
+    p.add_argument("--kappa", type=float, default=0.08)
+    p.add_argument("--leverage", type=float, default=6.0)
+    p.add_argument("--equity-scale", type=float, default=1.0)
+
+    p.add_argument("--seed", type=int, default=42)
+
+    p.add_argument("--csv", type=str, default="level82_mes_panel.csv")
+    p.add_argument("--json", type=str, default="level82_mes_summary.json")
+
+    a = p.parse_args()
+    return Config(
+        symbols=tuple(a.symbols),
+        market=a.market,
+        start=a.start,
+        alpha=float(a.alpha),
+        horizon_days=int(a.horizon_days),
+        lrm_multiplier=float(a.lrm_multiplier),
+        kappa=float(a.kappa),
+        leverage=float(a.leverage),
+        equity_scale=float(a.equity_scale),
+        seed=int(a.seed),
+        out_csv=a.csv,
+        out_json=a.json,
+    )
+
+
+def main() -> None:
+    cfg = parse_args()
+    panel, metrics, summary = run_pipeline(cfg)
+    save_outputs(panel, metrics, summary, cfg)
+
+
+if __name__ == "__main__":
+    # Jupyter/PyCharm cell shim: strip "-f kernel.json" etc.
+    import sys
+    sys.argv = [sys.argv[0]] + [
+        arg for arg in sys.argv[1:]
+        if arg != "-f" and not (arg.endswith(".json") and "kernel" in arg)
+    ]
+    main()
+```
+
+If you tell me whether Level-82 should treat **SPY as both an asset and the market** (or exclude it from the ranking), I can tweak the defaults so your output table is exactly how you want it.
